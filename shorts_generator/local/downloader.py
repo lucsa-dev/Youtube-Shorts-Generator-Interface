@@ -3,6 +3,7 @@
 Returns a local mp4 path so the rest of the local pipeline can read it
 directly off disk.
 """
+import json
 import os
 import re
 from pathlib import Path
@@ -130,6 +131,16 @@ def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[s
                 if os.path.exists(stem + ext):
                     path = stem + ext
                     break
+
+        resolved_id = (info or {}).get("id") or video_id
+        title = (info or {}).get("title") or (info or {}).get("fulltitle")
+        if resolved_id and title:
+            meta_path = os.path.join(out_dir, f"source_{resolved_id}.meta.json")
+            try:
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump({"id": resolved_id, "title": title}, f, ensure_ascii=False)
+            except OSError:
+                pass
 
     print(f"[download/local] ready: {path}", flush=True)
     return path
