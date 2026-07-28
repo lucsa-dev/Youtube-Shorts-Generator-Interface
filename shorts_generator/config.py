@@ -20,6 +20,71 @@ LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base")
 LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto")  # auto / cpu / cuda
 LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "output")
 
+# Content language: Whisper recognition + titles/hooks/descriptions from the LLM.
+# ISO-639-1 code. Default Brazilian Portuguese.
+CONTENT_LANGUAGE = os.getenv("CONTENT_LANGUAGE", "pt").strip().lower() or "pt"
+
+LANGUAGE_OPTIONS = [
+    ("pt", "Português (Brasil)"),
+    ("en", "English"),
+    ("es", "Español"),
+    ("fr", "Français"),
+    ("it", "Italiano"),
+    ("de", "Deutsch"),
+    ("auto", "Auto-detect (Whisper)"),
+]
+
+LANGUAGE_LABELS = {
+    "pt": "Brazilian Portuguese (pt-BR)",
+    "en": "English",
+    "es": "Spanish",
+    "fr": "French",
+    "it": "Italian",
+    "de": "German",
+}
+
+
+def normalize_language(code: str | None) -> str | None:
+    """Normalize UI/config language to Whisper ISO-639-1, or None for auto."""
+    if code is None:
+        return None
+    raw = str(code).strip().lower().replace("_", "-")
+    if not raw or raw in ("auto", "detect", "none"):
+        return None
+    aliases = {
+        "pt-br": "pt",
+        "pt-pt": "pt",
+        "portuguese": "pt",
+        "portugues": "pt",
+        "português": "pt",
+        "english": "en",
+        "spanish": "es",
+        "español": "es",
+        "french": "fr",
+        "italian": "it",
+        "german": "de",
+    }
+    if raw in aliases:
+        return aliases[raw]
+    # pt-BR → pt
+    if "-" in raw:
+        raw = raw.split("-", 1)[0]
+    return raw or None
+
+
+def language_label(code: str | None) -> str:
+    norm = normalize_language(code) or CONTENT_LANGUAGE or "pt"
+    return LANGUAGE_LABELS.get(norm, LANGUAGE_LABELS.get("pt", "Brazilian Portuguese (pt-BR)"))
+
+
+def resolve_content_language(override: str | None = None) -> str:
+    """Language for LLM titles/hooks. Never 'auto' — falls back to CONTENT_LANGUAGE/pt."""
+    norm = normalize_language(override)
+    if norm:
+        return norm
+    fallback = normalize_language(CONTENT_LANGUAGE) or "pt"
+    return fallback
+
 # VAD (Voice Activity Detection) settings for faster-whisper
 # Default threshold is 0.5; lower = more sensitive, higher = less sensitive
 # Default min_speech_duration_ms is 250ms; increase to avoid tiny false positives
