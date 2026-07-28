@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shorts Lab — AI YouTube Shorts Generator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+  <div class="scan" aria-hidden="true"></div>
+
+  <header class="top">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <div>
+        <p class="brand-name">Shorts Lab</p>
+        <p class="brand-sub">AI YouTube Shorts Generator</p>
+      </div>
+    </div>
+    <nav class="tabs" role="tablist">
+      <button class="tab is-active" data-tab="generate" role="tab" aria-selected="true">Gerar</button>
+      <button class="tab" data-tab="jobs" role="tab" aria-selected="false">Jobs</button>
+      <button class="tab" data-tab="config" role="tab" aria-selected="false">Config</button>
+    </nav>
+    <div class="status-pill" id="api-status" title="Status das chaves">
+      <span class="dot"></span>
+      <span class="status-text">checando…</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- GENERATE -->
+    <section class="panel is-active" id="panel-generate" role="tabpanel">
+      <div class="hero-block">
+        <h1 class="display">Corta. Rankeia.<br /><em>Publica.</em></h1>
+        <p class="lede">
+          Cole um vídeo longo do YouTube e receba shorts 9:16 ranqueados por viralidade —
+          hook, score e motivo em cada clip.
+        </p>
+      </div>
+
+      <form id="generate-form" class="workbench" autocomplete="off">
+        <label class="field field-grow">
+          <span class="label">Fonte</span>
+          <input
+            type="text"
+            name="url"
+            id="url"
+            placeholder="https://www.youtube.com/watch?v=…  ou caminho local"
+          />
+        </label>
+
+        <div class="field-row">
+          <label class="field">
+            <span class="label">Modo</span>
+            <select name="mode" id="mode">
+              <option value="api">API (MuAPI)</option>
+              <option value="local">Local (yt-dlp + Whisper)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="label">Clips</span>
+            <input type="number" name="num_clips" id="num_clips" min="1" max="20" value="3" />
+          </label>
+          <label class="field">
+            <span class="label">Proporção</span>
+            <select name="aspect_ratio" id="aspect_ratio">
+              <option value="9:16">9:16 Shorts / TikTok / Reels</option>
+              <option value="1:1">1:1 Quadrado</option>
+              <option value="4:5">4:5 Feed</option>
+              <option value="16:9">16:9 Landscape</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="label">Resolução</span>
+            <select name="download_format" id="download_format">
+              <option value="360">360p</option>
+              <option value="480">480p</option>
+              <option value="720" selected>720p</option>
+              <option value="1080">1080p</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="label">Idioma Whisper</span>
+            <input type="text" name="language" id="language" placeholder="auto (ex: pt, en)" />
+          </label>
+        </div>
+
+        <label class="field upload-field" id="upload-wrap">
+          <span class="label">Arquivo local <em>(somente modo local)</em></span>
+          <input type="file" name="file" id="file" accept="video/*,.mp4,.mkv,.webm,.mov" />
+          <span class="upload-hint" id="file-hint">Arraste um mp4 ou clique para escolher</span>
+        </label>
+
+        <div class="actions">
+          <button type="submit" class="btn primary" id="submit-btn">
+            <span>Gerar shorts</span>
+            <span class="btn-arrow" aria-hidden="true">→</span>
+          </button>
+          <p class="hint" id="form-hint">Pipeline: download → transcrição → ranking → crop vertical</p>
+        </div>
+      </form>
+
+      <div class="run-area" id="run-area" hidden>
+        <div class="run-head">
+          <div>
+            <p class="eyebrow">Job ativo</p>
+            <h2 id="active-job-title">—</h2>
+          </div>
+          <span class="badge" id="active-job-badge">queued</span>
+        </div>
+        <pre class="log" id="job-log" aria-live="polite"></pre>
+        <div class="results" id="results"></div>
+      </div>
+    </section>
+
+    <!-- JOBS -->
+    <section class="panel" id="panel-jobs" role="tabpanel" hidden>
+      <div class="section-head">
+        <h2>Histórico de jobs</h2>
+        <button type="button" class="btn ghost" id="refresh-jobs">Atualizar</button>
+      </div>
+      <div class="jobs-list" id="jobs-list">
+        <p class="empty">Nenhum job ainda.</p>
+      </div>
+    </section>
+
+    <!-- CONFIG -->
+    <section class="panel" id="panel-config" role="tabpanel" hidden>
+      <div class="section-head">
+        <h2>Configuração (.env)</h2>
+        <p class="lede small">Chaves secretas ficam mascaradas. Deixe em branco para manter o valor atual.</p>
+      </div>
+      <form id="config-form" class="config-grid"></form>
+      <div class="actions">
+        <button type="submit" form="config-form" class="btn primary">Salvar configuração</button>
+        <p class="hint" id="config-hint"></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span>CLI equivalente: <code>python main.py URL --mode api --num-clips 3</code></span>
+  </footer>
+
+  <script src="/app.js"></script>
+</body>
+</html>

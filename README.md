@@ -102,6 +102,17 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
    LOCAL_OUTPUT_DIR=output           # where local mp4s land
    ```
 
+## Web UI
+
+Além da CLI, o projeto inclui uma interface no navegador que expõe as mesmas opções (`mode`, `num_clips`, `aspect_ratio`, `format`, `language`), upload de arquivo no modo local, histórico de jobs, logs ao vivo e edição do `.env`.
+
+```bash
+pip install -r requirements.txt
+uvicorn web.app:app --reload --host 0.0.0.0 --port 8000
+```
+
+Abra [http://localhost:8000](http://localhost:8000).
+
 ## Usage
 
 ### Single video (API mode — default)
@@ -264,7 +275,10 @@ Audio is transcribed by MuAPI's `/openai-whisper` endpoint (server-side `whisper
 ```
 AI-Youtube-Shorts-Generator/
 ├── main.py                       CLI entry point
-├── requirements.txt              core deps (api mode)
+├── web/
+│   ├── app.py                    FastAPI web UI (jobs, config, uploads)
+│   └── static/                   frontend (HTML/CSS/JS)
+├── requirements.txt              core deps (api mode + web)
 ├── requirements-local.txt        optional deps for --mode local
 ├── .env.example
 └── shorts_generator/

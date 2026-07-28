@@ -4,5 +4,7 @@ __pycache__/
 .venv/
 venv/
 output/
+uploads/
+jobs/
 *.mp4
 .DS_Store
