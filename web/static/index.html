@@ -95,9 +95,9 @@
             <p class="hint" id="form-hint">Confirme os locutores, escolha tópicos e corte os shorts</p>
           </div>
           <div class="actions" id="edit-job-actions" hidden>
-            <button type="button" class="btn ghost" id="goto-topics-btn">Ir para tópicos</button>
             <button type="button" class="btn ghost" id="goto-format-btn">Ir para formato</button>
-            <p class="hint" id="edit-form-hint">Proporção e resolução ficam no passo Formato</p>
+            <button type="button" class="btn ghost" id="goto-topics-btn">Ir para tópicos</button>
+            <p class="hint" id="edit-form-hint">Formato vem antes da escolha dos tópicos</p>
           </div>
         </div>
       </form>
@@ -122,24 +122,6 @@
           <div class="cast-list" id="cast-list"></div>
         </div>
 
-        <div class="pick-area" id="pick-area" hidden>
-          <div class="section-head">
-            <div>
-              <h2 style="font-size:1.2rem">Tópicos encontrados</h2>
-              <p class="hint" id="pick-hint">Selecione os momentos que deseja transformar em shorts</p>
-            </div>
-            <div class="pick-actions">
-              <button type="button" class="btn ghost" id="pick-all">Todos</button>
-              <button type="button" class="btn ghost" id="pick-none">Nenhum</button>
-              <button type="button" class="btn primary" id="pick-continue" disabled>
-                <span id="pick-continue-label">Continuar com selecionados</span>
-                <span class="btn-arrow" aria-hidden="true">→</span>
-              </button>
-            </div>
-          </div>
-          <div class="topic-list" id="topic-list"></div>
-        </div>
-
         <div class="format-area" id="format-area" hidden>
           <div class="section-head">
             <div>
@@ -149,7 +131,7 @@
               </p>
             </div>
             <div class="pick-actions">
-              <button type="button" class="btn ghost" id="format-back">← Tópicos</button>
+              <button type="button" class="btn ghost" id="format-back">← Fonte</button>
               <button type="button" class="btn primary" id="format-continue">
                 <span>Continuar para legendas</span>
                 <span class="btn-arrow" aria-hidden="true">→</span>
@@ -187,16 +169,11 @@
             <div class="pick-actions">
               <button type="button" class="btn ghost" id="caption-back">← Formato</button>
               <button type="button" class="btn primary" id="caption-continue">
-                <span id="caption-continue-label">Gerar shorts</span>
+                <span id="caption-continue-label">Continuar para tópicos</span>
                 <span class="btn-arrow" aria-hidden="true">→</span>
               </button>
             </div>
           </div>
-
-          <label class="field checkbox-field">
-            <input type="checkbox" id="caption-enabled" checked />
-            <span>Queimar legendas no vídeo</span>
-          </label>
 
           <div id="caption-controls">
             <div class="theme-grid" id="theme-grid" role="listbox" aria-label="Temas de legenda"></div>
@@ -226,7 +203,7 @@
               </label>
             </div>
 
-            <div class="field-row caption-fields">
+            <div class="field-row caption-fields caption-style-row">
               <label class="field">
                 <span class="label">Cor ativa</span>
                 <input type="color" id="caption-primary" value="#ffff00" />
@@ -239,27 +216,49 @@
                 <span class="label">Cor borda</span>
                 <input type="color" id="caption-outline-color" value="#000000" />
               </label>
-              <label class="field checkbox-field compact">
-                <input type="checkbox" id="caption-bold" checked />
-                <span>Negrito</span>
+              <label class="field">
+                <span class="label">Peso</span>
+                <span class="caption-weight-toggle">
+                  <input type="checkbox" id="caption-bold" checked />
+                  <span>Negrito</span>
+                </span>
               </label>
             </div>
 
             <div class="caption-preview-wrap">
               <div class="caption-preview-frame" id="caption-preview-frame" data-ratio="9:16">
-                <img class="caption-preview-bg" id="caption-preview-bg" alt="" hidden />
-                <div class="caption-preview-fallback" id="caption-preview-fallback" aria-hidden="true"></div>
-                <div class="caption-preview-scrim" aria-hidden="true"></div>
-                <div class="caption-preview" id="caption-preview">
-                  <span class="cap-word is-done">Isso</span>
-                  <span class="cap-word is-active">muda</span>
-                  <span class="cap-word">tudo</span>
-                </div>
+                <video id="caption-preview-video" class="caption-preview-video" playsinline preload="metadata"></video>
+                <div class="live-caption" id="caption-preview-caption" aria-hidden="true"></div>
+                <button type="button" class="caption-preview-play" id="caption-preview-play" aria-label="Reproduzir preview">
+                  <span class="topic-play-icon" aria-hidden="true"></span>
+                </button>
                 <span class="caption-preview-badge" id="caption-preview-badge">9:16</span>
               </div>
-              <p class="hint caption-preview-meta" id="caption-preview-meta">Preview com frame do tópico selecionado</p>
+              <div class="caption-preview-bar">
+                <button type="button" class="btn ghost" id="caption-preview-toggle">▶ Pré-visualizar</button>
+                <p class="hint caption-preview-meta" id="caption-preview-meta">Preview com o primeiro tópico selecionado</p>
+              </div>
             </div>
           </div>
+        </div>
+
+        <div class="pick-area" id="pick-area" hidden>
+          <div class="section-head">
+            <div>
+              <h2 style="font-size:1.2rem">Tópicos encontrados</h2>
+              <p class="hint" id="pick-hint">Selecione os momentos e ajuste o início/fim de cada corte</p>
+            </div>
+            <div class="pick-actions">
+              <button type="button" class="btn ghost" id="pick-back">← Legendas</button>
+              <button type="button" class="btn ghost" id="pick-all">Todos</button>
+              <button type="button" class="btn ghost" id="pick-none">Nenhum</button>
+              <button type="button" class="btn primary" id="pick-continue" disabled>
+                <span id="pick-continue-label">Gerar shorts</span>
+                <span class="btn-arrow" aria-hidden="true">→</span>
+              </button>
+            </div>
+          </div>
+          <div class="topic-list" id="topic-list"></div>
         </div>
 
         <div class="results" id="results"></div>
@@ -294,8 +293,101 @@
   </main>
 
   <footer class="foot">
-    <span>CLI: <code>python main.py URL --mode local --num-clips 3</code> · Web: análise → tópicos → legendas → corte</span>
+    <span>CLI: <code>python main.py URL --mode local --num-clips 3</code> · Web: análise → formato → tópicos → legendas → corte</span>
   </footer>
+
+  <div class="trim-modal" id="trim-editor" hidden>
+    <div class="trim-modal-backdrop" data-trim-dismiss tabindex="-1" aria-hidden="true"></div>
+    <div
+      class="trim-modal-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="trim-title"
+    >
+      <div class="trim-head">
+        <div>
+          <h3 class="trim-title" id="trim-title">Ajustar corte</h3>
+          <p class="hint" id="trim-hint">Edite título, locutor e timestamps do corte</p>
+        </div>
+        <button type="button" class="btn ghost" id="trim-close">Fechar</button>
+      </div>
+      <div class="trim-layout">
+        <div class="trim-player-wrap">
+                <div class="trim-player-frame" id="trim-player-frame" data-ratio="9:16">
+                  <video id="trim-video" playsinline preload="metadata"></video>
+                  <div class="live-caption" id="trim-live-caption" aria-hidden="true"></div>
+                </div>
+          <div class="trim-player-bar">
+            <div class="trim-player-actions">
+              <button type="button" class="btn ghost" id="trim-play-clip">▶ Pré-visualizar corte</button>
+              <button type="button" class="btn ghost" id="trim-pause" hidden>❚❚ Pausar</button>
+            </div>
+            <div class="trim-now" title="Timestamp do frame atual">
+              <span class="label">Agora</span>
+              <strong id="trim-current-time">0:00.00</strong>
+            </div>
+          </div>
+        </div>
+        <div class="trim-controls">
+          <div class="trim-meta">
+            <label class="field field-grow">
+              <span class="label">Título</span>
+              <input type="text" id="trim-title-input" maxlength="200" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span class="label">Locutor</span>
+              <select id="trim-speaker-input" aria-label="Locutor do corte">
+                <option value="">— Sem locutor —</option>
+              </select>
+            </label>
+          </div>
+          <div class="trim-times">
+            <label class="field">
+              <span class="label">Início</span>
+              <input type="text" id="trim-start-input" inputmode="decimal" autocomplete="off" />
+            </label>
+            <label class="field">
+              <span class="label">Fim</span>
+              <input type="text" id="trim-end-input" inputmode="decimal" autocomplete="off" />
+            </label>
+            <div class="trim-duration-box">
+              <span class="label">Duração</span>
+              <strong id="trim-duration">—</strong>
+            </div>
+          </div>
+          <div class="trim-nudge">
+            <button type="button" class="btn ghost trim-nudge-btn" data-edge="start" data-delta="-0.5">Início −0.5s</button>
+            <button type="button" class="btn ghost trim-nudge-btn" data-edge="start" data-delta="0.5">Início +0.5s</button>
+            <button type="button" class="btn ghost trim-nudge-btn" data-edge="end" data-delta="-0.5">Fim −0.5s</button>
+            <button type="button" class="btn ghost trim-nudge-btn" data-edge="end" data-delta="0.5">Fim +0.5s</button>
+          </div>
+          <div
+            class="trim-timeline"
+            id="trim-timeline"
+            role="group"
+            aria-label="Timeline do corte"
+          >
+            <div class="trim-window-labels">
+              <span id="trim-win-start">0:00</span>
+              <span id="trim-win-end">0:00</span>
+            </div>
+            <div class="trim-track" id="trim-track">
+              <div class="trim-selection" id="trim-selection"></div>
+              <div class="trim-playhead" id="trim-playhead" hidden></div>
+              <button type="button" class="trim-handle is-start" id="trim-handle-start" aria-label="Início do corte"></button>
+              <button type="button" class="trim-handle is-end" id="trim-handle-end" aria-label="Fim do corte"></button>
+            </div>
+          </div>
+          <div class="trim-actions">
+            <button type="button" class="btn ghost" id="trim-reset">Restaurar original</button>
+            <button type="button" class="btn primary" id="trim-save">
+              <span>Salvar ajustes</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 
   <script src="/app.js"></script>
 </body>

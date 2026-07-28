@@ -30,6 +30,22 @@
       margin_v: 160,
       max_words_per_line: 4,
     },
+    trim: {
+      highlightId: null,
+      start: 0,
+      end: 0,
+      originalStart: 0,
+      originalEnd: 0,
+      originalTitle: "",
+      originalSpeaker: "",
+      titleSpeaker: "",
+      duration: 0,
+      winStart: 0,
+      winEnd: 0,
+      dragging: null,
+      previewLoop: false,
+      dirty: false,
+    },
   };
 
   /* ---------- Router ---------- */
@@ -104,6 +120,7 @@
     state.maxStep = 1;
     state.viewStep = 1;
     state.followJobStep = true;
+    closeTrimEditor({ silent: true });
     $("#run-area").hidden = true;
     $("#pick-area").hidden = true;
     const formatArea = $("#format-area");
@@ -135,6 +152,98 @@
     return 1;
   }
 
+  function selectionResumeStep(job) {
+    let saved = Number(job?.params?.ui_step);
+    if (!Number.isFinite(saved)) return 2;
+    // flow_version < 2: step 3 was topics and 4 was captions — swap on resume
+    if (Number(job?.params?.flow_version) !== 2) {
+      if (saved === 3) saved = 4;
+      else if (saved === 4) saved = 3;
+    }
+    if (saved >= 2 && saved <= 4) return saved;
+    return 2;
+  }
+
+  async function persistUiStep(step) {
+    if (!state.activeJobId) return;
+    const n = Number(step);
+    if (![1, 2, 3, 4, 5].includes(n)) return;
+    if (state.lastJob?.params) state.lastJob.params.ui_step = n;
+    if (state.jobParams) state.jobParams.ui_step = n;
+    const aspect = currentAspectRatio();
+    const fmt =
+      $("#download_format")?.value ||
+      state.jobParams?.download_format ||
+      state.lastJob?.params?.download_format ||
+      "720";
+    try {
+      await fetch(`/api/jobs/${state.activeJobId}/params`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          aspect_ratio: aspect,
+          download_format: fmt,
+          ui_step: n,
+          regenerate: false,
+        }),
+      });
+    } catch (_) {
+      /* best-effort */
+    }
+  }
+
+  let selectedPersistTimer = null;
+  function persistSelectedIds({ immediate = false } = {}) {
+    if (!state.activeJobId) return;
+    const ids = [...state.selectedIds]
+      .map(Number)
+      .filter((n) => !Number.isNaN(n));
+    if (state.lastJob?.params) state.lastJob.params.selected_ids = ids;
+    if (state.jobParams) state.jobParams.selected_ids = ids;
+
+    const flush = async () => {
+      selectedPersistTimer = null;
+      if (!state.activeJobId) return;
+      const aspect = currentAspectRatio();
+      const fmt =
+        $("#download_format")?.value ||
+        state.jobParams?.download_format ||
+        state.lastJob?.params?.download_format ||
+        "720";
+      try {
+        await fetch(`/api/jobs/${state.activeJobId}/params`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            aspect_ratio: aspect,
+            download_format: fmt,
+            selected_ids: ids,
+            regenerate: false,
+          }),
+        });
+      } catch (_) {
+        /* best-effort */
+      }
+    };
+
+    if (selectedPersistTimer) clearTimeout(selectedPersistTimer);
+    if (immediate) flush();
+    else selectedPersistTimer = setTimeout(flush, 250);
+  }
+
+  function selectedIdsFromJob(job, highlights) {
+    const params = job?.params || {};
+    if (Array.isArray(params.selected_ids)) {
+      return new Set(params.selected_ids.map(Number).filter((n) => !Number.isNaN(n)));
+    }
+    const fromResult = job?.result?.selected_ids;
+    if (Array.isArray(fromResult)) {
+      return new Set(fromResult.map(Number).filter((n) => !Number.isNaN(n)));
+    }
+    if (state.renderedIds.size) return new Set(state.renderedIds);
+    return new Set((highlights || []).map((h, i) => Number(h.id ?? i)));
+  }
+
   function setFlowStep(step, { maxStep } = {}) {
     if (maxStep != null) state.maxStep = Math.max(state.maxStep, maxStep);
     state.viewStep = step;
@@ -154,9 +263,9 @@
       (state.jobStatus === "awaiting_cast" || state.jobStatus === "ranking");
     const labels = {
       1: "1 · Configurar fonte",
-      2: castGate ? "2 · Identificar locutores" : "2 · Escolher tópicos",
-      3: "3 · Formato",
-      4: "4 · Legendas karaoke",
+      2: castGate ? "2 · Identificar locutores" : "2 · Formato",
+      3: "3 · Legendas karaoke",
+      4: "4 · Escolher tópicos",
       5: "5 · Cortar shorts",
     };
     const el = $("#step-label");
@@ -207,9 +316,9 @@
 
     const canPick = hasTopics && selectableStatus;
     const showCast = step === 2 && state.jobStatus === "awaiting_cast";
-    const showPick = step === 2 && canPick;
-    const showFormat = step === 3 && canPick;
-    const showCaptions = step === 4 && canPick;
+    const showFormat = step === 2 && canPick;
+    const showCaptions = step === 3 && canPick;
+    const showPick = step === 4 && canPick;
     const showResults = step === 5;
 
     if (cast) {
@@ -218,6 +327,7 @@
     }
     if (pick) {
       pick.hidden = !showPick;
+      if (!showPick) closeTrimEditor({ silent: true });
     }
     if (format) {
       format.hidden = !showFormat;
@@ -225,6 +335,17 @@
     if (captions) {
       captions.hidden = !showCaptions;
       if (showCaptions) syncCaptionForm();
+      else {
+        const capVideo = $("#caption-preview-video");
+        if (capVideo && !capVideo.paused) {
+          try {
+            capVideo.pause();
+          } catch (_) {
+            /* ignore */
+          }
+          syncCaptionPreviewUi(false);
+        }
+      }
     }
     if (results) {
       results.hidden = !showResults;
@@ -243,11 +364,18 @@
       if (dot.disabled || n > state.maxStep) return;
       state.followJobStep = false;
       setFlowStep(n);
-      if (n === 2 && state.lastJob) {
-        if (state.jobStatus === "awaiting_cast") renderCastForm(state.lastJob);
-        else renderTopicPicker(state.lastJob);
+      if (
+        ["awaiting_selection", "completed", "failed"].includes(state.jobStatus) &&
+        n >= 2 &&
+        n <= 4
+      ) {
+        persistUiStep(n);
       }
-      if (n === 4) syncCaptionForm();
+      if (n === 2 && state.lastJob && state.jobStatus === "awaiting_cast") {
+        renderCastForm(state.lastJob);
+      }
+      if (n === 3) syncCaptionForm();
+      if (n === 4 && state.lastJob) renderTopicPicker(state.lastJob);
       if (n === 5 && state.lastJob?.result) renderResults(state.lastJob);
     });
   });
@@ -269,13 +397,12 @@
 
   function syncPickContinueLabel() {
     const label = $("#pick-continue-label");
-    if (!label) return;
-    label.textContent = "Continuar para formato";
-    const capLabel = $("#caption-continue-label");
-    if (capLabel) {
+    if (label) {
       const hasRendered = state.renderedIds.size > 0 || state.jobStatus === "completed";
-      capLabel.textContent = hasRendered ? "Atualizar shorts" : "Gerar shorts";
+      label.textContent = hasRendered ? "Atualizar shorts" : "Gerar shorts";
     }
+    const capLabel = $("#caption-continue-label");
+    if (capLabel) capLabel.textContent = "Continuar para tópicos";
   }
 
   /* ---------- Mode / upload ---------- */
@@ -513,7 +640,7 @@
 
     const fd = new FormData(e.target);
     if (!fileInput.files?.length) fd.delete("file");
-    // Formato fica no passo 3 — envia defaults atuais dos selects
+    // Formato fica no passo 2 — envia defaults atuais dos selects
     fd.set("aspect_ratio", $("#aspect_ratio")?.value || "9:16");
     fd.set("download_format", $("#download_format")?.value || "720");
     // Idioma vem de CONTENT_LANGUAGE na Config (padrão das gerações)
@@ -541,6 +668,7 @@
     state.lastJob = null;
     state.jobStatus = "queued";
     state.maxStep = 1;
+    closeTrimEditor({ silent: true });
     $("#run-area").hidden = true;
     $("#pick-area").hidden = true;
     const formatArea = $("#format-area");
@@ -613,14 +741,16 @@
         if (cast) cast.hidden = true;
       } else if (job.status === "awaiting_selection") {
         prepareSelection(job);
-        // Allow navigating to format/caption steps if they already picked topics
+        const resume = selectionResumeStep(job);
+        state.maxStep = Math.max(state.maxStep, Math.max(3, resume));
+        // Allow navigating to topics/caption steps if they already picked topics
         if (state.selectedIds.size > 0) {
           state.maxStep = Math.max(state.maxStep, 4);
         }
-        if (state.followJobStep) setFlowStep(2);
+        if (state.followJobStep) setFlowStep(resume);
         else showFlowView(state.viewStep);
-        if (state.viewStep === 2) renderTopicPicker(job);
-        if (state.viewStep === 4) syncCaptionForm();
+        if (state.viewStep === 3) syncCaptionForm();
+        if (state.viewStep === 4) renderTopicPicker(job);
         if (state.pollTimer) {
           clearInterval(state.pollTimer);
           state.pollTimer = null;
@@ -659,8 +789,8 @@
         } else {
           state.maxStep = Math.max(state.maxStep, 5);
           showFlowView(state.viewStep);
-          if (state.viewStep === 2) renderTopicPicker(job);
-          if (state.viewStep === 4) syncCaptionForm();
+          if (state.viewStep === 3) syncCaptionForm();
+          if (state.viewStep === 4) renderTopicPicker(job);
           if (state.viewStep === 5) renderResults(job);
         }
         const capBtn = $("#caption-continue");
@@ -679,11 +809,12 @@
         if (highlights.length) {
           // Análise sobreviveu — permite retentar a seleção/corte
           prepareSelection(job);
-          state.maxStep = Math.max(state.maxStep, 4);
-          if (state.followJobStep) setFlowStep(2);
+          const resume = selectionResumeStep(job);
+          state.maxStep = Math.max(state.maxStep, Math.max(4, resume));
+          if (state.followJobStep) setFlowStep(resume);
           else showFlowView(state.viewStep);
-          if (state.viewStep === 2) renderTopicPicker(job);
-          if (state.viewStep === 4) syncCaptionForm();
+          if (state.viewStep === 3) syncCaptionForm();
+          if (state.viewStep === 4) renderTopicPicker(job);
         } else if (speakers.length && job.result?.transcript) {
           // Ranking falhou — volta para naming de locutores
           job.status = "awaiting_cast";
@@ -705,16 +836,9 @@
     const highlights = job.result?.highlights || [];
     state.highlights = highlights;
     if (state.selectedIds.size === 0) {
-      const selectedFromJob = job.params?.selected_ids || job.result?.selected_ids;
-      if (Array.isArray(selectedFromJob) && selectedFromJob.length) {
-        state.selectedIds = new Set(selectedFromJob.map(Number));
-      } else if (state.renderedIds.size) {
-        state.selectedIds = new Set(state.renderedIds);
-      } else {
-        highlights.forEach((h, i) => state.selectedIds.add(Number(h.id ?? i)));
-      }
+      state.selectedIds = selectedIdsFromJob(job, highlights);
     }
-    if (state.viewStep === 2) renderTopicPicker(job);
+    if (state.viewStep === 4) renderTopicPicker(job);
   }
 
   function renderCastForm(job) {
@@ -731,10 +855,16 @@
       return;
     }
 
+    // Preserve in-progress name edits across poll re-renders
+    const typed = {};
+    $$(".cast-name").forEach((input) => {
+      typed[input.dataset.id] = input.value;
+    });
+
     list.innerHTML = "";
     speakers.forEach((sp, i) => {
       const sid = String(sp.id || `S${i + 1}`);
-      const suggested = sp.suggested_name || sp.name || "";
+      const suggested = typed[sid] ?? (sp.suggested_name || sp.name || "");
       const role = sp.role || "unknown";
       const quote = sp.sample_quote || "";
       const evidence = sp.evidence || "";
@@ -742,11 +872,18 @@
       const card = document.createElement("div");
       card.className = "cast-card";
       card.dataset.id = sid;
+      const placeholder = `<span class="cast-face is-placeholder" aria-hidden="true">${escapeHtml(sid)}</span>`;
       const face = portrait
-        ? `<img class="cast-face" src="${escapeAttr(portrait)}" alt="" loading="lazy" />`
-        : `<span class="cast-face is-placeholder" aria-hidden="true">${escapeHtml(sid)}</span>`;
+        ? `<img class="cast-face" src="${escapeAttr(portrait)}" alt="${escapeAttr(suggested || sid)}" loading="lazy" width="112" height="112" />`
+        : placeholder;
       card.innerHTML = `
-        ${face}
+        <div class="cast-avatar">
+          ${face}
+          <span class="cast-id">${escapeHtml(sid)}</span>
+          <button type="button" class="cast-next-photo" data-id="${escapeAttr(sid)}" title="Buscar outro frame com rosto">
+            Trocar foto
+          </button>
+        </div>
         <div class="cast-body">
           <label class="field">
             <span class="label">Nome ${role !== "unknown" ? `(${escapeHtml(role)})` : ""}</span>
@@ -758,8 +895,87 @@
           ${evidence ? `<p class="cast-evidence">${escapeHtml(evidence)}</p>` : ""}
         </div>
       `;
+      const img = card.querySelector("img.cast-face");
+      if (img) {
+        img.addEventListener("error", () => {
+          img.replaceWith(
+            Object.assign(document.createElement("span"), {
+              className: "cast-face is-placeholder",
+              textContent: sid,
+            })
+          );
+        });
+      }
+      card.querySelector(".cast-next-photo")?.addEventListener("click", () => {
+        cycleCastPortrait(sid, card);
+      });
       list.appendChild(card);
     });
+  }
+
+  function setCastFace(card, sid, portraitUrl, alt) {
+    const avatar = card.querySelector(".cast-avatar");
+    if (!avatar) return;
+    let face = avatar.querySelector(".cast-face");
+    if (portraitUrl) {
+      if (face && face.tagName === "IMG") {
+        face.src = portraitUrl;
+        face.alt = alt || sid;
+      } else {
+        const img = document.createElement("img");
+        img.className = "cast-face";
+        img.src = portraitUrl;
+        img.alt = alt || sid;
+        img.width = 112;
+        img.height = 112;
+        img.loading = "lazy";
+        img.addEventListener("error", () => {
+          img.replaceWith(
+            Object.assign(document.createElement("span"), {
+              className: "cast-face is-placeholder",
+              textContent: sid,
+            })
+          );
+        });
+        if (face) face.replaceWith(img);
+        else avatar.insertBefore(img, avatar.firstChild);
+      }
+    }
+  }
+
+  async function cycleCastPortrait(sid, card) {
+    if (!state.activeJobId || state.jobStatus !== "awaiting_cast") return;
+    const btn = card.querySelector(".cast-next-photo");
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Buscando…";
+    }
+    try {
+      const res = await fetch(
+        `/api/jobs/${state.activeJobId}/cast/${encodeURIComponent(sid)}/next-portrait`,
+        { method: "POST" }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+      const url = data.portrait_url;
+      if (url) {
+        setCastFace(card, sid, url, sid);
+        const speakers = state.lastJob?.result?.speakers || [];
+        const sp = speakers.find((s) => String(s.id) === String(sid));
+        if (sp) {
+          sp.portrait_url = url;
+          if (data.portrait_time != null) sp.portrait_time = data.portrait_time;
+        }
+      }
+    } catch (err) {
+      const hint = $("#cast-hint");
+      if (hint) hint.textContent = `Trocar foto: ${err.message}`;
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = "Trocar foto";
+      }
+    }
   }
 
   async function submitCast({ skip = false } = {}) {
@@ -805,47 +1021,356 @@
   $("#cast-continue")?.addEventListener("click", () => submitCast({ skip: false }));
   $("#cast-skip")?.addEventListener("click", () => submitCast({ skip: true }));
 
+  function currentAspectRatio() {
+    return (
+      $("#aspect_ratio")?.value ||
+      state.jobParams?.aspect_ratio ||
+      state.lastJob?.params?.aspect_ratio ||
+      "9:16"
+    );
+  }
+
+  const captionWordsCache = new Map();
+
+  function effectiveCaptionStyle() {
+    if (state.viewStep === 3 && $("#caption-controls")) {
+      return readCaptionForm();
+    }
+    return {
+      ...state.captionStyle,
+      ...(state.jobParams?.caption_style || {}),
+      enabled: true,
+    };
+  }
+
+  async function fetchCaptionWords(start, end) {
+    if (!state.activeJobId) return [];
+    const key = `${state.activeJobId}:${Number(start).toFixed(2)}:${Number(end).toFixed(2)}`;
+    if (captionWordsCache.has(key)) return captionWordsCache.get(key);
+    try {
+      const res = await fetch(
+        `/api/jobs/${state.activeJobId}/caption-words?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return [];
+      const words = Array.isArray(data.words) ? data.words : [];
+      captionWordsCache.set(key, words);
+      return words;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  function styleLiveCaption(el, frameEl) {
+    if (!el) return;
+    const style = effectiveCaptionStyle();
+    const primary = assToHex(style.primary_colour || "&H0000FFFF");
+    const secondary = assToHex(style.secondary_colour || "&H00FFFFFF");
+    const outline = assToHex(style.outline_colour || "&H00000000");
+    const size = Number(style.font_size || 72);
+    const bold = style.bold !== false;
+    const font = style.font_name || "Arial Black";
+    const border = Number(style.outline || 4);
+    const frameW = frameEl?.clientWidth || el.parentElement?.clientWidth || 280;
+    const scale = frameW / 1080;
+    const strokePx = border > 0 ? border * scale * 2 : 0;
+    el.style.fontFamily = `"${font}", Impact, sans-serif`;
+    el.style.fontSize = `${Math.max(12, Math.round(size * scale))}px`;
+    el.style.fontWeight = bold ? "900" : "600";
+    el.style.webkitTextStroke = strokePx > 0 ? `${strokePx}px ${outline}` : "0";
+    el.style.paintOrder = "stroke fill";
+    el.dataset.primary = primary;
+    el.dataset.secondary = secondary;
+  }
+
+  function paintLiveCaption(el, words, tAbs, frameEl) {
+    if (!el) return;
+    const style = effectiveCaptionStyle();
+    if (!words?.length) {
+      el.hidden = true;
+      el.innerHTML = "";
+      return;
+    }
+    let activeIdx = words.findIndex((w) => tAbs >= float(w.start) && tAbs < float(w.end));
+    if (activeIdx < 0) {
+      activeIdx = -1;
+      for (let i = 0; i < words.length; i++) {
+        if (float(words[i].start) <= tAbs) activeIdx = i;
+        else break;
+      }
+    }
+    if (activeIdx < 0) {
+      el.hidden = true;
+      el.innerHTML = "";
+      return;
+    }
+    const maxW = Math.max(1, Number(style.max_words_per_line || 4));
+    const lineStart = Math.floor(activeIdx / maxW) * maxW;
+    const line = words.slice(lineStart, lineStart + maxW);
+    el.hidden = false;
+    styleLiveCaption(el, frameEl);
+    const primary = el.dataset.primary || "#ffff00";
+    const secondary = el.dataset.secondary || "#ffffff";
+    el.innerHTML = line
+      .map((w, i) => {
+        const gi = lineStart + i;
+        const cls =
+          gi < activeIdx ? " is-done" : gi === activeIdx ? " is-active" : "";
+        return `<span class="cap-word${cls}">${escapeHtml(String(w.word || ""))}</span>`;
+      })
+      .join("");
+    $$(".cap-word", el).forEach((node, i) => {
+      const gi = lineStart + i;
+      node.style.color = gi <= activeIdx ? primary : secondary;
+    });
+  }
+
+  async function ensureMediaCaptionWords(media) {
+    if (!media) return [];
+    if (Array.isArray(media._captionWords)) return media._captionWords;
+    const start = float(media.dataset.start);
+    const end = Math.max(start + 0.5, float(media.dataset.end));
+    const words = await fetchCaptionWords(start, end);
+    media._captionWords = words;
+    return words;
+  }
+
+  async function syncMediaLiveCaption(media) {
+    const video = $(".topic-video", media);
+    const caption = $(".live-caption", media);
+    if (!video || !caption) return;
+    const words = await ensureMediaCaptionWords(media);
+    paintLiveCaption(caption, words, video.currentTime || 0, $(".topic-media-frame", media));
+  }
+
+  async function syncTrimLiveCaption() {
+    const video = $("#trim-video");
+    const caption = $("#trim-live-caption");
+    if (!video || !caption || state.trim.highlightId == null) return;
+    const start = state.trim.start;
+    const end = state.trim.end;
+    const key = `trim:${start.toFixed(2)}:${end.toFixed(2)}`;
+    if (!state.trim._captionKey || state.trim._captionKey !== key) {
+      state.trim._captionKey = key;
+      state.trim._captionWords = await fetchCaptionWords(start, end);
+    }
+    paintLiveCaption(
+      caption,
+      state.trim._captionWords || [],
+      video.currentTime || 0,
+      $("#trim-player-frame")
+    );
+  }
+
+  function applyPreviewAspect(aspect) {
+    const ratio = aspect || currentAspectRatio();
+    $$(".topic-media").forEach((el) => {
+      el.dataset.ratio = ratio;
+    });
+    const trimFrame = $("#trim-player-frame");
+    if (trimFrame) trimFrame.dataset.ratio = ratio;
+  }
+
+  function pauseAllTopicVideos({ except = null } = {}) {
+    $$(".topic-media").forEach((media) => {
+      if (except && media === except) return;
+      const video = $(".topic-video", media);
+      if (video && !video.paused) {
+        try {
+          video.pause();
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      media.classList.remove("is-playing");
+    });
+    const capVideo = $("#caption-preview-video");
+    if (capVideo && !capVideo.paused) {
+      try {
+        capVideo.pause();
+      } catch (_) {
+        /* ignore */
+      }
+      syncCaptionPreviewUi(false);
+    }
+  }
+
+  function syncTopicMediaUi(media, playing) {
+    if (!media) return;
+    media.classList.toggle("is-playing", Boolean(playing));
+    if (playing) media.classList.add("has-frame");
+    const icon = $(".topic-play-icon", media);
+    if (icon) {
+      icon.setAttribute("aria-label", playing ? "Pausar" : "Reproduzir");
+    }
+  }
+
+  async function toggleTopicPreview(media) {
+    if (!media) return;
+    const video = $(".topic-video", media);
+    if (!video) return;
+
+    const start = float(media.dataset.start);
+    const end = Math.max(start + 0.5, float(media.dataset.end));
+    const src = media.dataset.src || "";
+
+    if (!src) {
+      syncTopicMediaUi(media, false);
+      return;
+    }
+
+    if (!video.paused) {
+      video.pause();
+      syncTopicMediaUi(media, false);
+      return;
+    }
+
+    pauseAllTopicVideos({ except: media });
+
+    if (!video.getAttribute("src") || video.getAttribute("src") !== src) {
+      video.src = src;
+      video.load();
+    }
+
+    const seekAndPlay = async () => {
+      try {
+        if (Math.abs(video.currentTime - start) > 0.35 || video.currentTime >= end - 0.15) {
+          video.currentTime = start;
+        }
+      } catch (_) {
+        /* seek may fail until metadata loads */
+      }
+      try {
+        await video.play();
+        syncTopicMediaUi(media, true);
+      } catch (_) {
+        syncTopicMediaUi(media, false);
+      }
+    };
+
+    if (video.readyState >= 1) {
+      await seekAndPlay();
+    } else {
+      const onReady = async () => {
+        video.removeEventListener("loadedmetadata", onReady);
+        await seekAndPlay();
+      };
+      video.addEventListener("loadedmetadata", onReady);
+      try {
+        video.load();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+
+  function bindTopicMedia(media) {
+    const video = $(".topic-video", media);
+    if (!video) return;
+
+    video.addEventListener("timeupdate", () => {
+      const end = float(media.dataset.end);
+      if (end > 0 && video.currentTime >= end - 0.05) {
+        video.pause();
+        try {
+          video.currentTime = float(media.dataset.start);
+        } catch (_) {
+          /* ignore */
+        }
+        syncTopicMediaUi(media, false);
+      }
+      syncMediaLiveCaption(media);
+    });
+    video.addEventListener("ended", () => {
+      syncTopicMediaUi(media, false);
+    });
+    video.addEventListener("pause", () => syncTopicMediaUi(media, false));
+    video.addEventListener("play", () => {
+      syncTopicMediaUi(media, true);
+      ensureMediaCaptionWords(media).then(() => syncMediaLiveCaption(media));
+    });
+
+    media.addEventListener("click", (ev) => {
+      if (ev.target.closest(".topic-check")) return;
+      if (!ev.target.closest(".topic-media-frame")) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleTopicPreview(media);
+    });
+  }
+
   function renderTopicPicker(job) {
     const highlights = job.result?.highlights || [];
     state.highlights = highlights;
     const list = $("#topic-list");
     const pick = $("#pick-area");
-    if (state.viewStep === 2) pick.hidden = false;
+    if (state.viewStep === 4) pick.hidden = false;
 
     if (!highlights.length) {
       list.innerHTML = `<p class="empty">Nenhum tópico encontrado.</p>`;
       $("#pick-continue").disabled = true;
       $("#pick-hint").textContent = "Nada para selecionar";
+      closeTrimEditor({ silent: true });
       return;
     }
 
     if (state.selectedIds.size === 0) {
-      const fromJob = job.params?.selected_ids || job.result?.selected_ids;
-      if (Array.isArray(fromJob) && fromJob.length) {
-        fromJob.forEach((id) => state.selectedIds.add(Number(id)));
-      } else if (state.renderedIds.size) {
-        state.renderedIds.forEach((id) => state.selectedIds.add(id));
-      } else {
-        highlights.forEach((h, i) => state.selectedIds.add(Number(h.id ?? i)));
-      }
+      state.selectedIds = selectedIdsFromJob(job, highlights);
     }
 
+    pauseAllTopicVideos();
     list.innerHTML = "";
+    const previewSrc = sourcePreviewUrl(job);
+    const aspect = currentAspectRatio();
+    const editingId = state.trim.highlightId;
     highlights.forEach((h, i) => {
       const id = Number(h.id ?? i);
       const selected = state.selectedIds.has(id);
       const already = state.renderedIds.has(id);
-      const card = document.createElement("button");
-      card.type = "button";
-      card.className = `topic-card${selected ? " is-selected" : ""}`;
+      const editing = editingId != null && Number(editingId) === id;
+      const card = document.createElement("div");
+      card.className = `topic-card${selected ? " is-selected" : ""}${
+        editing ? " is-editing" : ""
+      }`;
       card.dataset.id = String(id);
       card.style.animationDelay = `${i * 0.04}s`;
-      const thumb = h.thumbnail_url
-        ? `<img class="topic-thumb" src="${escapeAttr(h.thumbnail_url)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+      const thumbUrl =
+        h.preview_thumbnail_url ||
+        h.thumbnail_url ||
+        (state.activeJobId
+          ? `/api/jobs/${state.activeJobId}/preview-thumbs/${id}?v=2`
+          : "");
+      const thumbLayer = thumbUrl
+        ? `<img class="topic-thumb" src="${escapeAttr(thumbUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
         : `<span class="topic-thumb is-placeholder">frame</span>`;
+      const mediaInner = previewSrc
+        ? `${thumbLayer}<video class="topic-video" playsinline preload="none"${
+            thumbUrl ? ` poster="${escapeAttr(thumbUrl)}"` : ""
+          }></video>`
+        : thumbLayer;
       card.innerHTML = `
-        <input class="topic-check" type="checkbox" ${selected ? "checked" : ""} tabindex="-1" aria-hidden="true" />
-        ${thumb}
+        <div
+          class="topic-media${previewSrc ? "" : " is-static"}"
+          data-ratio="${escapeAttr(aspect)}"
+          data-start="${escapeAttr(String(h.start_time ?? 0))}"
+          data-end="${escapeAttr(String(h.end_time ?? 0))}"
+          data-src="${escapeAttr(previewSrc)}"
+        >
+          <input
+            class="topic-check"
+            type="checkbox"
+            ${selected ? "checked" : ""}
+            aria-label="Selecionar tópico"
+          />
+          <div class="topic-media-frame">
+            ${mediaInner}
+            ${
+              previewSrc
+                ? `<div class="live-caption" aria-hidden="true"></div><div class="topic-media-overlay" aria-hidden="true"><span class="topic-play-icon" aria-label="Reproduzir"></span></div>`
+                : ""
+            }
+          </div>
+        </div>
         <div class="topic-body">
           <div class="score"><strong>${h.score ?? "—"}</strong> / 100</div>
           <h3>${escapeHtml(h.title || `Tópico #${i + 1}`)}${
@@ -856,15 +1381,40 @@
               ? `<p class="meta-row"><strong>Locutor:</strong> ${escapeHtml(h.attributed_to)}</p>`
               : ""
           }
-          <p class="meta-row"><strong>Tempo:</strong> ${fmtTime(h.start_time)} → ${fmtTime(h.end_time)}</p>
+          <p class="meta-row topic-time"><strong>Tempo:</strong> ${fmtTime(h.start_time)} → ${fmtTime(h.end_time)}</p>
           <p class="meta-row"><strong>Hook:</strong> ${escapeHtml(h.hook_sentence || "—")}</p>
           <p class="topic-snippet">${escapeHtml(h.snippet || h.virality_reason || "")}</p>
+          <div class="topic-card-actions">
+            <button type="button" class="topic-edit" data-edit-id="${id}">
+              ${editing ? "Editando corte…" : "Ajustar corte"}
+            </button>
+          </div>
         </div>
       `;
-      card.addEventListener("click", () => toggleTopic(id, card));
+      const media = $(".topic-media", card);
+      if (previewSrc && media) bindTopicMedia(media);
+      const check = $(".topic-check", card);
+      check?.addEventListener("click", (ev) => ev.stopPropagation());
+      check?.addEventListener("change", () => {
+        if (check.checked) {
+          state.selectedIds.add(id);
+          card.classList.add("is-selected");
+        } else {
+          state.selectedIds.delete(id);
+          card.classList.remove("is-selected");
+        }
+        syncPickContinue();
+        persistSelectedIds();
+      });
+      $(".topic-edit", card)?.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        openTrimEditor(id);
+      });
       list.appendChild(card);
     });
 
+    applyPreviewAspect(aspect);
     syncPickContinue();
   }
 
@@ -881,6 +1431,7 @@
       if (cb) cb.checked = true;
     }
     syncPickContinue();
+    persistSelectedIds();
   }
 
   function syncPickContinue() {
@@ -907,6 +1458,7 @@
       if (cb) cb.checked = true;
     });
     syncPickContinue();
+    persistSelectedIds({ immediate: true });
   });
 
   $("#pick-none").addEventListener("click", () => {
@@ -917,22 +1469,767 @@
       if (cb) cb.checked = false;
     });
     syncPickContinue();
+    persistSelectedIds({ immediate: true });
   });
 
-  $("#pick-continue").addEventListener("click", () => {
+  /* ---------- Trim editor (step 2) ---------- */
+  function parseTimeInput(raw) {
+    const s = String(raw || "").trim().replace(",", ".");
+    if (!s) return NaN;
+    if (/^\d+(\.\d+)?$/.test(s)) return Number(s);
+    const parts = s.split(":").map((p) => p.trim());
+    if (parts.some((p) => p === "" || Number.isNaN(Number(p)))) return NaN;
+    if (parts.length === 2) return Number(parts[0]) * 60 + Number(parts[1]);
+    if (parts.length === 3) {
+      return Number(parts[0]) * 3600 + Number(parts[1]) * 60 + Number(parts[2]);
+    }
+    return NaN;
+  }
+
+  function fmtTimeInput(t) {
+    if (t == null || Number.isNaN(Number(t))) return "";
+    const n = Math.max(0, Number(t));
+    const m = Math.floor(n / 60);
+    const s = (n % 60).toFixed(2);
+    return `${m}:${s.padStart(5, "0")}`;
+  }
+
+  function highlightById(id) {
+    return state.highlights.find((h, i) => Number(h.id ?? i) === Number(id)) || null;
+  }
+
+  function videoDurationFromJob(job) {
+    const fromResult = float(job?.result?.duration);
+    if (fromResult > 0) return fromResult;
+    const fromTx = float(job?.result?.transcript?.duration);
+    if (fromTx > 0) return fromTx;
+    const video = $("#trim-video");
+    if (video && Number.isFinite(video.duration) && video.duration > 0) {
+      return video.duration;
+    }
+    let maxEnd = 0;
+    (job?.result?.highlights || state.highlights || []).forEach((h) => {
+      maxEnd = Math.max(maxEnd, float(h.end_time));
+    });
+    return maxEnd > 0 ? maxEnd + 5 : 0;
+  }
+
+  function sourcePreviewUrl(job) {
+    const url = job?.result?.source_preview_url;
+    if (url) return url;
+    if (state.activeJobId) return `/api/jobs/${state.activeJobId}/source`;
+    return "";
+  }
+
+  function fmtTimePrecise(t) {
+    if (t == null || Number.isNaN(Number(t))) return "—";
+    const n = Math.max(0, Number(t));
+    const m = Math.floor(n / 60);
+    const s = (n % 60).toFixed(2);
+    return `${m}:${s.padStart(5, "0")}`;
+  }
+
+  function clampTrimTimes(start, end) {
+    const t = state.trim;
+    const duration = t.duration > 0 ? t.duration : Math.max(end, start + 1);
+    let s = Math.max(0, Math.min(start, duration - 1));
+    let e = Math.max(s + 1, Math.min(end, duration));
+    if (e - s < 1) e = Math.min(duration, s + 1);
+    return { start: Math.round(s * 100) / 100, end: Math.round(e * 100) / 100 };
+  }
+
+  function recomputeTrimWindow({ force = false } = {}) {
+    const t = state.trim;
+    // Keep the visible window stable while dragging a single handle —
+    // recentering made the opposite handle appear to move.
+    if (!force && t.winEnd > t.winStart) {
+      const margin = Math.max(2, (t.winEnd - t.winStart) * 0.04);
+      let winStart = t.winStart;
+      let winEnd = t.winEnd;
+      const span = winEnd - winStart;
+      if (t.start < winStart + margin) {
+        winStart = Math.max(0, t.start - margin);
+        winEnd = winStart + span;
+      }
+      if (t.end > winEnd - margin) {
+        winEnd = Math.min(t.duration || t.end + margin, t.end + margin);
+        winStart = Math.max(0, winEnd - span);
+      }
+      if (t.duration > 0 && winEnd > t.duration) {
+        winEnd = t.duration;
+        winStart = Math.max(0, winEnd - span);
+      }
+      t.winStart = winStart;
+      t.winEnd = Math.max(winStart + 1, winEnd);
+      return;
+    }
+    const clip = Math.max(1, t.end - t.start);
+    const pad = Math.max(20, Math.min(120, clip * 1.5));
+    let winStart = Math.max(0, t.start - pad);
+    let winEnd = t.duration > 0 ? Math.min(t.duration, t.end + pad) : t.end + pad;
+    if (winEnd - winStart < 10) {
+      winEnd = Math.min(t.duration || winEnd + 10, winStart + Math.max(10, clip * 2));
+    }
+    t.winStart = winStart;
+    t.winEnd = Math.max(winStart + 1, winEnd);
+  }
+
+  function syncTrimUI() {
+    const t = state.trim;
+    const startInput = $("#trim-start-input");
+    const endInput = $("#trim-end-input");
+    if (startInput && document.activeElement !== startInput) {
+      startInput.value = fmtTimeInput(t.start);
+    }
+    if (endInput && document.activeElement !== endInput) {
+      endInput.value = fmtTimeInput(t.end);
+    }
+    const durEl = $("#trim-duration");
+    if (durEl) durEl.textContent = fmtTime(t.end - t.start);
+    const winStartEl = $("#trim-win-start");
+    const winEndEl = $("#trim-win-end");
+    if (winStartEl) winStartEl.textContent = fmtTime(t.winStart);
+    if (winEndEl) winEndEl.textContent = fmtTime(t.winEnd);
+
+    const span = Math.max(0.001, t.winEnd - t.winStart);
+    const leftPct = ((t.start - t.winStart) / span) * 100;
+    const rightPct = ((t.end - t.winStart) / span) * 100;
+    const sel = $("#trim-selection");
+    const hs = $("#trim-handle-start");
+    const he = $("#trim-handle-end");
+    if (sel) {
+      sel.style.left = `${leftPct}%`;
+      sel.style.width = `${Math.max(0.5, rightPct - leftPct)}%`;
+    }
+    if (hs) hs.style.left = `${leftPct}%`;
+    if (he) he.style.left = `${rightPct}%`;
+
+    const hint = $("#trim-hint");
+    if (hint) {
+      const len = t.end - t.start;
+      let msg = "Arraste um handle por vez — o outro lado fica fixo";
+      if (len < 15) msg = "Corte curto (<15s) — ok se for intencional";
+      else if (len > 90) msg = "Corte longo (>90s) — shorts costumam performar melhor mais curtos";
+      if (t.dirty) msg += " · alterações não salvas";
+      hint.textContent = msg;
+    }
+  }
+
+  function updatePlayhead() {
+    const video = $("#trim-video");
+    const head = $("#trim-playhead");
+    const nowEl = $("#trim-current-time");
+    const t = state.trim;
+    if (!video || !Number.isFinite(video.currentTime)) return;
+    if (nowEl) nowEl.textContent = fmtTimePrecise(video.currentTime);
+    if (!head) return;
+    const span = Math.max(0.001, t.winEnd - t.winStart);
+    const pct = ((video.currentTime - t.winStart) / span) * 100;
+    if (pct < -2 || pct > 102) {
+      head.hidden = true;
+      return;
+    }
+    head.hidden = false;
+    head.style.left = `${Math.max(0, Math.min(100, pct))}%`;
+  }
+
+  function setTrimRange(start, end, {
+    seek = true,
+    markDirty = true,
+    recomputeWindow = true,
+    forceWindow = false,
+  } = {}) {
+    const clamped = clampTrimTimes(start, end);
+    state.trim.start = clamped.start;
+    state.trim.end = clamped.end;
+    if (markDirty) state.trim.dirty = true;
+    if (recomputeWindow) recomputeTrimWindow({ force: forceWindow });
+    state.trim._captionKey = null;
+    syncTrimUI();
+    const video = $("#trim-video");
+    if (seek && video) {
+      const target = state.trim.dragging === "end" ? state.trim.end : state.trim.start;
+      if (Math.abs(video.currentTime - target) > 0.05) {
+        try {
+          video.currentTime = target;
+        } catch (_) {
+          /* ignore seek errors while loading */
+        }
+      }
+    }
+    updatePlayhead();
+    syncTrimLiveCaption();
+  }
+
+  function knownSpeakerNames(job) {
+    const names = [];
+    const seen = new Set();
+    for (const sp of job?.result?.speakers || []) {
+      const name = String(sp.name || sp.suggested_name || "").trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      names.push(name);
+    }
+    return names;
+  }
+
+  function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function replaceSpeakerInTitle(title, fromName, toName, knownNames = []) {
+    const t = String(title || "").trim();
+    const to = String(toName || "").trim();
+    if (!to) return t;
+    if (!t) return to;
+
+    const tryReplace = (from) => {
+      const name = String(from || "").trim();
+      if (!name) return null;
+      const re = new RegExp(escapeRegExp(name), "i");
+      if (!re.test(t)) return null;
+      return t.replace(new RegExp(escapeRegExp(name), "gi"), to);
+    };
+
+    const fromHit = tryReplace(fromName);
+    if (fromHit != null) return fromHit;
+
+    const sorted = [...knownNames]
+      .filter(Boolean)
+      .sort((a, b) => b.length - a.length);
+    for (const name of sorted) {
+      if (name.toLowerCase() === to.toLowerCase()) continue;
+      const hit = tryReplace(name);
+      if (hit != null) return hit;
+    }
+
+    const colon = t.match(/^([^:]{1,80}):\s*(.+)$/);
+    if (colon) return `${to}: ${colon[2].trim()}`;
+
+    return `${to}: ${t}`;
+  }
+
+  function populateTrimSpeakerSelect(job, selected) {
+    const select = $("#trim-speaker-input");
+    if (!select) return [];
+    const names = knownSpeakerNames(job);
+    const current = String(selected || "").trim();
+    if (current && !names.some((n) => n.toLowerCase() === current.toLowerCase())) {
+      names.unshift(current);
+    }
+    const opts = [`<option value="">— Sem locutor —</option>`].concat(
+      names.map(
+        (n) =>
+          `<option value="${escapeAttr(n)}"${
+            current && n.toLowerCase() === current.toLowerCase() ? " selected" : ""
+          }>${escapeHtml(n)}</option>`
+      )
+    );
+    select.innerHTML = opts.join("");
+    if (current) {
+      const match = names.find((n) => n.toLowerCase() === current.toLowerCase());
+      select.value = match || current;
+    } else {
+      select.value = "";
+    }
+    return names;
+  }
+
+  function openTrimEditor(highlightId) {
+    const job = state.lastJob;
+    const h = highlightById(highlightId);
+    if (!job || !h || !state.activeJobId) return;
+
+    const preview = sourcePreviewUrl(job);
+    if (!preview) {
+      $("#pick-hint").textContent = "Vídeo fonte indisponível para pré-visualizar";
+      return;
+    }
+
+    pauseAllTopicVideos();
+    applyPreviewAspect();
+
+    const start = float(h.start_time);
+    const end = float(h.end_time);
+    const duration = videoDurationFromJob(job);
+    state.trim.highlightId = Number(highlightId);
+    state.trim.originalStart = start;
+    state.trim.originalEnd = end;
+    state.trim.originalTitle = String(h.title || "").trim();
+    state.trim.originalSpeaker = String(h.attributed_to || "").trim();
+    state.trim.titleSpeaker = state.trim.originalSpeaker;
+    state.trim.duration = duration;
+    state.trim.dirty = false;
+    state.trim.previewLoop = false;
+    state.trim.dragging = null;
+
+    const editor = $("#trim-editor");
+    if (editor) editor.hidden = false;
+    document.body.classList.add("trim-modal-open");
+    const title = $("#trim-title");
+    if (title) title.textContent = `Ajustar: ${h.title || `Tópico #${highlightId}`}`;
+
+    const titleInput = $("#trim-title-input");
+    if (titleInput) titleInput.value = state.trim.originalTitle;
+    populateTrimSpeakerSelect(job, state.trim.originalSpeaker);
+
+    const video = $("#trim-video");
+    if (video) {
+      const nextSrc = preview;
+      if (video.dataset.src !== nextSrc) {
+        video.dataset.src = nextSrc;
+        video.src = nextSrc;
+      }
+      video.pause();
+    }
+    $("#trim-pause").hidden = true;
+    $("#trim-play-clip").hidden = false;
+
+    setTrimRange(start, end, { seek: true, markDirty: false, forceWindow: true });
+    if (state.lastJob) renderTopicPicker(state.lastJob);
+    $("#trim-close")?.focus();
+  }
+
+  function closeTrimEditor({ silent = false } = {}) {
+    const video = $("#trim-video");
+    if (video) {
+      video.pause();
+      state.trim.previewLoop = false;
+    }
+    $("#trim-pause").hidden = true;
+    $("#trim-play-clip").hidden = false;
+    const had = state.trim.highlightId != null;
+    state.trim.highlightId = null;
+    state.trim.dragging = null;
+    state.trim.dirty = false;
+    const editor = $("#trim-editor");
+    if (editor) editor.hidden = true;
+    document.body.classList.remove("trim-modal-open");
+    if (!silent && had && state.lastJob && state.viewStep === 4) {
+      renderTopicPicker(state.lastJob);
+    }
+  }
+
+  async function saveTrimEditor() {
+    const id = state.trim.highlightId;
+    if (id == null || !state.activeJobId) return;
+    const clamped = clampTrimTimes(state.trim.start, state.trim.end);
+    const titleVal = ($("#trim-title-input")?.value || "").trim();
+    const speakerVal = ($("#trim-speaker-input")?.value || "").trim();
+    if (!titleVal) {
+      const hint = $("#trim-hint");
+      if (hint) hint.textContent = "Informe um título para o corte";
+      $("#trim-title-input")?.focus();
+      return;
+    }
+    const btn = $("#trim-save");
+    const hint = $("#trim-hint");
+    if (btn) btn.disabled = true;
+    if (hint) hint.textContent = "salvando ajustes…";
+    try {
+      const res = await fetch(
+        `/api/jobs/${state.activeJobId}/highlights/${id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            start_time: clamped.start,
+            end_time: clamped.end,
+            title: titleVal,
+            attributed_to: speakerVal,
+          }),
+        }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+
+      const h = highlightById(id);
+      if (h && data.highlight) {
+        Object.assign(h, {
+          start_time: data.highlight.start_time,
+          end_time: data.highlight.end_time,
+          title: data.highlight.title ?? titleVal,
+          attributed_to: data.highlight.attributed_to ?? speakerVal,
+          thumbnail_url: data.highlight.thumbnail_url || h.thumbnail_url,
+        });
+      } else if (h) {
+        h.start_time = clamped.start;
+        h.end_time = clamped.end;
+        h.title = titleVal;
+        h.attributed_to = speakerVal;
+      }
+      if (state.lastJob?.result?.highlights) {
+        state.lastJob.result.highlights = state.highlights;
+      }
+      if (data.invalidated_short) {
+        state.renderedIds.delete(Number(id));
+        if (state.lastJob?.result?.shorts) {
+          state.lastJob.result.shorts = state.lastJob.result.shorts.filter(
+            (s, i) => Number(s.id ?? i) !== Number(id)
+          );
+        }
+        if (state.lastJob) state.lastJob.status = "awaiting_selection";
+        state.jobStatus = "awaiting_selection";
+      }
+      state.trim.start = clamped.start;
+      state.trim.end = clamped.end;
+      state.trim.originalStart = clamped.start;
+      state.trim.originalEnd = clamped.end;
+      state.trim.originalTitle = titleVal;
+      state.trim.originalSpeaker = speakerVal;
+      state.trim.dirty = false;
+      const heading = $("#trim-title");
+      if (heading) heading.textContent = `Ajustar: ${titleVal}`;
+      syncTrimUI();
+      if (hint) {
+        hint.textContent = data.invalidated_short
+          ? "Ajustes salvos — este short será re-cortado"
+          : "Ajustes salvos";
+      }
+      closeTrimEditor();
+    } catch (err) {
+      if (hint) hint.textContent = `Erro: ${err.message || err}`;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  }
+
+  function timeFromTimelineClientX(clientX) {
+    const track = $("#trim-track");
+    if (!track) return state.trim.start;
+    const rect = track.getBoundingClientRect();
+    const ratio = rect.width > 0 ? (clientX - rect.left) / rect.width : 0;
+    const t = state.trim;
+    return t.winStart + Math.max(0, Math.min(1, ratio)) * (t.winEnd - t.winStart);
+  }
+
+  function startTrimDrag(edge, ev) {
+    ev.preventDefault();
+    ev.stopPropagation();
+    state.trim.dragging = edge;
+    state.trim.previewLoop = false;
+    const video = $("#trim-video");
+    video?.pause();
+    $("#trim-pause").hidden = true;
+    $("#trim-play-clip").hidden = false;
+  }
+
+  function onTrimPointerMove(ev) {
+    if (!state.trim.dragging) return;
+    const t = timeFromTimelineClientX(ev.clientX);
+    const opts = { recomputeWindow: false, markDirty: true };
+    if (state.trim.dragging === "start") {
+      setTrimRange(Math.min(t, state.trim.end - 1), state.trim.end, {
+        ...opts,
+        seek: true,
+      });
+    } else if (state.trim.dragging === "end") {
+      setTrimRange(state.trim.start, Math.max(t, state.trim.start + 1), {
+        ...opts,
+        seek: true,
+      });
+    } else if (state.trim.dragging === "seek") {
+      const video = $("#trim-video");
+      const clamped = Math.max(state.trim.winStart, Math.min(t, state.trim.winEnd));
+      if (video) {
+        try {
+          video.currentTime = clamped;
+        } catch (_) {}
+      }
+      updatePlayhead();
+    }
+  }
+
+  function onTrimPointerUp() {
+    if (!state.trim.dragging) return;
+    const was = state.trim.dragging;
+    state.trim.dragging = null;
+    // Soft pan only if a handle is near the edge — never recenter both sides.
+    if (was === "start" || was === "end") {
+      recomputeTrimWindow({ force: false });
+      syncTrimUI();
+      updatePlayhead();
+    }
+  }
+
+  $("#trim-handle-start")?.addEventListener("pointerdown", (ev) =>
+    startTrimDrag("start", ev)
+  );
+  $("#trim-handle-end")?.addEventListener("pointerdown", (ev) =>
+    startTrimDrag("end", ev)
+  );
+  $("#trim-track")?.addEventListener("pointerdown", (ev) => {
+    if (ev.target.closest(".trim-handle")) return;
+    startTrimDrag("seek", ev);
+    onTrimPointerMove(ev);
+  });
+  window.addEventListener("pointermove", onTrimPointerMove);
+  window.addEventListener("pointerup", onTrimPointerUp);
+  window.addEventListener("pointercancel", onTrimPointerUp);
+
+  $("#trim-start-input")?.addEventListener("change", () => {
+    const parsed = parseTimeInput($("#trim-start-input").value);
+    if (Number.isNaN(parsed)) {
+      syncTrimUI();
+      return;
+    }
+    setTrimRange(parsed, state.trim.end);
+  });
+  $("#trim-end-input")?.addEventListener("change", () => {
+    const parsed = parseTimeInput($("#trim-end-input").value);
+    if (Number.isNaN(parsed)) {
+      syncTrimUI();
+      return;
+    }
+    setTrimRange(state.trim.start, parsed);
+  });
+
+  $$(".trim-nudge-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const edge = btn.dataset.edge;
+      const delta = float(btn.dataset.delta);
+      if (edge === "start") setTrimRange(state.trim.start + delta, state.trim.end);
+      else setTrimRange(state.trim.start, state.trim.end + delta);
+    });
+  });
+
+  $("#trim-reset")?.addEventListener("click", () => {
+    const titleInput = $("#trim-title-input");
+    const speakerInput = $("#trim-speaker-input");
+    if (titleInput) titleInput.value = state.trim.originalTitle || "";
+    if (speakerInput) {
+      populateTrimSpeakerSelect(state.lastJob, state.trim.originalSpeaker);
+    }
+    state.trim.titleSpeaker = state.trim.originalSpeaker || "";
+    setTrimRange(state.trim.originalStart, state.trim.originalEnd, {
+      markDirty: true,
+      forceWindow: true,
+    });
+  });
+  $("#trim-close")?.addEventListener("click", () => closeTrimEditor());
+  $("#trim-save")?.addEventListener("click", () => saveTrimEditor());
+  $("#trim-editor")?.addEventListener("click", (ev) => {
+    if (ev.target.closest("[data-trim-dismiss]")) closeTrimEditor();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    if ($("#trim-editor")?.hidden) return;
+    closeTrimEditor();
+  });
+
+  function markTrimMetaDirty() {
+    if (state.trim.highlightId == null) return;
+    const titleVal = ($("#trim-title-input")?.value || "").trim();
+    const speakerVal = ($("#trim-speaker-input")?.value || "").trim();
+    const metaDirty =
+      titleVal !== (state.trim.originalTitle || "") ||
+      speakerVal !== (state.trim.originalSpeaker || "");
+    const timesDirty =
+      Math.abs(state.trim.start - state.trim.originalStart) > 0.01 ||
+      Math.abs(state.trim.end - state.trim.originalEnd) > 0.01;
+    state.trim.dirty = metaDirty || timesDirty;
+    syncTrimUI();
+  }
+  $("#trim-title-input")?.addEventListener("input", markTrimMetaDirty);
+  $("#trim-speaker-input")?.addEventListener("change", () => {
+    if (state.trim.highlightId == null) return;
+    const select = $("#trim-speaker-input");
+    const titleInput = $("#trim-title-input");
+    const next = (select?.value || "").trim();
+    const prev = String(state.trim.titleSpeaker || state.trim.originalSpeaker || "").trim();
+    if (titleInput && next && next.toLowerCase() !== prev.toLowerCase()) {
+      titleInput.value = replaceSpeakerInTitle(
+        titleInput.value,
+        prev,
+        next,
+        knownSpeakerNames(state.lastJob)
+      );
+      const heading = $("#trim-title");
+      if (heading) heading.textContent = `Ajustar: ${titleInput.value}`;
+    } else if (titleInput && !next && prev) {
+      // Speaker cleared: strip previous name from title when present
+      const stripped = String(titleInput.value || "")
+        .replace(new RegExp(`^\\s*${escapeRegExp(prev)}\\s*:\\s*`, "i"), "")
+        .replace(new RegExp(escapeRegExp(prev), "gi"), "")
+        .replace(/\s{2,}/g, " ")
+        .trim();
+      if (stripped) titleInput.value = stripped;
+      const heading = $("#trim-title");
+      if (heading) heading.textContent = `Ajustar: ${titleInput.value || "corte"}`;
+    }
+    state.trim.titleSpeaker = next;
+    markTrimMetaDirty();
+  });
+
+  $("#trim-play-clip")?.addEventListener("click", () => {
+    const video = $("#trim-video");
+    if (!video) return;
+    state.trim.previewLoop = true;
+    try {
+      video.currentTime = state.trim.start;
+    } catch (_) {}
+    video.play().catch(() => {});
+    $("#trim-play-clip").hidden = true;
+    $("#trim-pause").hidden = false;
+  });
+  $("#trim-pause")?.addEventListener("click", () => {
+    const video = $("#trim-video");
+    state.trim.previewLoop = false;
+    video?.pause();
+    $("#trim-pause").hidden = true;
+    $("#trim-play-clip").hidden = false;
+  });
+
+  const trimVideo = $("#trim-video");
+  trimVideo?.addEventListener("click", () => {
+    if (state.trim.highlightId == null) return;
+    if (trimVideo.paused) {
+      // If parked past the cut end, restart from start for a useful preview.
+      if (trimVideo.currentTime >= state.trim.end - 0.05) {
+        try {
+          trimVideo.currentTime = state.trim.start;
+        } catch (_) {}
+      }
+      state.trim.previewLoop = true;
+      trimVideo.play().catch(() => {});
+    } else {
+      state.trim.previewLoop = false;
+      trimVideo.pause();
+    }
+  });
+  trimVideo?.addEventListener("loadedmetadata", () => {
+    if (state.trim.highlightId == null) return;
+    if (Number.isFinite(trimVideo.duration) && trimVideo.duration > 0) {
+      state.trim.duration = Math.max(state.trim.duration, trimVideo.duration);
+      recomputeTrimWindow({ force: true });
+      syncTrimUI();
+    }
+    try {
+      trimVideo.currentTime = state.trim.start;
+    } catch (_) {}
+    updatePlayhead();
+  });
+  trimVideo?.addEventListener("seeked", () => {
+    updatePlayhead();
+    syncTrimLiveCaption();
+  });
+  trimVideo?.addEventListener("timeupdate", () => {
+    if (state.trim.highlightId == null) return;
+    updatePlayhead();
+    syncTrimLiveCaption();
+    if (
+      state.trim.previewLoop &&
+      !trimVideo.paused &&
+      trimVideo.currentTime >= state.trim.end - 0.05
+    ) {
+      trimVideo.pause();
+      state.trim.previewLoop = false;
+      try {
+        trimVideo.currentTime = state.trim.start;
+      } catch (_) {}
+      $("#trim-pause").hidden = true;
+      $("#trim-play-clip").hidden = false;
+      updatePlayhead();
+      syncTrimLiveCaption();
+    }
+  });
+  trimVideo?.addEventListener("play", () => {
+    if (state.trim.highlightId == null) return;
+    $("#trim-play-clip").hidden = true;
+    $("#trim-pause").hidden = false;
+    state.trim._captionKey = null;
+    syncTrimLiveCaption();
+  });
+  trimVideo?.addEventListener("pause", () => {
+    if (state.trim.highlightId == null) return;
+    if (!state.trim.previewLoop) {
+      $("#trim-pause").hidden = true;
+      $("#trim-play-clip").hidden = false;
+    }
+  });
+
+  $("#pick-continue").addEventListener("click", async () => {
     if (!state.activeJobId || state.selectedIds.size === 0) return;
+    if (state.trim.highlightId != null && state.trim.dirty) {
+      await saveTrimEditor();
+      if (state.trim.dirty) return; // save failed
+    }
+    closeTrimEditor({ silent: true });
+    const btn = $("#pick-continue");
+    btn.disabled = true;
+    state.captionStyle = {
+      ...state.captionStyle,
+      ...(state.jobParams?.caption_style || {}),
+    };
+    applyThemeToForm({ ...state.captionStyle, id: state.captionStyle.theme });
+    const style = readCaptionForm();
+    state.captionStyle = style;
+    try {
+      const res = await fetch(`/api/jobs/${state.activeJobId}/select`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: [...state.selectedIds], caption_style: style }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+      state.jobStatus = "rendering";
+      state.followJobStep = true;
+      setFlowStep(5);
+      if (state.lastJob?.result) {
+        const ready = [...state.selectedIds].filter((id) => state.renderedIds.has(id));
+        const pending = [...state.selectedIds].filter((id) => !state.renderedIds.has(id));
+        const currentId = pending[0] ?? null;
+        renderResults({
+          ...state.lastJob,
+          status: "rendering",
+          params: {
+            ...state.lastJob.params,
+            selected_ids: [...state.selectedIds],
+            caption_style: style,
+          },
+          result: {
+            ...state.lastJob.result,
+            selected_ids: [...state.selectedIds],
+            shorts: (state.lastJob.result.shorts || []).filter((s, i) =>
+              state.renderedIds.has(Number(s.id ?? i))
+            ),
+            render_progress: {
+              total: state.selectedIds.size,
+              done: ready.length,
+              current_id: currentId,
+              pending_ids: pending.slice(1),
+              done_ids: ready,
+            },
+          },
+        });
+      }
+      if (state.pollTimer) clearInterval(state.pollTimer);
+      pollJob();
+      state.pollTimer = setInterval(pollJob, 1500);
+    } catch (err) {
+      $("#pick-hint").textContent = `erro: ${err.message}`;
+      btn.disabled = false;
+      pollJob();
+    }
+  });
+
+  $("#pick-back")?.addEventListener("click", () => {
     state.followJobStep = false;
-    setFlowStep(3, { maxStep: 3 });
+    closeTrimEditor({ silent: true });
+    setFlowStep(3);
+    persistUiStep(3);
+    syncCaptionForm();
   });
 
   $("#format-back")?.addEventListener("click", () => {
     state.followJobStep = false;
-    setFlowStep(2);
-    if (state.lastJob) renderTopicPicker(state.lastJob);
+    setFlowStep(1);
   });
 
   $("#format-continue")?.addEventListener("click", async () => {
-    if (!state.activeJobId || state.selectedIds.size === 0) return;
+    if (!state.activeJobId) return;
     const btn = $("#format-continue");
     const hint = $("#format-hint");
     const aspect = $("#aspect_ratio")?.value || "9:16";
@@ -940,12 +2237,23 @@
     if (btn) btn.disabled = true;
     if (hint) hint.textContent = "salvando formato…";
     try {
+      if (state.selectedIds.size === 0 && state.lastJob) {
+        state.selectedIds = selectedIdsFromJob(
+          state.lastJob,
+          state.lastJob.result?.highlights || state.highlights
+        );
+      }
+      const selected = [...state.selectedIds]
+        .map(Number)
+        .filter((n) => !Number.isNaN(n));
       const res = await fetch(`/api/jobs/${state.activeJobId}/params`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           aspect_ratio: aspect,
           download_format: fmt,
+          ui_step: 3,
+          selected_ids: selected,
           regenerate: false,
         }),
       });
@@ -956,19 +2264,25 @@
           ...state.lastJob.params,
           aspect_ratio: aspect,
           download_format: fmt,
+          ui_step: 3,
+          flow_version: 2,
+          selected_ids: selected,
         };
       }
       state.jobParams = {
         ...(state.jobParams || {}),
         aspect_ratio: aspect,
         download_format: fmt,
+        ui_step: 3,
+        flow_version: 2,
+        selected_ids: selected,
       };
       if (hint) {
         hint.textContent =
           "Escolha a proporção do corte. A resolução vale para novos downloads (análise).";
       }
       state.followJobStep = false;
-      setFlowStep(4, { maxStep: 4 });
+      setFlowStep(3, { maxStep: 3 });
       syncCaptionForm();
     } catch (err) {
       if (hint) hint.textContent = `erro: ${err.message}`;
@@ -999,11 +2313,10 @@
   }
 
   function readCaptionForm() {
-    const enabled = $("#caption-enabled")?.checked ?? true;
     const themeBtn = $(".theme-chip.is-selected");
     return {
       theme: themeBtn?.dataset.theme || state.captionStyle.theme || "bold-white",
-      enabled,
+      enabled: true,
       font_name: $("#caption-font")?.value || "Arial Black",
       font_size: Number($("#caption-size")?.value || 72),
       outline: Number($("#caption-outline")?.value || 4),
@@ -1015,6 +2328,7 @@
       shadow: state.captionStyle.shadow ?? 0,
       margin_v: state.captionStyle.margin_v ?? 160,
       back_colour: state.captionStyle.back_colour || "&H80000000",
+      uppercase: state.captionStyle.uppercase !== false,
     };
   }
 
@@ -1068,71 +2382,179 @@
     return tokens.length ? tokens : ["Isso", "muda", "tudo"];
   }
 
-  function updateCaptionPreview() {
-    const preview = $("#caption-preview");
+  const captionPreview = {
+    start: 0,
+    end: 0,
+    words: [],
+    key: "",
+    bound: false,
+  };
+
+  function syncCaptionPreviewUi(playing) {
     const frame = $("#caption-preview-frame");
-    const bg = $("#caption-preview-bg");
-    const fallback = $("#caption-preview-fallback");
+    const toggle = $("#caption-preview-toggle");
+    const playBtn = $("#caption-preview-play");
+    frame?.classList.toggle("is-playing", Boolean(playing));
+    if (toggle) toggle.textContent = playing ? "❚❚ Pausar" : "▶ Pré-visualizar";
+    if (playBtn) playBtn.setAttribute("aria-label", playing ? "Pausar" : "Reproduzir preview");
+  }
+
+  async function syncCaptionPreviewCaption() {
+    const video = $("#caption-preview-video");
+    const caption = $("#caption-preview-caption");
+    const frame = $("#caption-preview-frame");
+    if (!video || !caption) return;
+    paintLiveCaption(caption, captionPreview.words, video.currentTime || 0, frame);
+  }
+
+  async function ensureCaptionPreviewWords(start, end) {
+    const key = `${Number(start).toFixed(2)}:${Number(end).toFixed(2)}`;
+    if (captionPreview.key === key && captionPreview.words.length) {
+      return captionPreview.words;
+    }
+    captionPreview.key = key;
+    captionPreview.start = start;
+    captionPreview.end = end;
+    captionPreview.words = await fetchCaptionWords(start, end);
+    return captionPreview.words;
+  }
+
+  async function toggleCaptionPreviewPlayback() {
+    const video = $("#caption-preview-video");
+    if (!video || !video.getAttribute("src")) return;
+    if (!video.paused) {
+      video.pause();
+      syncCaptionPreviewUi(false);
+      return;
+    }
+    pauseAllTopicVideos();
+    const start = captionPreview.start;
+    const end = Math.max(start + 0.5, captionPreview.end);
+    try {
+      if (
+        !Number.isFinite(video.currentTime) ||
+        video.currentTime < start - 0.05 ||
+        video.currentTime >= end - 0.15
+      ) {
+        video.currentTime = start;
+      }
+    } catch (_) {
+      /* ignore */
+    }
+    await ensureCaptionPreviewWords(start, end);
+    try {
+      await video.play();
+      syncCaptionPreviewUi(true);
+      syncCaptionPreviewCaption();
+    } catch (_) {
+      syncCaptionPreviewUi(false);
+    }
+  }
+
+  function bindCaptionPreviewVideo() {
+    if (captionPreview.bound) return;
+    const video = $("#caption-preview-video");
+    if (!video) return;
+    captionPreview.bound = true;
+
+    video.addEventListener("timeupdate", () => {
+      if (state.viewStep !== 3) return;
+      const end = captionPreview.end;
+      if (end > 0 && video.currentTime >= end - 0.05) {
+        try {
+          video.currentTime = captionPreview.start;
+        } catch (_) {
+          /* ignore */
+        }
+      }
+      syncCaptionPreviewCaption();
+    });
+    video.addEventListener("play", () => syncCaptionPreviewUi(true));
+    video.addEventListener("pause", () => {
+      if (state.viewStep === 3) syncCaptionPreviewUi(false);
+    });
+    video.addEventListener("ended", () => syncCaptionPreviewUi(false));
+
+    $("#caption-preview-frame")?.addEventListener("click", (ev) => {
+      if (ev.target.closest(".caption-preview-badge")) return;
+      ev.preventDefault();
+      toggleCaptionPreviewPlayback();
+    });
+    $("#caption-preview-toggle")?.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      toggleCaptionPreviewPlayback();
+    });
+  }
+
+  function updateCaptionPreview() {
+    const frame = $("#caption-preview-frame");
+    const video = $("#caption-preview-video");
     const badge = $("#caption-preview-badge");
     const meta = $("#caption-preview-meta");
-    if (!preview || !frame) return;
+    if (!frame || !video) return;
 
-    const aspect =
-      $("#aspect_ratio")?.value ||
-      state.jobParams?.aspect_ratio ||
-      "9:16";
+    bindCaptionPreviewVideo();
+
+    const aspect = currentAspectRatio();
     frame.dataset.ratio = aspect;
     if (badge) badge.textContent = aspect;
 
     const highlight = previewHighlight();
+    const start = float(highlight?.start_time);
+    const end = Math.max(start + 0.5, float(highlight?.end_time));
     const thumb = highlight?.thumbnail_url || "";
-    if (bg) {
-      if (thumb) {
-        bg.hidden = false;
-        if (bg.getAttribute("src") !== thumb) bg.src = thumb;
-        if (fallback) fallback.hidden = true;
-      } else {
-        bg.hidden = true;
-        bg.removeAttribute("src");
-        if (fallback) fallback.hidden = false;
+    const previewSrc = sourcePreviewUrl(state.lastJob);
+    const rangeKey = `${start.toFixed(2)}:${end.toFixed(2)}`;
+    const srcChanged = previewSrc && video.dataset.src !== previewSrc;
+    const rangeChanged = captionPreview.key !== rangeKey;
+
+    captionPreview.start = start;
+    captionPreview.end = end;
+
+    if (previewSrc) {
+      if (srcChanged) {
+        video.dataset.src = previewSrc;
+        video.src = previewSrc;
+      }
+      if (thumb) video.setAttribute("poster", thumb);
+      else video.removeAttribute("poster");
+      if ((srcChanged || rangeChanged) && video.paused) {
+        try {
+          video.currentTime = start;
+        } catch (_) {
+          /* ignore until metadata */
+        }
       }
     }
+
     if (meta) {
       const title = highlight?.title || "tópico selecionado";
-      meta.textContent = thumb
-        ? `Preview · ${aspect} · frame de “${title}”`
-        : `Preview · ${aspect} · sem miniatura do corte ainda`;
+      meta.textContent = previewSrc
+        ? `Preview · ${aspect} · “${title}” · clique para play/pause`
+        : `Preview · ${aspect} · vídeo fonte indisponível`;
     }
 
-    const words = previewWordsFromHighlight(highlight);
-    preview.innerHTML = words
-      .map((w, i) => {
-        const cls = i === 0 ? " is-done" : i === 1 ? " is-active" : "";
-        return `<span class="cap-word${cls}">${escapeHtml(w)}</span>`;
-      })
-      .join("");
+    const caption = $("#caption-preview-caption");
+    if (caption) {
+      if (rangeChanged || !captionPreview.words.length) {
+        captionPreview.key = "";
+        captionPreview.words = [];
+        const sample = previewWordsFromHighlight(highlight).map((word, i) => ({
+          word,
+          start: start + i * 0.35,
+          end: start + (i + 1) * 0.35,
+        }));
+        paintLiveCaption(caption, sample, start + 0.4, frame);
+        ensureCaptionPreviewWords(start, end).then(() => {
+          syncCaptionPreviewCaption();
+        });
+      } else {
+        syncCaptionPreviewCaption();
+      }
+    }
 
-    const primary = $("#caption-primary")?.value || "#ffff00";
-    const secondary = $("#caption-secondary")?.value || "#ffffff";
-    const outline = $("#caption-outline-color")?.value || "#000000";
-    const size = Number($("#caption-size")?.value || 72);
-    const bold = $("#caption-bold")?.checked;
-    const font = $("#caption-font")?.value || "Arial Black";
-    const border = Number($("#caption-outline")?.value || 4);
-    // PlayRes design width matches ASS default (1080). With paint-order
-    // stroke→fill, only the outer half of -webkit-text-stroke shows, so
-    // stroke width must be 2× ASS Outline to match burn-in.
-    const frameW = frame.clientWidth || 280;
-    const scale = frameW / 1080;
-    const strokePx = border > 0 ? border * scale * 2 : 0;
-    preview.style.fontFamily = `"${font}", Impact, sans-serif`;
-    preview.style.fontSize = `${Math.max(14, Math.round(size * scale))}px`;
-    preview.style.fontWeight = bold ? "900" : "600";
-    preview.style.webkitTextStroke = strokePx > 0 ? `${strokePx}px ${outline}` : "0";
-    preview.style.paintOrder = "stroke fill";
-    $$(".cap-word", preview).forEach((w, i) => {
-      w.style.color = i <= 1 ? primary : secondary;
-    });
+    syncCaptionPreviewUi(!video.paused && Boolean(previewSrc));
   }
 
   function renderThemeGrid() {
@@ -1172,12 +2594,9 @@
   function syncCaptionForm() {
     renderThemeGrid();
     const style = state.captionStyle;
-    if ($("#caption-enabled")) $("#caption-enabled").checked = style.enabled !== false;
     applyThemeToForm({ ...style, id: style.theme });
     const controls = $("#caption-controls");
-    if (controls) controls.hidden = style.enabled === false && !$("#caption-enabled")?.checked;
-    const enabled = $("#caption-enabled")?.checked ?? true;
-    if (controls) controls.hidden = !enabled;
+    if (controls) controls.hidden = false;
     updateCaptionPreview();
   }
 
@@ -1196,107 +2615,95 @@
     }
   }
 
-  $("#caption-enabled")?.addEventListener("change", () => {
-    const on = $("#caption-enabled").checked;
-    const controls = $("#caption-controls");
-    if (controls) controls.hidden = !on;
-  });
-
   ["caption-font", "caption-size", "caption-outline", "caption-words", "caption-primary", "caption-secondary", "caption-outline-color", "caption-bold"].forEach((id) => {
     $(`#${id}`)?.addEventListener("input", updateCaptionPreview);
     $(`#${id}`)?.addEventListener("change", updateCaptionPreview);
   });
 
   $("#aspect_ratio")?.addEventListener("change", () => {
-    if (state.viewStep === 4) updateCaptionPreview();
-  });
-
-  $("#caption-preview-bg")?.addEventListener("load", updateCaptionPreview);
-  $("#caption-preview-bg")?.addEventListener("error", () => {
-    const bg = $("#caption-preview-bg");
-    const fallback = $("#caption-preview-fallback");
-    if (bg) {
-      bg.hidden = true;
-      bg.removeAttribute("src");
-    }
-    if (fallback) fallback.hidden = false;
+    applyPreviewAspect();
+    if (state.viewStep === 3) updateCaptionPreview();
   });
 
   $("#caption-back")?.addEventListener("click", () => {
     state.followJobStep = false;
-    setFlowStep(3);
+    setFlowStep(2);
+    persistUiStep(2);
   });
 
   $("#caption-continue")?.addEventListener("click", async () => {
-    if (!state.activeJobId || state.selectedIds.size === 0) return;
+    if (!state.activeJobId) return;
     const btn = $("#caption-continue");
+    const hint = $("#caption-hint");
     btn.disabled = true;
     const style = readCaptionForm();
     state.captionStyle = style;
     try {
-      const res = await fetch(`/api/jobs/${state.activeJobId}/select`, {
-        method: "POST",
+      const aspect = currentAspectRatio();
+      const fmt =
+        $("#download_format")?.value ||
+        state.jobParams?.download_format ||
+        "720";
+      const res = await fetch(`/api/jobs/${state.activeJobId}/params`, {
+        method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids: [...state.selectedIds], caption_style: style }),
+        body: JSON.stringify({
+          aspect_ratio: aspect,
+          download_format: fmt,
+          ui_step: 4,
+          caption_style: style,
+          regenerate: false,
+        }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
-      state.jobStatus = "rendering";
-      state.followJobStep = true;
-      setFlowStep(5);
-      if (state.lastJob?.result) {
-        const ready = [...state.selectedIds].filter((id) => state.renderedIds.has(id));
-        const pending = [...state.selectedIds].filter((id) => !state.renderedIds.has(id));
-        const currentId = pending[0] ?? null;
-        renderResults({
-          ...state.lastJob,
-          status: "rendering",
-          params: {
-            ...state.lastJob.params,
-            selected_ids: [...state.selectedIds],
-            caption_style: style,
-          },
-          result: {
-            ...state.lastJob.result,
-            selected_ids: [...state.selectedIds],
-            shorts: (state.lastJob.result.shorts || []).filter((s, i) =>
-              state.renderedIds.has(Number(s.id ?? i))
-            ),
-            render_progress: {
-              total: state.selectedIds.size,
-              done: ready.length,
-              current_id: currentId,
-              pending_ids: pending.slice(1),
-              done_ids: ready,
-            },
-          },
-        });
+      if (state.lastJob?.params) {
+        state.lastJob.params.ui_step = 4;
+        state.lastJob.params.flow_version = 2;
+        state.lastJob.params.caption_style = style;
       }
-      if (state.pollTimer) clearInterval(state.pollTimer);
-      pollJob();
-      state.pollTimer = setInterval(pollJob, 1500);
+      state.jobParams = {
+        ...(state.jobParams || {}),
+        ui_step: 4,
+        flow_version: 2,
+        caption_style: style,
+      };
+      state.followJobStep = false;
+      setFlowStep(4, { maxStep: 4 });
+      if (state.lastJob) renderTopicPicker(state.lastJob);
+      if (hint) {
+        hint.textContent =
+          "Escolha o tema e ajuste tipografia — as palavras destacam no ritmo da fala";
+      }
     } catch (err) {
-      $("#caption-hint").textContent = `erro: ${err.message}`;
+      if (hint) hint.textContent = `erro: ${err.message}`;
+    } finally {
       btn.disabled = false;
-      pollJob();
     }
   });
 
   $("#goto-topics-btn")?.addEventListener("click", () => {
-    if (state.maxStep >= 2) {
+    if (state.maxStep >= 4) {
+      state.followJobStep = false;
+      setFlowStep(4);
+      persistUiStep(4);
+      if (state.lastJob) renderTopicPicker(state.lastJob);
+    } else if (state.maxStep >= 3) {
+      state.followJobStep = false;
+      setFlowStep(3);
+      persistUiStep(3);
+      syncCaptionForm();
+    } else if (state.maxStep >= 2 && state.jobStatus === "awaiting_cast") {
       state.followJobStep = false;
       setFlowStep(2);
-      if (state.lastJob) {
-        if (state.jobStatus === "awaiting_cast") renderCastForm(state.lastJob);
-        else renderTopicPicker(state.lastJob);
-      }
+      if (state.lastJob) renderCastForm(state.lastJob);
     }
   });
 
   $("#goto-format-btn")?.addEventListener("click", () => {
-    if (state.maxStep >= 3 && state.selectedIds.size > 0) {
+    if (state.maxStep >= 2 && state.jobStatus !== "awaiting_cast") {
       state.followJobStep = false;
-      setFlowStep(3);
+      setFlowStep(2);
     }
   });
 
@@ -1317,26 +2724,41 @@
     const hook = short?.hook_sentence ?? highlight.hook_sentence ?? "—";
     const reason = short?.virality_reason ?? highlight.virality_reason ?? "—";
     const clip = short?.clip_url || "";
-    const thumb = highlight.thumbnail_url
-      ? `<img class="short-skeleton-thumb" src="${escapeAttr(highlight.thumbnail_url)}" alt="" />`
+    // Short poster only after the clip exists (or server already published thumbnail_url).
+    // While queued/rendering, reuse the topic preview thumb — never hit short-thumbs 404s.
+    const previewThumb =
+      highlight.thumbnail_url ||
+      highlight.preview_thumbnail_url ||
+      (state.activeJobId
+        ? `/api/jobs/${state.activeJobId}/preview-thumbs/${id}?v=2`
+        : "");
+    const shortThumb =
+      short?.thumbnail_url ||
+      (cardState === "ready" && state.activeJobId
+        ? `/api/jobs/${state.activeJobId}/short-thumbs/${id}?v=2`
+        : "");
+    const poster = (cardState === "ready" ? shortThumb || previewThumb : previewThumb) || "";
+    const thumbImg = poster
+      ? `<img class="short-skeleton-thumb" src="${escapeAttr(poster)}" alt="" loading="lazy" onerror="this.remove()" />`
       : "";
 
     let media;
     if (cardState === "ready" && clip) {
-      media = `<video controls playsinline src="${escapeAttr(clip)}"></video>`;
+      const posterAttr = poster ? ` poster="${escapeAttr(poster)}"` : "";
+      media = `<video controls playsinline preload="metadata" src="${escapeAttr(clip)}"${posterAttr}></video>`;
     } else if (cardState === "error") {
       media = `<div class="short-skeleton is-error"><span>${escapeHtml(
         short?.error || "Clip indisponível"
       )}</span></div>`;
     } else if (cardState === "rendering") {
       media = `<div class="short-skeleton is-rendering" aria-busy="true">
-        ${thumb}
+        ${thumbImg}
         <div class="short-skeleton-shine"></div>
         <span class="short-skeleton-label">Renderizando…</span>
       </div>`;
     } else if (cardState === "pending") {
       media = `<div class="short-skeleton is-pending" aria-busy="true">
-        ${thumb}
+        ${thumbImg}
         <div class="short-skeleton-shine"></div>
         <span class="short-skeleton-label">Na fila</span>
       </div>`;
@@ -1353,6 +2775,26 @@
             ? `<p class="meta-row short-status-hint">Aguardando na fila</p>`
             : "";
 
+    const ytUrl = short?.youtube_url || "";
+    const ytActions =
+      cardState === "ready" && clip
+        ? `<div class="short-actions" data-short-id="${escapeAttr(String(id))}">
+            ${
+              ytUrl
+                ? `<a class="btn ghost btn-tiny" href="${escapeAttr(
+                    ytUrl
+                  )}" target="_blank" rel="noopener">Ver no YouTube</a>
+                   <button type="button" class="btn ghost btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
+                     String(id)
+                   )}">Reenviar</button>`
+                : `<button type="button" class="btn primary btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
+                    String(id)
+                  )}">Enviar ao YouTube</button>`
+            }
+            <p class="hint yt-upload-hint" hidden></p>
+          </div>`
+        : "";
+
     return `
       <div class="short-media">${media}</div>
       <div class="short-meta">
@@ -1362,6 +2804,7 @@
         <p class="meta-row"><strong>Hook:</strong> ${escapeHtml(hook)}</p>
         <p class="meta-row"><strong>Por quê:</strong> ${escapeHtml(reason)}</p>
         ${download}
+        ${ytActions}
       </div>
     `;
   }
@@ -1467,6 +2910,79 @@
       if (!seen.has(key)) el.remove();
     });
   }
+
+  async function uploadShortToYoutube(shortId, btn) {
+    const jobId = state.activeJobId || state.lastJob?.id;
+    if (!jobId) return;
+    const actions = btn.closest(".short-actions");
+    const hint = actions?.querySelector(".yt-upload-hint");
+    const prevLabel = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "Enviando…";
+    if (hint) {
+      hint.hidden = false;
+      hint.textContent = "Upload em andamento (pode levar alguns minutos)…";
+    }
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/shorts/${shortId}/youtube`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail;
+        const msg =
+          typeof detail === "string"
+            ? detail
+            : Array.isArray(detail)
+              ? detail.map((d) => d.msg || JSON.stringify(d)).join("; ")
+              : data.message || `HTTP ${res.status}`;
+        throw new Error(msg);
+      }
+      if (state.lastJob?.result?.shorts) {
+        const shorts = state.lastJob.result.shorts;
+        for (let i = 0; i < shorts.length; i++) {
+          const sid = Number(shorts[i].id ?? i);
+          if (sid === Number(shortId)) {
+            shorts[i].youtube_url = data.url;
+            shorts[i].youtube_video_id = data.video_id;
+            shorts[i].youtube_privacy = data.privacy_status;
+            break;
+          }
+        }
+      }
+      if (actions) {
+        actions.innerHTML = `
+          <a class="btn ghost btn-tiny" href="${escapeAttr(
+            data.url
+          )}" target="_blank" rel="noopener">Ver no YouTube</a>
+          <button type="button" class="btn ghost btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
+            String(shortId)
+          )}">Reenviar</button>
+          <p class="hint yt-upload-hint">${escapeHtml(
+            data.privacy_status
+              ? `Publicado como ${data.privacy_status}`
+              : "Enviado"
+          )}</p>
+        `;
+      }
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+      if (hint) {
+        hint.hidden = false;
+        hint.textContent = String(err.message || err);
+      }
+    }
+  }
+
+  $("#results")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest?.("[data-yt-upload]");
+    if (!btn || btn.disabled) return;
+    ev.preventDefault();
+    uploadShortToYoutube(btn.getAttribute("data-yt-upload"), btn);
+  });
 
   /* ---------- Jobs list ---------- */
   $("#refresh-jobs").addEventListener("click", loadJobs);
