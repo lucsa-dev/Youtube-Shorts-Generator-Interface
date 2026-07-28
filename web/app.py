@@ -255,9 +255,10 @@ def _write_config(updates: Dict[str, str]) -> None:
 def _public_short(job_id: str, short: Dict[str, Any], index: int) -> Dict[str, Any]:
     out = dict(short)
     clip = short.get("clip_url") or ""
+    hid = _short_id(short, index)
     if clip and not clip.startswith("http"):
-        # Local path → serve via our API
-        out["clip_url"] = f"/api/jobs/{job_id}/clips/{index}"
+        # Serve by highlight id so URLs stay stable as shorts arrive mid-render
+        out["clip_url"] = f"/api/jobs/{job_id}/clips/{hid}"
         out["local_path"] = clip
     return out
 
@@ -403,6 +404,36 @@ def _short_id(short: Dict[str, Any], fallback: int = -1) -> int:
         return fallback
 
 
+def _build_render_result(
+    analysis: Dict[str, Any],
+    selected_ids: List[int],
+    done_by_id: Dict[int, Dict[str, Any]],
+    *,
+    phase: str,
+    current_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    shorts = [done_by_id[sid] for sid in selected_ids if sid in done_by_id]
+    pending_ids = [
+        sid for sid in selected_ids if sid not in done_by_id and sid != current_id
+    ]
+    return {
+        "mode": analysis.get("mode"),
+        "phase": phase,
+        "source_video_url": analysis.get("source_video_url"),
+        "transcript": analysis.get("transcript"),
+        "highlights": analysis.get("highlights") or [],
+        "selected_ids": list(selected_ids),
+        "shorts": shorts,
+        "render_progress": {
+            "total": len(selected_ids),
+            "done": len(done_by_id),
+            "current_id": current_id,
+            "pending_ids": pending_ids,
+            "done_ids": [sid for sid in selected_ids if sid in done_by_id],
+        },
+    }
+
+
 def _run_render(
     job_id: str,
     selected_ids: List[int],
@@ -455,45 +486,69 @@ def _run_render(
     else:
         _append_log(job_id, f"Cortando {len(render_ids)} tópicos selecionados…")
 
+    done_by_id: Dict[int, Dict[str, Any]] = {
+        sid: existing_by_id[sid] for sid in reuse_ids
+    }
+
+    def publish(phase: str, current_id: Optional[int] = None) -> None:
+        result = _build_render_result(
+            analysis, selected_ids, done_by_id, phase=phase, current_id=current_id
+        )
+        with _jobs_lock:
+            job = _jobs[job_id]
+            job["result"] = result
+            job["updated_at"] = _now()
+            if phase == "completed":
+                job["status"] = "completed"
+                job["error"] = None
+                job["finished_at"] = _now()
+            else:
+                job["status"] = "rendering"
+            _persist_job(job)
+
+    first_current = render_ids[0] if render_ids else None
+    publish("rendering", current_id=first_current)
+
     capture = LogCapture(job_id, sys.stdout)
     err_capture = LogCapture(job_id, sys.stderr)
 
     try:
         new_shorts: List[Dict[str, Any]] = []
         if render_ids:
+            remaining = list(render_ids)
+
+            def on_short_done(short: Dict[str, Any], _i: int, _total: int) -> None:
+                sid = _short_id(short)
+                done_by_id[sid] = short
+                new_shorts.append(short)
+                if sid in remaining:
+                    remaining.remove(sid)
+                next_id = remaining[0] if remaining else None
+                publish("rendering", current_id=next_id)
+                title = short.get("title") or f"#{sid}"
+                if short.get("error"):
+                    _append_log(job_id, f"Falhou short {sid}: {title} — {short['error']}")
+                else:
+                    _append_log(
+                        job_id,
+                        f"Pronto {len(done_by_id)}/{len(selected_ids)}: {title}",
+                    )
+
             with redirect_stdout(capture), redirect_stderr(err_capture):
                 partial = render_selected_shorts(
                     analysis,
                     render_ids,
                     aspect_ratio=params.get("aspect_ratio") or "9:16",
+                    on_short_done=on_short_done,
                 )
-            new_shorts = partial.get("shorts") or []
+            # Ensure any shorts from the batch are present even if callback skipped
+            for s in partial.get("shorts") or []:
+                done_by_id[_short_id(s)] = s
 
-        merged_by_id = {
-            **{sid: existing_by_id[sid] for sid in reuse_ids},
-            **{_short_id(s, i): s for i, s in enumerate(new_shorts)},
-        }
-        shorts = [merged_by_id[sid] for sid in selected_ids if sid in merged_by_id]
-        result = {
-            "mode": analysis.get("mode"),
-            "phase": "completed",
-            "source_video_url": analysis.get("source_video_url"),
-            "transcript": analysis.get("transcript"),
-            "highlights": analysis.get("highlights") or [],
-            "selected_ids": list(selected_ids),
-            "shorts": shorts,
-        }
-        with _jobs_lock:
-            job = _jobs[job_id]
-            job["status"] = "completed"
-            job["result"] = result
-            job["error"] = None
-            job["updated_at"] = _now()
-            job["finished_at"] = _now()
-            _persist_job(job)
+        publish("completed", current_id=None)
         _append_log(
             job_id,
-            f"Concluído: {len(shorts)} shorts "
+            f"Concluído: {len(done_by_id)} shorts "
             f"({len(new_shorts)} novos, {len(reuse_ids)} reaproveitados).",
         )
     except Exception as e:
@@ -504,6 +559,11 @@ def _run_render(
             job["error"] = str(e)
             job["updated_at"] = _now()
             job["finished_at"] = _now()
+            # Keep partial shorts so the UI can show what already rendered
+            if done_by_id:
+                job["result"] = _build_render_result(
+                    analysis, selected_ids, done_by_id, phase="failed"
+                )
             _persist_job(job)
         _append_log(job_id, f"ERRO: {e}")
         _append_log(job_id, tb)
@@ -784,16 +844,27 @@ def download_result_json(job_id: str):
     return FileResponse(path, media_type="application/json", filename=f"shorts_{job_id}.json")
 
 
-@app.get("/api/jobs/{job_id}/clips/{index}")
-def get_clip(job_id: str, index: int):
+@app.get("/api/jobs/{job_id}/clips/{clip_ref}")
+def get_clip(job_id: str, clip_ref: int):
     with _jobs_lock:
         job = _jobs.get(job_id)
         if not job or not job.get("result"):
             raise HTTPException(404, "Job/resultado não encontrado")
         shorts = job["result"].get("shorts", [])
-        if index < 0 or index >= len(shorts):
+        clip = ""
+        # Prefer highlight id (stable during progressive render)
+        for i, s in enumerate(shorts):
+            if _short_id(s, i) == clip_ref:
+                clip = s.get("clip_url") or ""
+                break
+        else:
+            # Legacy: treat as array index
+            if 0 <= clip_ref < len(shorts):
+                clip = shorts[clip_ref].get("clip_url") or ""
+            else:
+                raise HTTPException(404, "Clip não encontrado")
+        if not clip:
             raise HTTPException(404, "Clip não encontrado")
-        clip = shorts[index].get("clip_url") or ""
     if clip.startswith("http"):
         return JSONResponse({"redirect": clip})
     path = Path(clip)
@@ -817,19 +888,33 @@ def _sorted_selection_ids(highlights: List[Dict[str, Any]], ids: List[int]) -> L
     return sorted(ids, key=lambda i: float(by_id[i].get("start_time", 0)))
 
 
+def _job_highlights(job: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return list((job.get("result") or {}).get("highlights") or [])
+
+
+def _job_allows_selection(job: Dict[str, Any]) -> bool:
+    """Selection is allowed after analysis, including recoverable failures."""
+    status = job.get("status")
+    if status in ("awaiting_selection", "completed"):
+        return True
+    # Render/analyze interrupted or failed after analysis — user can retry cut
+    if status == "failed" and _job_highlights(job):
+        return True
+    return False
+
+
 @app.post("/api/jobs/{job_id}/select")
 def select_highlights(job_id: str, body: SelectHighlights):
     with _jobs_lock:
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "Job não encontrado")
-        if job["status"] not in ("awaiting_selection", "completed"):
+        if not _job_allows_selection(job):
             raise HTTPException(
                 400,
                 f"Job não permite nova seleção (status={job['status']})",
             )
-        result = job.get("result") or {}
-        highlights = result.get("highlights") or []
+        highlights = _job_highlights(job)
         if not highlights:
             raise HTTPException(400, "Job ainda não tem tópicos analisados")
         valid_ids = {int(h.get("id", i)) for i, h in enumerate(highlights)}
@@ -841,6 +926,12 @@ def select_highlights(job_id: str, body: SelectHighlights):
             raise HTTPException(400, f"IDs inválidos: {bad}")
         ids = _sorted_selection_ids(highlights, ids)
         force = bool(body.force) or bool(job["params"].get("force_rerender"))
+        # Clear prior failure so UI reflects a fresh render attempt
+        if job["status"] == "failed":
+            job["status"] = "awaiting_selection"
+            job["error"] = None
+            job["updated_at"] = _now()
+            _persist_job(job)
 
     thread = threading.Thread(
         target=_run_render,
@@ -871,7 +962,7 @@ def update_job_params(job_id: str, body: UpdateJobParams):
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "Job não encontrado")
-        if job["status"] not in ("awaiting_selection", "completed"):
+        if not _job_allows_selection(job):
             raise HTTPException(
                 400,
                 f"Não é possível alterar params agora (status={job['status']})",
@@ -1028,12 +1119,31 @@ def _load_persisted_jobs() -> None:
             result_path = JOBS_DIR / f"{job_id}_result.json"
             if result_path.exists():
                 data["result"] = json.loads(result_path.read_text(encoding="utf-8"))
-            # Mark interrupted in-flight runs as failed; keep selection pause
-            if data.get("status") in ("queued", "analyzing", "rendering", "running"):
-                data["status"] = "failed"
-                data["error"] = data.get("error") or "Interrompido (servidor reiniciou)"
-            # awaiting_selection + completed/failed stay as-is
             data.setdefault("logs", [])
+            # Interrupted in-flight runs: recover to selection if analysis exists
+            if data.get("status") in ("queued", "analyzing", "rendering", "running"):
+                if _job_highlights(data):
+                    data["status"] = "awaiting_selection"
+                    data["error"] = None
+                    data["logs"].append(
+                        {
+                            "ts": _now(),
+                            "message": (
+                                "Servidor reiniciou durante o processamento — "
+                                "análise preservada; selecione os tópicos novamente."
+                            ),
+                        }
+                    )
+                    data["updated_at"] = _now()
+                    _persist_job(data)
+                else:
+                    data["status"] = "failed"
+                    data["error"] = (
+                        data.get("error") or "Interrompido (servidor reiniciou)"
+                    )
+                    data["updated_at"] = _now()
+                    _persist_job(data)
+            # awaiting_selection + completed/failed stay as-is
             _jobs[job_id] = data
         except Exception:
             continue
