@@ -10,6 +10,9 @@ The web UI runs analysis in stages so the user can name speakers, then pick
 which highlights to render. CLI still runs the full pipeline in one shot
 (auto-accepting suggested speaker names).
 """
+import os
+import re
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
 from .cast import (
@@ -19,10 +22,40 @@ from .cast import (
     label_transcript_speakers,
 )
 from .clipper import crop_highlights
-from .config import normalize_language, resolve_content_language
+from .config import LOCAL_OUTPUT_DIR, normalize_language, resolve_content_language
 from .downloader import download_youtube
 from .highlights import call_muapi_llm, get_highlights, snippet_for_range
 from .transcriber import transcribe
+
+
+def _source_folder_slug(analysis: Dict) -> str:
+    """Folder name for rendered shorts — YouTube id from the step-1 source."""
+    from .local.downloader import _extract_youtube_video_id
+
+    source_url = str(analysis.get("source_url") or "")
+    source_video = str(analysis.get("source_video_url") or "")
+    meta = analysis.get("metadata") or {}
+
+    video_id = (
+        _extract_youtube_video_id(source_url)
+        or _extract_youtube_video_id(source_video)
+        or (str(meta.get("id") or "").strip() or None)
+    )
+
+    if not video_id and source_video:
+        stem = Path(source_video).stem
+        if stem.startswith("source_"):
+            video_id = stem[len("source_") :]
+        elif stem:
+            video_id = stem
+
+    slug = re.sub(r"[^\w\-]+", "_", video_id or "unknown").strip("_") or "unknown"
+    return slug[:80]
+
+
+def _shorts_output_dir(analysis: Dict) -> str:
+    """LOCAL_OUTPUT_DIR/<youtube_id>/ for per-source rendered clips."""
+    return os.path.join(LOCAL_OUTPUT_DIR, _source_folder_slug(analysis))
 
 
 def _enrich_highlights(highlights: List[Dict], transcript: Dict) -> List[Dict]:
@@ -245,7 +278,11 @@ def render_selected_shorts(
     transcript = analysis.get("transcript")
     style = resolve_style(caption_style)
 
-    print(f"[pipeline] cropping {len(selected)} selected highlights", flush=True)
+    out_dir = _shorts_output_dir(analysis)
+    print(
+        f"[pipeline] cropping {len(selected)} selected highlights → {out_dir}/",
+        flush=True,
+    )
 
     if mode == "local":
         from .local.clipper import crop_highlights_local
@@ -254,6 +291,7 @@ def render_selected_shorts(
             source,
             selected,
             aspect_ratio=aspect_ratio,
+            out_dir=out_dir,
             on_short_done=on_short_done,
             transcript=transcript,
             caption_style=style,

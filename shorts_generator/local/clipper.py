@@ -7,10 +7,32 @@ Two stages per highlight:
      cascade — same approach as the original repo, no external models).
 """
 import os
+import re
 import subprocess
 from typing import Dict, List, Optional, Tuple
 
 from ..config import LOCAL_FACE_SMOOTHING, LOCAL_OUTPUT_DIR
+
+
+def _safe_filename(title: str, *, max_len: int = 80) -> str:
+    """Sanitize a highlight title for use as a filesystem basename."""
+    text = (title or "").strip()
+    text = text.replace(":", " -")
+    text = re.sub(r"[\\/:*?\"<>|]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" ._")
+    if not text:
+        return "untitled"
+    return text[:max_len].rstrip(" ._")
+
+
+def _short_out_path(out_dir: str, highlight: Dict, index: int) -> str:
+    hid = highlight.get("id", index)
+    try:
+        hid_n = int(hid)
+    except (TypeError, ValueError):
+        hid_n = index
+    slug = _safe_filename(str(highlight.get("title") or f"short_{hid_n:02d}"))
+    return os.path.join(out_dir, f"{hid_n:02d} - {slug}.mp4")
 
 
 def _ratio(aspect_ratio: str) -> float:
@@ -173,9 +195,8 @@ def crop_highlights_local(
     results: List[Dict] = []
     total = len(highlights)
     for i, h in enumerate(highlights, 1):
-        hid = h.get("id", i)
-        out_path = os.path.join(out_dir, f"short_{int(hid):02d}.mp4")
-        print(f"[clip/local] {i}/{total}: {h.get('title', '(untitled)')}", flush=True)
+        out_path = _short_out_path(out_dir, h, i)
+        print(f"[clip/local] {i}/{total}: {h.get('title', '(untitled)')} → {out_path}", flush=True)
         try:
             start = float(h["start_time"])
             end = float(h["end_time"])
