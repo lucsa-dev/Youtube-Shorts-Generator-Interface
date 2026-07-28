@@ -141,12 +141,21 @@
   function showFlowView(step) {
     const form = $("#generate-form");
     const hasJob = Boolean(state.activeJobId);
+    const hasTopics = state.highlights.length > 0;
+    const selectableStatus = ["awaiting_selection", "completed", "rendering", "failed"].includes(
+      state.jobStatus
+    );
     const editable =
       hasJob &&
       step === 1 &&
-      ["awaiting_selection", "completed"].includes(state.jobStatus);
+      (["awaiting_selection", "completed"].includes(state.jobStatus) ||
+        (state.jobStatus === "failed" && hasTopics));
 
-    form?.classList.toggle("is-locked", hasJob && !editable);
+    const step1Fields = $("#step1-fields");
+    if (step1Fields) step1Fields.hidden = step !== 1;
+
+    // Lock only on step 1 while the job is running (fields are hidden on steps 2–3).
+    form?.classList.toggle("is-locked", hasJob && step === 1 && !editable);
     form?.classList.toggle("is-editing-job", editable);
 
     const newActions = $("#new-job-actions");
@@ -164,16 +173,14 @@
     }
     if (run) run.hidden = false;
 
-    const canPick =
-      state.highlights.length > 0 &&
-      ["awaiting_selection", "completed", "rendering"].includes(state.jobStatus);
+    const canPick = hasTopics && selectableStatus;
 
     if (pick) {
       pick.hidden = !(step === 2 && canPick);
     }
     if (results) {
       results.hidden = step !== 3;
-      if (step === 3 && state.lastJob?.result?.shorts) {
+      if (step === 3 && state.lastJob?.result) {
         renderResults(state.lastJob);
       }
     }
@@ -490,7 +497,7 @@
     }
     if (state.pollTimer) clearInterval(state.pollTimer);
     pollJob();
-    state.pollTimer = setInterval(pollJob, 2000);
+    state.pollTimer = setInterval(pollJob, 1500);
   }
 
   async function pollJob() {
@@ -531,9 +538,23 @@
           state.pollTimer = null;
         }
       } else if (job.status === "rendering") {
+        const shorts = job.result?.shorts || [];
+        state.renderedIds = new Set(
+          shorts
+            .filter((s) => s.clip_url && !s.error)
+            .map((s, i) => Number(s.id ?? i))
+            .filter((n) => !Number.isNaN(n))
+        );
+        if (job.params?.selected_ids?.length) {
+          state.selectedIds = new Set(job.params.selected_ids.map(Number));
+        } else if (job.result?.selected_ids?.length) {
+          state.selectedIds = new Set(job.result.selected_ids.map(Number));
+        }
+        state.highlights = job.result?.highlights || state.highlights;
         state.maxStep = Math.max(state.maxStep, 3);
         if (state.followJobStep) setFlowStep(3);
         else showFlowView(state.viewStep);
+        if (state.viewStep === 3) renderResults(job);
       } else if (job.status === "completed" && job.result) {
         const shorts = job.result.shorts || [];
         state.renderedIds = new Set(
@@ -560,7 +581,17 @@
         state.pollTimer = null;
         const logEl = $("#job-log");
         logEl.textContent += `\n\nFALHOU: ${job.error || "erro desconhecido"}`;
-        showFlowView(state.viewStep);
+        const highlights = job.result?.highlights || [];
+        if (highlights.length) {
+          // Análise sobreviveu — permite retentar a seleção/corte
+          prepareSelection(job);
+          state.maxStep = Math.max(state.maxStep, 2);
+          if (state.followJobStep) setFlowStep(2);
+          else showFlowView(state.viewStep);
+          if (state.viewStep === 2) renderTopicPicker(job);
+        } else {
+          showFlowView(state.viewStep);
+        }
       }
     } catch {
       /* ignore transient poll errors */
@@ -714,12 +745,39 @@
       state.followJobStep = true;
       setFlowStep(3);
       setBadge("rendering");
+      // Optimistic skeleton grid while the first poll arrives
+      if (state.lastJob?.result) {
+        const ready = [...state.selectedIds].filter((id) => state.renderedIds.has(id));
+        const pending = [...state.selectedIds].filter((id) => !state.renderedIds.has(id));
+        const currentId = pending[0] ?? null;
+        renderResults({
+          ...state.lastJob,
+          status: "rendering",
+          params: { ...state.lastJob.params, selected_ids: [...state.selectedIds] },
+          result: {
+            ...state.lastJob.result,
+            selected_ids: [...state.selectedIds],
+            shorts: (state.lastJob.result.shorts || []).filter((s, i) =>
+              state.renderedIds.has(Number(s.id ?? i))
+            ),
+            render_progress: {
+              total: state.selectedIds.size,
+              done: ready.length,
+              current_id: currentId,
+              pending_ids: pending.slice(1),
+              done_ids: ready,
+            },
+          },
+        });
+      }
       if (state.pollTimer) clearInterval(state.pollTimer);
       pollJob();
-      state.pollTimer = setInterval(pollJob, 2000);
+      state.pollTimer = setInterval(pollJob, 1500);
     } catch (err) {
       $("#pick-hint").textContent = `erro: ${err.message}`;
       btn.disabled = false;
+      // Status no servidor pode ter mudado (ex.: reload) — ressincroniza
+      pollJob();
     }
   });
 
@@ -758,9 +816,34 @@
         state.followJobStep = true;
         setBadge("rendering");
         setFlowStep(3);
+        if (state.lastJob?.result) {
+          const ids = [
+            ...(state.selectedIds.size
+              ? state.selectedIds
+              : state.lastJob.params?.selected_ids ||
+                state.lastJob.result?.selected_ids ||
+                []),
+          ].map(Number);
+          renderResults({
+            ...state.lastJob,
+            status: "rendering",
+            result: {
+              ...state.lastJob.result,
+              shorts: [],
+              selected_ids: ids,
+              render_progress: {
+                total: ids.length,
+                done: 0,
+                current_id: ids[0] ?? null,
+                pending_ids: ids.slice(1),
+                done_ids: [],
+              },
+            },
+          });
+        }
         if (state.pollTimer) clearInterval(state.pollTimer);
         pollJob();
-        state.pollTimer = setInterval(pollJob, 2000);
+        state.pollTimer = setInterval(pollJob, 1500);
       } else {
         hint.textContent = "proporção salva — escolha os tópicos na etapa 2";
         state.renderedIds = new Set();
@@ -778,53 +861,171 @@
     }
   });
 
-  function renderResults(job) {
-    const box = $("#results");
-    box.innerHTML = "";
-    const shorts = job.result?.shorts || [];
-    if (!shorts.length) {
-      box.innerHTML = `<p class="empty">Nenhum short gerado.</p>`;
-      return;
+  function shortCardState(id, short, progress, jobStatus) {
+    if (short?.clip_url && !short.error) return "ready";
+    if (short?.error) return "error";
+    if (jobStatus !== "rendering") return short ? "error" : "missing";
+    const current = progress?.current_id;
+    if (current != null && Number(current) === id) return "rendering";
+    return "pending";
+  }
+
+  function buildShortCardHtml(id, highlight, short, cardState, index) {
+    const title = highlight.title || short?.title || `Short #${id + 1}`;
+    const score = short?.score ?? highlight.score ?? "—";
+    const start = short?.start_time ?? highlight.start_time;
+    const end = short?.end_time ?? highlight.end_time;
+    const hook = short?.hook_sentence ?? highlight.hook_sentence ?? "—";
+    const reason = short?.virality_reason ?? highlight.virality_reason ?? "—";
+    const clip = short?.clip_url || "";
+    const thumb = highlight.thumbnail_url
+      ? `<img class="short-skeleton-thumb" src="${escapeAttr(highlight.thumbnail_url)}" alt="" />`
+      : "";
+
+    let media;
+    if (cardState === "ready" && clip) {
+      media = `<video controls playsinline src="${escapeAttr(clip)}"></video>`;
+    } else if (cardState === "error") {
+      media = `<div class="short-skeleton is-error"><span>${escapeHtml(
+        short?.error || "Clip indisponível"
+      )}</span></div>`;
+    } else if (cardState === "rendering") {
+      media = `<div class="short-skeleton is-rendering" aria-busy="true">
+        ${thumb}
+        <div class="short-skeleton-shine"></div>
+        <span class="short-skeleton-label">Renderizando…</span>
+      </div>`;
+    } else if (cardState === "pending") {
+      media = `<div class="short-skeleton is-pending" aria-busy="true">
+        ${thumb}
+        <div class="short-skeleton-shine"></div>
+        <span class="short-skeleton-label">Na fila</span>
+      </div>`;
+    } else {
+      media = `<p class="empty">Clip indisponível</p>`;
     }
 
-    const head = document.createElement("div");
-    head.className = "section-head";
-    head.innerHTML = `
-      <h2 style="font-size:1.2rem">
-        ${shorts.length} shorts · ${job.result.highlights?.length || 0} tópicos analisados
-      </h2>
-      <a class="btn ghost" href="/api/jobs/${job.id}/result.json" download>Baixar JSON</a>
-    `;
-    box.appendChild(head);
+    const download =
+      cardState === "ready" && clip
+        ? `<p class="meta-row"><a href="${escapeAttr(clip)}" download="short_${id}.mp4">Baixar clip</a></p>`
+        : cardState === "rendering"
+          ? `<p class="meta-row short-status-hint">Cortando agora…</p>`
+          : cardState === "pending"
+            ? `<p class="meta-row short-status-hint">Aguardando na fila</p>`
+            : "";
 
-    shorts.forEach((s, i) => {
-      const card = document.createElement("article");
-      card.className = "short-card";
+    return `
+      <div class="short-media">${media}</div>
+      <div class="short-meta">
+        <div class="score"><strong>${score}</strong> / 100</div>
+        <h3>${escapeHtml(title)}</h3>
+        <p class="meta-row"><strong>Tempo:</strong> ${fmtTime(start)} → ${fmtTime(end)}</p>
+        <p class="meta-row"><strong>Hook:</strong> ${escapeHtml(hook)}</p>
+        <p class="meta-row"><strong>Por quê:</strong> ${escapeHtml(reason)}</p>
+        ${download}
+      </div>
+    `;
+  }
+
+  function renderResults(job) {
+    const box = $("#results");
+    if (!box) return;
+
+    const highlights = job.result?.highlights || [];
+    const shorts = job.result?.shorts || [];
+    const progress = job.result?.render_progress || null;
+    const jobStatus = job.status || state.jobStatus;
+
+    const highlightsById = new Map(
+      highlights.map((h, i) => [Number(h.id ?? i), h])
+    );
+    const shortsById = new Map(
+      shorts.map((s, i) => [Number(s.id ?? i), s])
+    );
+
+    let ids = (job.params?.selected_ids || job.result?.selected_ids || [])
+      .map(Number)
+      .filter((n) => !Number.isNaN(n));
+    if (!ids.length) {
+      ids = [...shortsById.keys()];
+    }
+    if (!ids.length && jobStatus === "rendering" && state.selectedIds.size) {
+      ids = [...state.selectedIds];
+    }
+
+    const done = progress?.done ?? shorts.filter((s) => s.clip_url && !s.error).length;
+    const total = progress?.total ?? (ids.length || shorts.length);
+
+    let head = box.querySelector(":scope > .section-head");
+    if (!head) {
+      head = document.createElement("div");
+      head.className = "section-head";
+      box.prepend(head);
+    }
+    head.style.order = "-1";
+
+    const titleText =
+      jobStatus === "rendering"
+        ? `${done} de ${total} shorts prontos · renderizando…`
+        : `${shorts.length} shorts · ${highlights.length} tópicos analisados`;
+
+    head.innerHTML = `
+      <h2 style="font-size:1.2rem">${titleText}</h2>
+      ${
+        jobStatus === "completed"
+          ? `<a class="btn ghost" href="/api/jobs/${job.id}/result.json" download>Baixar JSON</a>`
+          : `<span class="hint">${done}/${total}</span>`
+      }
+    `;
+
+    if (!ids.length) {
+      [...box.querySelectorAll(".short-card")].forEach((el) => el.remove());
+      if (!box.querySelector(".empty")) {
+        const empty = document.createElement("p");
+        empty.className = "empty";
+        empty.textContent =
+          jobStatus === "rendering" ? "Preparando renderização…" : "Nenhum short gerado.";
+        box.appendChild(empty);
+      }
+      return;
+    }
+    box.querySelectorAll(":scope > .empty").forEach((el) => el.remove());
+
+    const existing = new Map(
+      [...box.querySelectorAll(".short-card[data-id]")].map((el) => [el.dataset.id, el])
+    );
+    const seen = new Set();
+
+    ids.forEach((id, i) => {
+      const key = String(id);
+      seen.add(key);
+      const short = shortsById.get(id);
+      const highlight = highlightsById.get(id) || short || {};
+      const cardState = shortCardState(id, short, progress, jobStatus);
+      let card = existing.get(key);
+
+      if (card && card.dataset.state === cardState && cardState === "ready") {
+        // Keep the same <video> so playback isn't interrupted
+        card.style.order = String(i);
+        return;
+      }
+
+      if (!card) {
+        card = document.createElement("article");
+        card.className = "short-card";
+        card.dataset.id = key;
+        box.appendChild(card);
+      }
+
+      card.dataset.state = cardState;
+      card.className = `short-card is-${cardState}`;
+      card.style.order = String(i);
       card.style.animationDelay = `${i * 0.06}s`;
-      const clip = s.clip_url || "";
-      const videoSrc = clip;
-      card.innerHTML = `
-        <div>
-          ${
-            clip
-              ? `<video controls playsinline src="${escapeAttr(videoSrc)}"></video>`
-              : `<p class="empty">Clip indisponível${s.error ? `: ${escapeHtml(s.error)}` : ""}</p>`
-          }
-        </div>
-        <div class="short-meta">
-          <div class="score"><strong>${s.score ?? "—"}</strong> / 100</div>
-          <h3>${escapeHtml(s.title || `Short #${i + 1}`)}</h3>
-          <p class="meta-row"><strong>Tempo:</strong> ${fmtTime(s.start_time)} → ${fmtTime(s.end_time)}</p>
-          <p class="meta-row"><strong>Hook:</strong> ${escapeHtml(s.hook_sentence || "—")}</p>
-          <p class="meta-row"><strong>Por quê:</strong> ${escapeHtml(s.virality_reason || "—")}</p>
-          ${
-            clip
-              ? `<p class="meta-row"><a href="${escapeAttr(clip)}" download="short_${i + 1}.mp4">Baixar clip</a></p>`
-              : ""
-          }
-        </div>
-      `;
-      box.appendChild(card);
+      card.innerHTML = buildShortCardHtml(id, highlight, short, cardState, i);
+    });
+
+    existing.forEach((el, key) => {
+      if (!seen.has(key)) el.remove();
     });
   }
 

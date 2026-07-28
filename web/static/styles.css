@@ -377,7 +377,7 @@ button.step-dot:disabled {
   color: var(--muted);
   line-height: 1.45;
 }
-.workbench.is-locked {
+.workbench.is-locked #step1-fields {
   opacity: 0.55;
   pointer-events: none;
 }
@@ -650,7 +650,11 @@ button.step-dot:disabled {
   margin-inline: auto;
 }
 
-.short-card > div:first-child {
+.short-card.is-pending {
+  opacity: 0.72;
+}
+
+.short-media {
   width: 100%;
   display: flex;
   justify-content: center;
@@ -665,6 +669,87 @@ button.step-dot:disabled {
   border: 1px solid var(--line);
   border-radius: 12px;
   display: block;
+}
+
+.short-skeleton {
+  position: relative;
+  width: 100%;
+  max-width: 320px;
+  aspect-ratio: 9 / 16;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  background: linear-gradient(160deg, #1a1f14 0%, #0d100a 55%, #151910 100%);
+}
+
+.short-skeleton-thumb {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0.35;
+  filter: grayscale(0.4);
+}
+
+.short-skeleton-shine {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    110deg,
+    transparent 25%,
+    rgba(214, 255, 63, 0.08) 45%,
+    transparent 65%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shine 1.6s ease-in-out infinite;
+}
+
+.short-skeleton.is-pending .short-skeleton-shine {
+  animation-duration: 2.4s;
+  opacity: 0.55;
+}
+
+.short-skeleton.is-error {
+  align-items: center;
+  padding: 1rem;
+  background: #1a1210;
+  color: #ffb4a8;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.short-skeleton-label {
+  position: relative;
+  z-index: 1;
+  margin-bottom: 1rem;
+  padding: 0.35rem 0.7rem;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink);
+  background: rgba(10, 12, 8, 0.72);
+  border: 1px solid var(--line);
+}
+
+.short-skeleton.is-rendering .short-skeleton-label {
+  color: var(--run);
+  border-color: rgba(126, 200, 255, 0.35);
+}
+
+.short-status-hint {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+@keyframes skeleton-shine {
+  0% { background-position: 120% 0; }
+  100% { background-position: -80% 0; }
 }
 
 .short-meta {

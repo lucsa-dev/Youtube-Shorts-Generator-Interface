@@ -49,71 +49,73 @@
         </div>
         <p class="step-label" id="step-label">1 · Configurar fonte</p>
 
-        <div class="recent-block" id="recent-block" hidden>
-          <div class="recent-head">
-            <span class="label">Recentes</span>
-            <button type="button" class="btn ghost btn-tiny" id="refresh-sources">Atualizar</button>
+        <div id="step1-fields">
+          <div class="recent-block" id="recent-block" hidden>
+            <div class="recent-head">
+              <span class="label">Recentes</span>
+              <button type="button" class="btn ghost btn-tiny" id="refresh-sources">Atualizar</button>
+            </div>
+            <div class="recent-list" id="recent-sources"></div>
           </div>
-          <div class="recent-list" id="recent-sources"></div>
-        </div>
 
-        <label class="field field-grow">
-          <span class="label">Fonte</span>
-          <input
-            type="text"
-            name="url"
-            id="url"
-            placeholder="https://www.youtube.com/watch?v=…  ou caminho local"
-          />
-        </label>
-
-        <div class="field-row">
-          <label class="field" id="mode-field" hidden>
-            <span class="label">Modo</span>
-            <select name="mode" id="mode">
-              <option value="local" selected>Local (yt-dlp + Whisper)</option>
-            </select>
+          <label class="field field-grow">
+            <span class="label">Fonte</span>
+            <input
+              type="text"
+              name="url"
+              id="url"
+              placeholder="https://www.youtube.com/watch?v=…  ou caminho local"
+            />
           </label>
-          <label class="field">
-            <span class="label">Proporção</span>
-            <select name="aspect_ratio" id="aspect_ratio">
-              <option value="9:16">9:16 Shorts / TikTok / Reels</option>
-              <option value="1:1">1:1 Quadrado</option>
-              <option value="4:5">4:5 Feed</option>
-              <option value="16:9">16:9 Landscape</option>
-            </select>
-          </label>
-          <label class="field">
-            <span class="label">Resolução</span>
-            <select name="download_format" id="download_format">
-              <option value="360">360p</option>
-              <option value="480">480p</option>
-              <option value="720" selected>720p</option>
-              <option value="1080">1080p</option>
-            </select>
-          </label>
-        </div>
 
-        <label class="field upload-field" id="upload-wrap">
-          <span class="label">Arquivo local <em id="upload-mode-note">(somente modo local)</em></span>
-          <input type="file" name="file" id="file" accept="video/*,.mp4,.mkv,.webm,.mov" />
-          <span class="upload-hint" id="file-hint">Arraste um mp4 ou clique para escolher</span>
-        </label>
+          <div class="field-row">
+            <label class="field" id="mode-field" hidden>
+              <span class="label">Modo</span>
+              <select name="mode" id="mode">
+                <option value="local" selected>Local (yt-dlp + Whisper)</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="label">Proporção</span>
+              <select name="aspect_ratio" id="aspect_ratio">
+                <option value="9:16">9:16 Shorts / TikTok / Reels</option>
+                <option value="1:1">1:1 Quadrado</option>
+                <option value="4:5">4:5 Feed</option>
+                <option value="16:9">16:9 Landscape</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="label">Resolução</span>
+              <select name="download_format" id="download_format">
+                <option value="360">360p</option>
+                <option value="480">480p</option>
+                <option value="720" selected>720p</option>
+                <option value="1080">1080p</option>
+              </select>
+            </label>
+          </div>
 
-        <div class="actions" id="new-job-actions">
-          <button type="submit" class="btn primary" id="submit-btn">
-            <span>Analisar vídeo</span>
-            <span class="btn-arrow" aria-hidden="true">→</span>
-          </button>
-          <p class="hint" id="form-hint">A IA encontra os tópicos; você escolhe quais cortar</p>
-        </div>
-        <div class="actions" id="edit-job-actions" hidden>
-          <button type="button" class="btn primary" id="apply-format-btn">
-            <span>Aplicar proporção</span>
-            <span class="btn-arrow" aria-hidden="true">→</span>
-          </button>
-          <button type="button" class="btn ghost" id="goto-topics-btn">Ir para tópicos</button>
-          <p class="hint" id="edit-form-hint">Mudar a proporção regenera todos os shorts deste job</p>
+          <label class="field upload-field" id="upload-wrap">
+            <span class="label">Arquivo local <em id="upload-mode-note">(somente modo local)</em></span>
+            <input type="file" name="file" id="file" accept="video/*,.mp4,.mkv,.webm,.mov" />
+            <span class="upload-hint" id="file-hint">Arraste um mp4 ou clique para escolher</span>
+          </label>
+
+          <div class="actions" id="new-job-actions">
+            <button type="submit" class="btn primary" id="submit-btn">
+              <span>Analisar vídeo</span>
+              <span class="btn-arrow" aria-hidden="true">→</span>
+            </button>
+            <p class="hint" id="form-hint">A IA encontra os tópicos; você escolhe quais cortar</p>
+          </div>
+          <div class="actions" id="edit-job-actions" hidden>
+            <button type="button" class="btn primary" id="apply-format-btn">
+              <span>Aplicar proporção</span>
+              <span class="btn-arrow" aria-hidden="true">→</span>
+            </button>
+            <button type="button" class="btn ghost" id="goto-topics-btn">Ir para tópicos</button>
+            <p class="hint" id="edit-form-hint">Mudar a proporção regenera todos os shorts deste job</p>
+          </div>
         </div>
       </form>
 
