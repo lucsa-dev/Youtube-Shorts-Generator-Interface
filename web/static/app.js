@@ -286,19 +286,19 @@
           <select name="${item.key}">${options}</select>
         `;
       } else {
-        const note = item.is_secret
-          ? `<span class="secret-note">${item.is_set ? `definida: ${item.masked}` : "não definida"} — deixe vazio para manter</span>`
-          : "";
+        const labelExtra =
+          item.key === "LOCAL_FACE_SMOOTHING"
+            ? ` <em>— suavização do crop de rosto (0–1; padrão 0.15; só modo local)</em>`
+            : "";
         wrap.innerHTML = `
-          <span class="label">${item.key}</span>
+          <span class="label">${item.key}${labelExtra}</span>
           <input
-            type="${item.is_secret ? "password" : "text"}"
+            type="text"
             name="${item.key}"
-            placeholder="${item.is_secret ? "" : item.value || ""}"
-            value="${item.is_secret ? "" : escapeAttr(item.value || "")}"
+            placeholder="${escapeAttr(item.value || "")}"
+            value="${escapeAttr(item.value || "")}"
             autocomplete="off"
           />
-          ${note}
         `;
       }
       form.appendChild(wrap);
@@ -319,7 +319,7 @@
         body: JSON.stringify({ values }),
       });
       if (!res.ok) throw new Error(await res.text());
-      hint.textContent = "configuração salva — idioma padrão atualizado";
+      hint.textContent = "configuração salva";
       await loadConfig();
       await refreshHealth();
     } catch (err) {

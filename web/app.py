@@ -43,21 +43,10 @@ app = FastAPI(title="AI YouTube Shorts Generator", version="1.0.0")
 _jobs: Dict[str, Dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 
+# Editable from the web Config UI. API keys, Whisper, LLM providers stay in .env only.
 CONFIG_KEYS = [
     "CONTENT_LANGUAGE",
-    "MUAPI_API_KEY",
-    "MUAPI_BASE_URL",
-    "MUAPI_POLL_INTERVAL",
-    "MUAPI_POLL_TIMEOUT",
-    "LLM_PROVIDER",
-    "OPENAI_API_KEY",
-    "OPENAI_MODEL",
-    "GEMINI_API_KEY",
-    "GEMINI_MODEL",
-    "LOCAL_WHISPER_MODEL",
-    "LOCAL_WHISPER_DEVICE",
-    "LOCAL_OUTPUT_DIR",
-    "LOCAL_WHISPER_VAD_FILTER",
+    "LOCAL_FACE_SMOOTHING",
 ]
 
 SECRET_KEYS = {"MUAPI_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"}
@@ -170,6 +159,8 @@ def _read_config() -> Dict[str, Any]:
         val = (raw.get(key) or "").strip()
         if key == "CONTENT_LANGUAGE" and not val:
             val = "pt"
+        if key == "LOCAL_FACE_SMOOTHING" and not val:
+            val = "0.15"
         secret = key in SECRET_KEYS
         is_set = _is_real_secret(val) if secret else bool(val)
         items.append(
@@ -205,14 +196,25 @@ def _read_config() -> Dict[str, Any]:
     }
 
 
+def _env_float(key: str, default: float) -> float:
+    raw = (os.getenv(key) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def _write_config(updates: Dict[str, str]) -> None:
     if not ENV_PATH.exists():
         ENV_PATH.write_text("", encoding="utf-8")
     for key, value in updates.items():
         if key not in CONFIG_KEYS:
             continue
-        # Skip blank secret updates — keep existing value
-        if key in SECRET_KEYS and not str(value).strip():
+        # Skip blank updates — keep existing value (avoids wiping optional keys
+        # and breaking float() reload with empty strings).
+        if not str(value).strip():
             continue
         set_key(str(ENV_PATH), key, str(value).strip())
         os.environ[key] = str(value).strip()
@@ -221,20 +223,28 @@ def _write_config(updates: Dict[str, str]) -> None:
     import shorts_generator.config as cfg
 
     cfg.MUAPI_API_KEY = os.getenv("MUAPI_API_KEY", "").strip()
-    cfg.MUAPI_BASE_URL = os.getenv("MUAPI_BASE_URL", "https://api.muapi.ai/api/v1").rstrip("/")
-    cfg.POLL_INTERVAL_SECONDS = float(os.getenv("MUAPI_POLL_INTERVAL", "5"))
-    cfg.POLL_TIMEOUT_SECONDS = float(os.getenv("MUAPI_POLL_TIMEOUT", "600"))
+    cfg.MUAPI_BASE_URL = (
+        os.getenv("MUAPI_BASE_URL") or "https://api.muapi.ai/api/v1"
+    ).strip().rstrip("/")
+    cfg.POLL_INTERVAL_SECONDS = _env_float("MUAPI_POLL_INTERVAL", 5.0)
+    cfg.POLL_TIMEOUT_SECONDS = _env_float("MUAPI_POLL_TIMEOUT", 600.0)
     cfg.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-    cfg.OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    cfg.OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
     cfg.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-    cfg.GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    cfg.LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
-    cfg.LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base")
-    cfg.LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto")
-    cfg.LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "output")
+    cfg.GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
+    cfg.LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
+    cfg.LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL") or "base"
+    cfg.LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE") or "auto"
+    cfg.LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR") or "output"
     cfg.LOCAL_WHISPER_VAD_FILTER = (
         os.getenv("LOCAL_WHISPER_VAD_FILTER", "false").strip().lower() == "true"
     )
+    try:
+        cfg.LOCAL_FACE_SMOOTHING = max(
+            0.0, min(1.0, _env_float("LOCAL_FACE_SMOOTHING", 0.15))
+        )
+    except (TypeError, ValueError):
+        cfg.LOCAL_FACE_SMOOTHING = 0.15
     cfg.CONTENT_LANGUAGE = os.getenv("CONTENT_LANGUAGE", "pt").strip().lower() or "pt"
 
 
