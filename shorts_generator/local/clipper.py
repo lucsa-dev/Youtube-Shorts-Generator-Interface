@@ -10,7 +10,7 @@ import os
 import subprocess
 from typing import Dict, List, Optional, Tuple
 
-from ..config import LOCAL_OUTPUT_DIR
+from ..config import LOCAL_FACE_SMOOTHING, LOCAL_OUTPUT_DIR
 
 
 def _ratio(aspect_ratio: str) -> float:
@@ -83,7 +83,7 @@ def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
     writer = cv2.VideoWriter(silent_path, fourcc, fps, (crop_w, crop_h))
 
     last_center: Optional[Tuple[int, int]] = None
-    smoothing = 0.15  # how aggressively to chase a new face position
+    smoothing = LOCAL_FACE_SMOOTHING  # how aggressively to chase a new face position
     while True:
         ret, frame = cap.read()
         if not ret:

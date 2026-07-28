@@ -5,10 +5,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 MUAPI_API_KEY = os.getenv("MUAPI_API_KEY", "").strip()
-MUAPI_BASE_URL = os.getenv("MUAPI_BASE_URL", "https://api.muapi.ai/api/v1").rstrip("/")
+MUAPI_BASE_URL = (os.getenv("MUAPI_BASE_URL") or "https://api.muapi.ai/api/v1").strip().rstrip("/")
 
-POLL_INTERVAL_SECONDS = float(os.getenv("MUAPI_POLL_INTERVAL", "5"))
-POLL_TIMEOUT_SECONDS = float(os.getenv("MUAPI_POLL_TIMEOUT", "600"))
+
+def _env_float(key: str, default: float) -> float:
+    raw = (os.getenv(key) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+POLL_INTERVAL_SECONDS = _env_float("MUAPI_POLL_INTERVAL", 5.0)
+POLL_TIMEOUT_SECONDS = _env_float("MUAPI_POLL_TIMEOUT", 600.0)
 
 # Local-mode (--mode local) settings — only consulted when running offline.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -19,6 +30,8 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
 LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base")
 LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto")  # auto / cpu / cuda
 LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "output")
+# Face-tracking crop: 0 = freeze on first face, 1 = snap instantly to new position.
+LOCAL_FACE_SMOOTHING = max(0.0, min(1.0, _env_float("LOCAL_FACE_SMOOTHING", 0.15)))
 
 # Content language: Whisper recognition + titles/hooks/descriptions from the LLM.
 # ISO-639-1 code. Default Brazilian Portuguese.
