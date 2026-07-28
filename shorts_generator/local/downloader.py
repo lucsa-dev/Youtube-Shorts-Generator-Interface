@@ -134,11 +134,27 @@ def download_youtube_local(video_url: str, fmt: str = "720", out_dir: Optional[s
 
         resolved_id = (info or {}).get("id") or video_id
         title = (info or {}).get("title") or (info or {}).get("fulltitle")
+        description = (info or {}).get("description") or ""
+        channel = (
+            (info or {}).get("channel")
+            or (info or {}).get("uploader")
+            or (info or {}).get("creator")
+            or ""
+        )
         if resolved_id and title:
             meta_path = os.path.join(out_dir, f"source_{resolved_id}.meta.json")
             try:
                 with open(meta_path, "w", encoding="utf-8") as f:
-                    json.dump({"id": resolved_id, "title": title}, f, ensure_ascii=False)
+                    json.dump(
+                        {
+                            "id": resolved_id,
+                            "title": title,
+                            "description": description,
+                            "channel": channel,
+                        },
+                        f,
+                        ensure_ascii=False,
+                    )
             except OSError:
                 pass
 

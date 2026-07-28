@@ -60,9 +60,12 @@ Rules:
 - Explain in one sentence why this clip is viral ("virality_reason")
 - start_time / end_time must span the FULL self-contained segment, not just the hook line
 - CRITICAL language rule: write title, hook_sentence, and virality_reason entirely in {output_language}. Do NOT use English unless the output language is English. Prefer hooks taken from / closely paraphrasing the transcript.
+- When KNOWN SPEAKERS are provided (podcast/interview/debate), titles MUST attribute the main speaker or public figure when known — e.g. "{{Name}} fala sobre {{topic}}" or "{{Name}}: {{claim}}". Prefer guests / public figures over hosts. Never invent names outside the provided list. Fill attributed_to with that person's name (or empty string if none).
+
+{cast_block}
 
 Respond ONLY with valid JSON (no markdown, no explanation):
-{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
+{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string","attributed_to":"string"}}]}}"""
 
 
 CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
@@ -175,6 +178,9 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
                 ).strip(),
                 "virality_reason": str(
                     item.get("virality_reason") or item.get("reason") or ""
+                ).strip(),
+                "attributed_to": str(
+                    item.get("attributed_to") or item.get("speaker") or ""
                 ).strip(),
             }
         )
@@ -349,10 +355,16 @@ def build_transcript_text(transcript: Dict, offset: float = 0.0) -> str:
     relative to the chunk start (0 … duration). The model otherwise copies
     absolute wall-clock times (e.g. 1500s) which then fail sanitization
     against the chunk's relative duration (~1200s).
+
+    If segments carry ``speaker`` (from cast labeling), prefix each line.
     """
-    segments = transcript.get("segments", [])
+    from .cast import build_named_transcript_text
+
+    segments = transcript.get("segments") or []
+    if any(str(s.get("speaker") or "").strip() for s in segments):
+        return build_named_transcript_text(transcript, offset=offset)
     return "\n".join(
-        f"[{max(0.0, float(s['start']) - offset):.1f}s] {s['text'].strip()}"
+        f"[{max(0.0, float(s['start']) - offset):.1f}s] {str(s.get('text') or '').strip()}"
         for s in segments
     )
 
@@ -406,6 +418,7 @@ def call_highlight_api(
     is_chunk: bool = False,
     llm_fn: LLMFn = call_muapi_llm,
     output_language: str = "Brazilian Portuguese (pt-BR)",
+    cast_block: str = "",
 ) -> Dict:
     system = HIGHLIGHT_SYSTEM_PROMPT.format(
         virality_criteria=VIRALITY_CRITERIA,
@@ -413,6 +426,7 @@ def call_highlight_api(
         density=content_info.get("density", "medium"),
         num_clips_instruction=_num_clips_instruction(num_clips, duration, is_chunk),
         output_language=output_language,
+        cast_block=cast_block or "",
     )
     base_prompt = f"{system}\n\nTranscript:\n{transcript_text}"
     prompt = base_prompt
@@ -451,11 +465,12 @@ def call_highlight_api(
             prompt = (
                 base_prompt
                 + "\n\nIMPORTANT: Return ONLY valid JSON with a top-level 'highlights' array."
-                + " Each item must include: title, start_time, end_time, score, hook_sentence, virality_reason."
+                + " Each item must include: title, start_time, end_time, score, hook_sentence, virality_reason, attributed_to."
                 + f" Timestamps must be relative to THIS transcript window (0 to {duration:.1f} seconds)."
                 + f" EVERY clip duration (end_time - start_time) MUST be {int(MIN_CLIP_SECONDS)}–90 seconds"
                 + " and cover setup + claim + payoff — never a single hook sentence."
                 + f" title, hook_sentence, and virality_reason MUST be written in {output_language}."
+                + " When speakers are known, put the person name in the title and attributed_to."
                 + " No markdown fences, no commentary."
             )
 
@@ -510,6 +525,7 @@ def get_highlights(
     num_clips: Optional[int] = 3,
     llm_fn: Optional[LLMFn] = None,
     output_language: Optional[str] = None,
+    speakers: Optional[List[Dict]] = None,
 ) -> Dict:
     """Main entry point — returns {highlights: [...]} sorted by score.
 
@@ -517,18 +533,22 @@ def get_highlights(
     mode passes in a local LLM-backed callable.
     `output_language` controls the language of title / hook / virality_reason.
     Pass ``num_clips=None`` to let the model decide how many topics to return.
+    `speakers` — named cast roster for title attribution (from cast.py).
     """
+    from .cast import cast_context_block
     from .config import language_label, resolve_content_language
 
     llm_fn = llm_fn or call_muapi_llm
     lang_code = resolve_content_language(output_language)
     lang_label = language_label(lang_code)
     duration = transcript.get("duration", 0)
+    cast_speakers = speakers or transcript.get("speakers") or []
+    cast_block = cast_context_block(cast_speakers) if cast_speakers else ""
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
     print(
         f"[highlights] content={content_info.get('content_type')} "
         f"density={content_info.get('density')} duration={duration:.0f}s "
-        f"output_lang={lang_code}",
+        f"output_lang={lang_code} speakers={len(cast_speakers)}",
         flush=True,
     )
 
@@ -549,6 +569,7 @@ def get_highlights(
                 is_chunk=True,
                 llm_fn=llm_fn,
                 output_language=lang_label,
+                cast_block=cast_block,
             )
             for h in result.get("highlights", []):
                 h["start_time"] = float(h["start_time"]) + offset
@@ -565,6 +586,7 @@ def get_highlights(
             num_clips=num_clips,
             llm_fn=llm_fn,
             output_language=lang_label,
+            cast_block=cast_block,
         )
         highlights = expand_highlights_to_context(result.get("highlights", []), transcript)
         highlights = dedupe_highlights(highlights)
