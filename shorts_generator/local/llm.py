@@ -19,11 +19,17 @@ def call_openai_llm(prompt: str) -> str:
         ) from e
 
     client = OpenAI(api_key=require_openai_key())
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        temperature=0.7,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    kwargs = {
+        "model": OPENAI_MODEL,
+        "temperature": 0.4,
+        "max_tokens": 8192,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    # Prefer JSON object mode when the prompt asks for JSON — reduces
+    # markdown fences / commentary that break highlight parsing.
+    if "JSON" in prompt or "json" in prompt:
+        kwargs["response_format"] = {"type": "json_object"}
+    response = client.chat.completions.create(**kwargs)
     return response.choices[0].message.content or ""
 
 

@@ -124,6 +124,13 @@ def _coerce_int(value: object, default: int = 0) -> int:
         return default
 
 
+def _highlight_times(item: Dict) -> tuple:
+    """Accept common aliases the models sometimes emit."""
+    start = item.get("start_time", item.get("start", item.get("from")))
+    end = item.get("end_time", item.get("end", item.get("to")))
+    return start, end
+
+
 def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
     """Normalize model output into the expected shape; skip invalid entries."""
     if not isinstance(raw_highlights, list):
@@ -135,13 +142,15 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
         if not isinstance(item, dict):
             continue
 
-        start = _coerce_float(item.get("start_time"), default=-1.0)
-        end = _coerce_float(item.get("end_time"), default=-1.0)
+        start = _coerce_float(_highlight_times(item)[0], default=-1.0)
+        end = _coerce_float(_highlight_times(item)[1], default=-1.0)
         if start < 0 or end <= start:
             continue
 
         if max_end != float("inf"):
-            start = min(start, max_end)
+            # Drop clearly out-of-window times (e.g. absolute stamps on a relative chunk).
+            if start > max_end:
+                continue
             end = min(end, max_end)
             if end <= start:
                 continue
@@ -152,8 +161,12 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
                 "start_time": start,
                 "end_time": end,
                 "score": max(0, min(100, _coerce_int(item.get("score"), default=0))),
-                "hook_sentence": str(item.get("hook_sentence") or "").strip(),
-                "virality_reason": str(item.get("virality_reason") or "").strip(),
+                "hook_sentence": str(
+                    item.get("hook_sentence") or item.get("hook") or ""
+                ).strip(),
+                "virality_reason": str(
+                    item.get("virality_reason") or item.get("reason") or ""
+                ).strip(),
             }
         )
 
@@ -171,9 +184,19 @@ def detect_content_type(transcript: Dict, llm_fn: LLMFn = call_muapi_llm) -> Dic
         return {"content_type": "other", "density": "medium"}
 
 
-def build_transcript_text(transcript: Dict) -> str:
+def build_transcript_text(transcript: Dict, offset: float = 0.0) -> str:
+    """Render transcript lines for the LLM.
+
+    When processing a long-video chunk, pass ``offset`` so timestamps are
+    relative to the chunk start (0 … duration). The model otherwise copies
+    absolute wall-clock times (e.g. 1500s) which then fail sanitization
+    against the chunk's relative duration (~1200s).
+    """
     segments = transcript.get("segments", [])
-    return "\n".join(f"[{s['start']:.1f}s] {s['text'].strip()}" for s in segments)
+    return "\n".join(
+        f"[{max(0.0, float(s['start']) - offset):.1f}s] {s['text'].strip()}"
+        for s in segments
+    )
 
 
 def chunk_transcript(transcript: Dict) -> List[Dict]:
@@ -224,12 +247,26 @@ def call_highlight_api(
         raw = llm_fn(prompt)
         try:
             parsed = _parse_json_loose(raw)
-            highlights = _sanitize_highlights(parsed.get("highlights"), duration=duration)
+            if isinstance(parsed, list):
+                raw_highlights = parsed
+            elif isinstance(parsed, dict):
+                raw_highlights = parsed.get("highlights")
+                if raw_highlights is None and isinstance(parsed.get("data"), dict):
+                    raw_highlights = parsed["data"].get("highlights")
+            else:
+                raw_highlights = None
+            highlights = _sanitize_highlights(raw_highlights, duration=duration)
             if highlights:
                 return {"highlights": highlights}
-            last_error = "no valid highlights in response"
+            n_raw = len(raw_highlights) if isinstance(raw_highlights, list) else 0
+            preview = (raw or "").strip().replace("\n", " ")[:240]
+            last_error = (
+                f"no valid highlights in response "
+                f"(parsed={n_raw} items, duration={duration:.1f}s, preview={preview!r})"
+            )
         except Exception as e:
-            last_error = str(e)
+            preview = (raw or "").strip().replace("\n", " ")[:240]
+            last_error = f"{e} (preview={preview!r})"
 
         if attempt < MAX_HIGHLIGHT_API_ATTEMPTS:
             print(
@@ -240,6 +277,7 @@ def call_highlight_api(
                 base_prompt
                 + "\n\nIMPORTANT: Return ONLY valid JSON with a top-level 'highlights' array."
                 + " Each item must include: title, start_time, end_time, score, hook_sentence, virality_reason."
+                + f" Timestamps must be relative to THIS transcript window (0 to {duration:.1f} seconds)."
                 + " No markdown fences, no commentary."
             )
 
@@ -289,8 +327,9 @@ def get_highlights(
         print(f"[highlights] long video — splitting into {len(chunks)} chunks", flush=True)
         all_highlights: List[Dict] = []
         for i, chunk in enumerate(chunks):
-            offset = chunk.get("_offset", 0)
-            text = build_transcript_text(chunk)
+            offset = float(chunk.get("_offset", 0) or 0)
+            # Relative timestamps so sanitize(duration=chunk length) accepts them.
+            text = build_transcript_text(chunk, offset=offset)
             print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
             result = call_highlight_api(text, content_info, chunk["duration"], num_clips=num_clips, is_chunk=True, llm_fn=llm_fn)
             for h in result.get("highlights", []):
