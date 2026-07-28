@@ -46,6 +46,8 @@
           <button type="button" class="step-dot" data-step="2" disabled>2</button>
           <span class="step-line" aria-hidden="true"></span>
           <button type="button" class="step-dot" data-step="3" disabled>3</button>
+          <span class="step-line" aria-hidden="true"></span>
+          <button type="button" class="step-dot" data-step="4" disabled>4</button>
         </div>
         <p class="step-label" id="step-label">1 · Configurar fonte</p>
 
@@ -147,6 +149,90 @@
           <div class="topic-list" id="topic-list"></div>
         </div>
 
+        <div class="caption-area" id="caption-area" hidden>
+          <div class="section-head">
+            <div>
+              <h2 style="font-size:1.2rem">Legendas karaoke</h2>
+              <p class="hint" id="caption-hint">Escolha o tema e ajuste tipografia — as palavras destacam no ritmo da fala</p>
+            </div>
+            <div class="pick-actions">
+              <button type="button" class="btn ghost" id="caption-back">← Tópicos</button>
+              <button type="button" class="btn primary" id="caption-continue">
+                <span id="caption-continue-label">Gerar shorts</span>
+                <span class="btn-arrow" aria-hidden="true">→</span>
+              </button>
+            </div>
+          </div>
+
+          <label class="field checkbox-field">
+            <input type="checkbox" id="caption-enabled" checked />
+            <span>Queimar legendas no vídeo</span>
+          </label>
+
+          <div id="caption-controls">
+            <div class="theme-grid" id="theme-grid" role="listbox" aria-label="Temas de legenda"></div>
+
+            <div class="field-row caption-fields">
+              <label class="field">
+                <span class="label">Fonte</span>
+                <select id="caption-font">
+                  <option value="Arial Black">Arial Black</option>
+                  <option value="Impact">Impact</option>
+                  <option value="Arial">Arial</option>
+                  <option value="DejaVu Sans">DejaVu Sans</option>
+                  <option value="Helvetica">Helvetica</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="label">Tamanho</span>
+                <input type="number" id="caption-size" min="32" max="120" step="2" value="72" />
+              </label>
+              <label class="field">
+                <span class="label">Borda</span>
+                <input type="number" id="caption-outline" min="0" max="12" step="1" value="4" />
+              </label>
+              <label class="field">
+                <span class="label">Palavras / linha</span>
+                <input type="number" id="caption-words" min="1" max="8" step="1" value="4" />
+              </label>
+            </div>
+
+            <div class="field-row caption-fields">
+              <label class="field">
+                <span class="label">Cor ativa</span>
+                <input type="color" id="caption-primary" value="#ffff00" />
+              </label>
+              <label class="field">
+                <span class="label">Cor espera</span>
+                <input type="color" id="caption-secondary" value="#ffffff" />
+              </label>
+              <label class="field">
+                <span class="label">Cor borda</span>
+                <input type="color" id="caption-outline-color" value="#000000" />
+              </label>
+              <label class="field checkbox-field compact">
+                <input type="checkbox" id="caption-bold" checked />
+                <span>Negrito</span>
+              </label>
+            </div>
+
+            <div class="caption-preview-wrap">
+              <div class="caption-preview-frame" id="caption-preview-frame" data-ratio="9:16">
+                <img class="caption-preview-bg" id="caption-preview-bg" alt="" hidden />
+                <div class="caption-preview-fallback" id="caption-preview-fallback" aria-hidden="true"></div>
+                <div class="caption-preview-scrim" aria-hidden="true"></div>
+                <div class="caption-preview" id="caption-preview">
+                  <span class="cap-word is-done">Isso</span>
+                  <span class="cap-word is-active">muda</span>
+                  <span class="cap-word">tudo</span>
+                </div>
+                <span class="caption-preview-badge" id="caption-preview-badge">9:16</span>
+              </div>
+              <p class="hint caption-preview-meta" id="caption-preview-meta">Preview com frame do tópico selecionado</p>
+            </div>
+          </div>
+        </div>
+
         <div class="results" id="results"></div>
       </div>
     </section>
@@ -177,7 +263,7 @@
   </main>
 
   <footer class="foot">
-    <span>CLI: <code>python main.py URL --mode local --num-clips 3</code> · Web: análise → seleção → corte</span>
+    <span>CLI: <code>python main.py URL --mode local --num-clips 3</code> · Web: análise → tópicos → legendas → corte</span>
   </footer>
 
   <script src="/app.js"></script>

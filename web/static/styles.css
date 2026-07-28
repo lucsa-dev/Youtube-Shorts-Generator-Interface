@@ -822,6 +822,201 @@ button.step-dot:disabled {
   font-size: 0.92rem;
   word-break: break-all;
 }
+.caption-area {
+  margin-top: 1.25rem;
+  animation: rise 0.35s ease both;
+}
+
+.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  margin: 0.75rem 0 1rem;
+  cursor: pointer;
+}
+.checkbox-field input {
+  width: 1.1rem;
+  height: 1.1rem;
+  accent-color: var(--accent);
+}
+.checkbox-field.compact {
+  margin: 0;
+  align-self: end;
+  padding-bottom: 0.55rem;
+}
+
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.65rem;
+  margin-bottom: 1rem;
+}
+
+.theme-chip {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  color: var(--ink);
+  border-radius: var(--radius);
+  padding: 0.85rem 0.75rem;
+  cursor: pointer;
+  text-align: left;
+  font-family: var(--font-body);
+  transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease;
+}
+.theme-chip:hover {
+  border-color: rgba(214, 255, 63, 0.35);
+  transform: translateY(-1px);
+}
+.theme-chip.is-selected {
+  border-color: var(--accent);
+  background: rgba(214, 255, 63, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(214, 255, 63, 0.25);
+}
+.theme-chip-label {
+  font-weight: 600;
+  font-size: 0.92rem;
+}
+
+.caption-fields input[type="color"] {
+  height: 2.4rem;
+  padding: 0.2rem;
+  cursor: pointer;
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+}
+.caption-fields input[type="number"] {
+  width: 100%;
+}
+
+.caption-preview-wrap {
+  margin-top: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.caption-preview-frame {
+  position: relative;
+  width: min(100%, 280px);
+  aspect-ratio: 9 / 16;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #0a0c08;
+  box-shadow: var(--shadow);
+  isolation: isolate;
+}
+.caption-preview-frame[data-ratio="1:1"] {
+  width: min(100%, 320px);
+  aspect-ratio: 1 / 1;
+}
+.caption-preview-frame[data-ratio="4:5"] {
+  width: min(100%, 300px);
+  aspect-ratio: 4 / 5;
+}
+.caption-preview-frame[data-ratio="16:9"] {
+  width: min(100%, 420px);
+  aspect-ratio: 16 / 9;
+}
+
+.caption-preview-bg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  z-index: 0;
+}
+
+.caption-preview-fallback {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  background:
+    linear-gradient(160deg, #2a3120 0%, #12150f 55%, #0a0c08 100%),
+    repeating-linear-gradient(
+      -12deg,
+      transparent 0 10px,
+      rgba(255, 255, 255, 0.02) 10px 20px
+    );
+}
+
+.caption-preview-scrim {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: linear-gradient(
+    180deg,
+    rgba(0, 0, 0, 0.05) 40%,
+    rgba(0, 0, 0, 0.45) 72%,
+    rgba(0, 0, 0, 0.7) 100%
+  );
+  pointer-events: none;
+}
+
+.caption-preview {
+  position: absolute;
+  left: 6%;
+  right: 6%;
+  bottom: 12%;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.45rem;
+  text-align: center;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  line-height: 1.15;
+  pointer-events: none;
+}
+
+.caption-preview-badge {
+  position: absolute;
+  top: 0.55rem;
+  left: 0.55rem;
+  z-index: 3;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  letter-spacing: 0.04em;
+  color: var(--ink);
+  background: rgba(16, 18, 15, 0.72);
+  border: 1px solid var(--line);
+  padding: 0.2rem 0.4rem;
+  border-radius: var(--radius);
+}
+
+.caption-preview-meta {
+  margin: 0;
+  text-align: center;
+  max-width: 28rem;
+}
+
+.cap-word {
+  display: inline-block;
+  transition: color 0.2s ease, transform 0.2s ease;
+}
+.cap-word.is-active {
+  transform: scale(1.08);
+}
+
+@media (max-width: 900px) {
+  .theme-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .caption-preview-frame,
+  .caption-preview-frame[data-ratio="1:1"],
+  .caption-preview-frame[data-ratio="4:5"] {
+    width: min(100%, 240px);
+  }
+  .caption-preview-frame[data-ratio="16:9"] {
+    width: min(100%, 100%);
+  }
+}
+
 .empty { color: var(--muted); margin: 0; }
 
 .config-grid {

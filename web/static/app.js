@@ -15,6 +15,21 @@
     lastJob: null,
     renderedIds: new Set(),
     followJobStep: true,
+    captionThemes: [],
+    captionStyle: {
+      theme: "bold-white",
+      enabled: true,
+      font_name: "Arial Black",
+      font_size: 72,
+      primary_colour: "&H0000FFFF",
+      secondary_colour: "&H00FFFFFF",
+      outline_colour: "&H00000000",
+      bold: true,
+      outline: 4,
+      shadow: 0,
+      margin_v: 160,
+      max_words_per_line: 4,
+    },
   };
 
   /* ---------- Router ---------- */
@@ -110,7 +125,7 @@
 
   function statusToStep(status) {
     if (status === "awaiting_selection") return 2;
-    if (status === "rendering" || status === "completed") return 3;
+    if (status === "rendering" || status === "completed") return 4;
     return 1;
   }
 
@@ -131,7 +146,8 @@
     const labels = {
       1: "1 · Configurar fonte",
       2: "2 · Escolher tópicos",
-      3: "3 · Cortar shorts",
+      3: "3 · Legendas karaoke",
+      4: "4 · Cortar shorts",
     };
     const el = $("#step-label");
     if (el) el.textContent = labels[step] || labels[1];
@@ -154,7 +170,7 @@
     const step1Fields = $("#step1-fields");
     if (step1Fields) step1Fields.hidden = step !== 1;
 
-    // Lock only on step 1 while the job is running (fields are hidden on steps 2–3).
+    // Lock only on step 1 while the job is running (fields are hidden on steps 2–4).
     form?.classList.toggle("is-locked", hasJob && step === 1 && !editable);
     form?.classList.toggle("is-editing-job", editable);
 
@@ -164,6 +180,7 @@
     if (editActions) editActions.hidden = !editable;
 
     const pick = $("#pick-area");
+    const captions = $("#caption-area");
     const results = $("#results");
     const run = $("#run-area");
 
@@ -178,9 +195,13 @@
     if (pick) {
       pick.hidden = !(step === 2 && canPick);
     }
+    if (captions) {
+      captions.hidden = !(step === 3 && canPick);
+      if (step === 3 && canPick) syncCaptionForm();
+    }
     if (results) {
-      results.hidden = step !== 3;
-      if (step === 3 && state.lastJob?.result) {
+      results.hidden = step !== 4;
+      if (step === 4 && state.lastJob?.result) {
         renderResults(state.lastJob);
       }
     }
@@ -195,7 +216,8 @@
       state.followJobStep = false;
       setFlowStep(n);
       if (n === 2 && state.lastJob) renderTopicPicker(state.lastJob);
-      if (n === 3 && state.lastJob?.result) renderResults(state.lastJob);
+      if (n === 3) syncCaptionForm();
+      if (n === 4 && state.lastJob?.result) renderResults(state.lastJob);
     });
   });
 
@@ -209,15 +231,20 @@
     }
     if (params.aspect_ratio) $("#aspect_ratio").value = params.aspect_ratio;
     if (params.download_format) $("#download_format").value = params.download_format;
+    if (params.caption_style) {
+      state.captionStyle = { ...state.captionStyle, ...params.caption_style };
+    }
   }
 
   function syncPickContinueLabel() {
     const label = $("#pick-continue-label");
     if (!label) return;
-    const hasRendered = state.renderedIds.size > 0 || state.jobStatus === "completed";
-    label.textContent = hasRendered
-      ? "Atualizar shorts"
-      : "Continuar com selecionados";
+    label.textContent = "Continuar para legendas";
+    const capLabel = $("#caption-continue-label");
+    if (capLabel) {
+      const hasRendered = state.renderedIds.size > 0 || state.jobStatus === "completed";
+      capLabel.textContent = hasRendered ? "Atualizar shorts" : "Gerar shorts";
+    }
   }
 
   /* ---------- Mode / upload ---------- */
@@ -530,9 +557,14 @@
         else showFlowView(state.viewStep);
       } else if (job.status === "awaiting_selection") {
         prepareSelection(job);
+        // Allow navigating to caption step if they already picked topics before
+        if (state.selectedIds.size > 0) {
+          state.maxStep = Math.max(state.maxStep, 3);
+        }
         if (state.followJobStep) setFlowStep(2);
         else showFlowView(state.viewStep);
         if (state.viewStep === 2) renderTopicPicker(job);
+        if (state.viewStep === 3) syncCaptionForm();
         if (state.pollTimer) {
           clearInterval(state.pollTimer);
           state.pollTimer = null;
@@ -551,10 +583,10 @@
           state.selectedIds = new Set(job.result.selected_ids.map(Number));
         }
         state.highlights = job.result?.highlights || state.highlights;
-        state.maxStep = Math.max(state.maxStep, 3);
-        if (state.followJobStep) setFlowStep(3);
+        state.maxStep = Math.max(state.maxStep, 4);
+        if (state.followJobStep) setFlowStep(4);
         else showFlowView(state.viewStep);
-        if (state.viewStep === 3) renderResults(job);
+        if (state.viewStep === 4) renderResults(job);
       } else if (job.status === "completed" && job.result) {
         const shorts = job.result.shorts || [];
         state.renderedIds = new Set(
@@ -566,29 +598,35 @@
           state.pollTimer = null;
         }
         if (state.followJobStep) {
-          setFlowStep(3);
+          setFlowStep(4);
           renderResults(job);
         } else {
-          state.maxStep = Math.max(state.maxStep, 3);
+          state.maxStep = Math.max(state.maxStep, 4);
           showFlowView(state.viewStep);
           if (state.viewStep === 2) renderTopicPicker(job);
-          if (state.viewStep === 3) renderResults(job);
+          if (state.viewStep === 3) syncCaptionForm();
+          if (state.viewStep === 4) renderResults(job);
         }
+        const capBtn = $("#caption-continue");
+        if (capBtn) capBtn.disabled = false;
         loadJobs();
         loadSources();
       } else if (job.status === "failed") {
         clearInterval(state.pollTimer);
         state.pollTimer = null;
+        const capBtn = $("#caption-continue");
+        if (capBtn) capBtn.disabled = false;
         const logEl = $("#job-log");
         logEl.textContent += `\n\nFALHOU: ${job.error || "erro desconhecido"}`;
         const highlights = job.result?.highlights || [];
         if (highlights.length) {
           // Análise sobreviveu — permite retentar a seleção/corte
           prepareSelection(job);
-          state.maxStep = Math.max(state.maxStep, 2);
+          state.maxStep = Math.max(state.maxStep, 3);
           if (state.followJobStep) setFlowStep(2);
           else showFlowView(state.viewStep);
           if (state.viewStep === 2) renderTopicPicker(job);
+          if (state.viewStep === 3) syncCaptionForm();
         } else {
           showFlowView(state.viewStep);
         }
@@ -729,23 +767,279 @@
     syncPickContinue();
   });
 
-  $("#pick-continue").addEventListener("click", async () => {
+  $("#pick-continue").addEventListener("click", () => {
     if (!state.activeJobId || state.selectedIds.size === 0) return;
-    const btn = $("#pick-continue");
+    state.followJobStep = false;
+    setFlowStep(3, { maxStep: 3 });
+    syncCaptionForm();
+  });
+
+  /* ---------- Caption karaoke UI ---------- */
+  function assToHex(ass) {
+    // &HAABBGGRR → #RRGGBB
+    const m = String(ass || "").match(/&H([0-9A-Fa-f]{8})/);
+    if (!m) return "#ffffff";
+    const hex = m[1];
+    const bb = hex.slice(2, 4);
+    const gg = hex.slice(4, 6);
+    const rr = hex.slice(6, 8);
+    return `#${rr}${gg}${bb}`.toLowerCase();
+  }
+
+  function hexToAss(hex, alpha = "00") {
+    const h = String(hex || "#ffffff").replace("#", "");
+    if (h.length !== 6) return `&H${alpha}FFFFFF`;
+    const rr = h.slice(0, 2);
+    const gg = h.slice(2, 4);
+    const bb = h.slice(4, 6);
+    return `&H${alpha}${bb}${gg}${rr}`.toUpperCase();
+  }
+
+  function readCaptionForm() {
+    const enabled = $("#caption-enabled")?.checked ?? true;
+    const themeBtn = $(".theme-chip.is-selected");
+    return {
+      theme: themeBtn?.dataset.theme || state.captionStyle.theme || "bold-white",
+      enabled,
+      font_name: $("#caption-font")?.value || "Arial Black",
+      font_size: Number($("#caption-size")?.value || 72),
+      outline: Number($("#caption-outline")?.value || 4),
+      max_words_per_line: Number($("#caption-words")?.value || 4),
+      primary_colour: hexToAss($("#caption-primary")?.value || "#ffff00"),
+      secondary_colour: hexToAss($("#caption-secondary")?.value || "#ffffff"),
+      outline_colour: hexToAss($("#caption-outline-color")?.value || "#000000"),
+      bold: $("#caption-bold")?.checked ?? true,
+      shadow: state.captionStyle.shadow ?? 0,
+      margin_v: state.captionStyle.margin_v ?? 160,
+      back_colour: state.captionStyle.back_colour || "&H80000000",
+    };
+  }
+
+  function applyThemeToForm(theme) {
+    if (!theme) return;
+    state.captionStyle = { ...state.captionStyle, ...theme, theme: theme.id || theme.theme };
+    const font = $("#caption-font");
+    if (font && theme.font_name) {
+      if (![...font.options].some((o) => o.value === theme.font_name)) {
+        const opt = document.createElement("option");
+        opt.value = theme.font_name;
+        opt.textContent = theme.font_name;
+        font.appendChild(opt);
+      }
+      font.value = theme.font_name;
+    }
+    if ($("#caption-size") && theme.font_size != null) $("#caption-size").value = theme.font_size;
+    if ($("#caption-outline") && theme.outline != null) $("#caption-outline").value = theme.outline;
+    if ($("#caption-words") && theme.max_words_per_line != null) {
+      $("#caption-words").value = theme.max_words_per_line;
+    }
+    if ($("#caption-primary") && theme.primary_colour) {
+      $("#caption-primary").value = assToHex(theme.primary_colour);
+    }
+    if ($("#caption-secondary") && theme.secondary_colour) {
+      $("#caption-secondary").value = assToHex(theme.secondary_colour);
+    }
+    if ($("#caption-outline-color") && theme.outline_colour) {
+      $("#caption-outline-color").value = assToHex(theme.outline_colour);
+    }
+    if ($("#caption-bold") && theme.bold != null) $("#caption-bold").checked = !!theme.bold;
+    updateCaptionPreview();
+  }
+
+  function previewHighlight() {
+    const ordered = [...state.selectedIds]
+      .map((id) => state.highlights.find((h, i) => Number(h.id ?? i) === Number(id)))
+      .filter(Boolean)
+      .sort((a, b) => float(a.start_time) - float(b.start_time));
+    return ordered[0] || state.highlights[0] || null;
+  }
+
+  function float(v) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : 0;
+  }
+
+  function previewWordsFromHighlight(h) {
+    const raw = (h?.snippet || h?.hook_sentence || "Isso muda tudo").trim();
+    const tokens = raw.split(/\s+/).filter(Boolean).slice(0, 5);
+    return tokens.length ? tokens : ["Isso", "muda", "tudo"];
+  }
+
+  function updateCaptionPreview() {
+    const preview = $("#caption-preview");
+    const frame = $("#caption-preview-frame");
+    const bg = $("#caption-preview-bg");
+    const fallback = $("#caption-preview-fallback");
+    const badge = $("#caption-preview-badge");
+    const meta = $("#caption-preview-meta");
+    if (!preview || !frame) return;
+
+    const aspect =
+      $("#aspect_ratio")?.value ||
+      state.jobParams?.aspect_ratio ||
+      "9:16";
+    frame.dataset.ratio = aspect;
+    if (badge) badge.textContent = aspect;
+
+    const highlight = previewHighlight();
+    const thumb = highlight?.thumbnail_url || "";
+    if (bg) {
+      if (thumb) {
+        bg.hidden = false;
+        if (bg.getAttribute("src") !== thumb) bg.src = thumb;
+        if (fallback) fallback.hidden = true;
+      } else {
+        bg.hidden = true;
+        bg.removeAttribute("src");
+        if (fallback) fallback.hidden = false;
+      }
+    }
+    if (meta) {
+      const title = highlight?.title || "tópico selecionado";
+      meta.textContent = thumb
+        ? `Preview · ${aspect} · frame de “${title}”`
+        : `Preview · ${aspect} · sem miniatura do corte ainda`;
+    }
+
+    const words = previewWordsFromHighlight(highlight);
+    preview.innerHTML = words
+      .map((w, i) => {
+        const cls = i === 0 ? " is-done" : i === 1 ? " is-active" : "";
+        return `<span class="cap-word${cls}">${escapeHtml(w)}</span>`;
+      })
+      .join("");
+
+    const primary = $("#caption-primary")?.value || "#ffff00";
+    const secondary = $("#caption-secondary")?.value || "#ffffff";
+    const outline = $("#caption-outline-color")?.value || "#000000";
+    const size = Number($("#caption-size")?.value || 72);
+    const bold = $("#caption-bold")?.checked;
+    const font = $("#caption-font")?.value || "Arial Black";
+    const border = Number($("#caption-outline")?.value || 4);
+    // Scale text relative to frame width so 9:16 vs 16:9 stay readable
+    const frameW = frame.clientWidth || 280;
+    const scale = frameW / 1080;
+    preview.style.fontFamily = `"${font}", Impact, sans-serif`;
+    preview.style.fontSize = `${Math.max(14, Math.round(size * scale * 0.95))}px`;
+    preview.style.fontWeight = bold ? "900" : "600";
+    preview.style.webkitTextStroke = `${Math.max(1, border * scale * 0.9)}px ${outline}`;
+    preview.style.paintOrder = "stroke fill";
+    $$(".cap-word", preview).forEach((w, i) => {
+      w.style.color = i <= 1 ? primary : secondary;
+    });
+  }
+
+  function renderThemeGrid() {
+    const grid = $("#theme-grid");
+    if (!grid) return;
+    const themes = state.captionThemes.length
+      ? state.captionThemes
+      : [
+          { id: "bold-white", label: "Branco bold" },
+          { id: "yellow-pop", label: "Amarelo pop" },
+          { id: "neon-mint", label: "Verde neon" },
+          { id: "minimal", label: "Minimal" },
+        ];
+    const active = state.captionStyle.theme || "bold-white";
+    grid.innerHTML = "";
+    themes.forEach((t) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `theme-chip${t.id === active ? " is-selected" : ""}`;
+      btn.dataset.theme = t.id;
+      btn.setAttribute("role", "option");
+      btn.setAttribute("aria-selected", t.id === active ? "true" : "false");
+      btn.innerHTML = `<span class="theme-chip-label">${escapeHtml(t.label || t.id)}</span>`;
+      btn.addEventListener("click", () => {
+        $$(".theme-chip", grid).forEach((c) => {
+          c.classList.remove("is-selected");
+          c.setAttribute("aria-selected", "false");
+        });
+        btn.classList.add("is-selected");
+        btn.setAttribute("aria-selected", "true");
+        applyThemeToForm({ ...t, theme: t.id });
+      });
+      grid.appendChild(btn);
+    });
+  }
+
+  function syncCaptionForm() {
+    renderThemeGrid();
+    const style = state.captionStyle;
+    if ($("#caption-enabled")) $("#caption-enabled").checked = style.enabled !== false;
+    applyThemeToForm({ ...style, id: style.theme });
+    const controls = $("#caption-controls");
+    if (controls) controls.hidden = style.enabled === false && !$("#caption-enabled")?.checked;
+    const enabled = $("#caption-enabled")?.checked ?? true;
+    if (controls) controls.hidden = !enabled;
+    updateCaptionPreview();
+  }
+
+  async function loadCaptionThemes() {
+    try {
+      const res = await fetch("/api/caption-themes");
+      const data = await res.json();
+      if (res.ok) {
+        state.captionThemes = data.themes || [];
+        if (data.default && !state.jobParams?.caption_style) {
+          state.captionStyle = { ...state.captionStyle, ...data.default };
+        }
+      }
+    } catch (_) {
+      /* ignore — hardcoded fallbacks */
+    }
+  }
+
+  $("#caption-enabled")?.addEventListener("change", () => {
+    const on = $("#caption-enabled").checked;
+    const controls = $("#caption-controls");
+    if (controls) controls.hidden = !on;
+  });
+
+  ["caption-font", "caption-size", "caption-outline", "caption-words", "caption-primary", "caption-secondary", "caption-outline-color", "caption-bold"].forEach((id) => {
+    $(`#${id}`)?.addEventListener("input", updateCaptionPreview);
+    $(`#${id}`)?.addEventListener("change", updateCaptionPreview);
+  });
+
+  $("#aspect_ratio")?.addEventListener("change", () => {
+    if (state.viewStep === 3) updateCaptionPreview();
+  });
+
+  $("#caption-preview-bg")?.addEventListener("load", updateCaptionPreview);
+  $("#caption-preview-bg")?.addEventListener("error", () => {
+    const bg = $("#caption-preview-bg");
+    const fallback = $("#caption-preview-fallback");
+    if (bg) {
+      bg.hidden = true;
+      bg.removeAttribute("src");
+    }
+    if (fallback) fallback.hidden = false;
+  });
+
+  $("#caption-back")?.addEventListener("click", () => {
+    state.followJobStep = false;
+    setFlowStep(2);
+    if (state.lastJob) renderTopicPicker(state.lastJob);
+  });
+
+  $("#caption-continue")?.addEventListener("click", async () => {
+    if (!state.activeJobId || state.selectedIds.size === 0) return;
+    const btn = $("#caption-continue");
     btn.disabled = true;
+    const style = readCaptionForm();
+    state.captionStyle = style;
     try {
       const res = await fetch(`/api/jobs/${state.activeJobId}/select`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids: [...state.selectedIds] }),
+        body: JSON.stringify({ ids: [...state.selectedIds], caption_style: style }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
       state.jobStatus = "rendering";
       state.followJobStep = true;
-      setFlowStep(3);
+      setFlowStep(4);
       setBadge("rendering");
-      // Optimistic skeleton grid while the first poll arrives
       if (state.lastJob?.result) {
         const ready = [...state.selectedIds].filter((id) => state.renderedIds.has(id));
         const pending = [...state.selectedIds].filter((id) => !state.renderedIds.has(id));
@@ -753,7 +1047,11 @@
         renderResults({
           ...state.lastJob,
           status: "rendering",
-          params: { ...state.lastJob.params, selected_ids: [...state.selectedIds] },
+          params: {
+            ...state.lastJob.params,
+            selected_ids: [...state.selectedIds],
+            caption_style: style,
+          },
           result: {
             ...state.lastJob.result,
             selected_ids: [...state.selectedIds],
@@ -774,9 +1072,8 @@
       pollJob();
       state.pollTimer = setInterval(pollJob, 1500);
     } catch (err) {
-      $("#pick-hint").textContent = `erro: ${err.message}`;
+      $("#caption-hint").textContent = `erro: ${err.message}`;
       btn.disabled = false;
-      // Status no servidor pode ter mudado (ex.: reload) — ressincroniza
       pollJob();
     }
   });
@@ -815,7 +1112,7 @@
         state.renderedIds = new Set();
         state.followJobStep = true;
         setBadge("rendering");
-        setFlowStep(3);
+        setFlowStep(4);
         if (state.lastJob?.result) {
           const ids = [
             ...(state.selectedIds.size
@@ -1087,6 +1384,7 @@
 
   refreshHealth();
   loadSources();
+  loadCaptionThemes();
   setFlowStep(1);
   applyRoute(parseRoute(location.pathname));
 })();

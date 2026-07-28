@@ -458,11 +458,16 @@ def _run_render(
         _persist_job(job)
 
     existing = analysis.get("shorts") or []
-    existing_by_id = {
-        _short_id(s, i): s
-        for i, s in enumerate(existing)
-        if s.get("clip_url") and not s.get("error")
-    }
+    desired_style = params.get("caption_style")
+    existing_by_id = {}
+    for i, s in enumerate(existing):
+        if not s.get("clip_url") or s.get("error"):
+            continue
+        sid = _short_id(s, i)
+        # Re-render when karaoke style no longer matches
+        if desired_style and s.get("caption_style") != desired_style:
+            continue
+        existing_by_id[sid] = s
     if force:
         reuse_ids: List[int] = []
         render_ids = list(selected_ids)
@@ -540,6 +545,7 @@ def _run_render(
                     render_ids,
                     aspect_ratio=params.get("aspect_ratio") or "9:16",
                     on_short_done=on_short_done,
+                    caption_style=params.get("caption_style"),
                 )
             # Ensure any shorts from the batch are present even if callback skipped
             for s in partial.get("shorts") or []:
@@ -572,11 +578,13 @@ def _run_render(
 class SelectHighlights(BaseModel):
     ids: List[int] = Field(default_factory=list)
     force: bool = False
+    caption_style: Optional[Dict[str, Any]] = None
 
 
 class UpdateJobParams(BaseModel):
     aspect_ratio: Optional[str] = None
     regenerate: bool = True
+    caption_style: Optional[Dict[str, Any]] = None
 
 
 @app.get("/api/health")
@@ -584,6 +592,15 @@ def health():
     cfg = _read_config()
     return {"ok": True, "config": cfg["status"]}
 
+
+@app.get("/api/caption-themes")
+def caption_themes():
+    from shorts_generator.captions import list_themes, resolve_style
+
+    return {
+        "themes": list_themes(),
+        "default": resolve_style({"theme": "bold-white"}),
+    }
 
 def _fmt_size(n: int) -> str:
     units = ["B", "KB", "MB", "GB"]
@@ -691,6 +708,7 @@ def _list_recent_sources(limit: int = 12) -> List[Dict[str, Any]]:
             youtube_url = meta.get("url") or f"https://www.youtube.com/watch?v={video_id}"
             stat = path.stat()
             srt = path.with_suffix(".srt")
+            json_cache = path.with_name(path.stem + ".transcript.json")
             items.append(
                 {
                     "id": video_id,
@@ -701,7 +719,7 @@ def _list_recent_sources(limit: int = 12) -> List[Dict[str, Any]]:
                     "size_bytes": stat.st_size,
                     "size_label": _fmt_size(stat.st_size),
                     "mtime": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(),
-                    "has_transcript_cache": srt.exists(),
+                    "has_transcript_cache": json_cache.exists() or srt.exists(),
                     "mode": meta.get("mode") or "local",
                     "last_job_id": meta.get("last_job_id"),
                     "last_used_at": meta.get("last_used_at"),
@@ -905,6 +923,8 @@ def _job_allows_selection(job: Dict[str, Any]) -> bool:
 
 @app.post("/api/jobs/{job_id}/select")
 def select_highlights(job_id: str, body: SelectHighlights):
+    from shorts_generator.captions import resolve_style
+
     with _jobs_lock:
         job = _jobs.get(job_id)
         if not job:
@@ -925,13 +945,17 @@ def select_highlights(job_id: str, body: SelectHighlights):
         if bad:
             raise HTTPException(400, f"IDs inválidos: {bad}")
         ids = _sorted_selection_ids(highlights, ids)
-        force = bool(body.force) or bool(job["params"].get("force_rerender"))
+        style = resolve_style(body.caption_style if body.caption_style is not None else job["params"].get("caption_style"))
+        prev_style = job["params"].get("caption_style")
+        style_changed = prev_style != style
+        job["params"]["caption_style"] = style
+        force = bool(body.force) or bool(job["params"].get("force_rerender")) or style_changed
         # Clear prior failure so UI reflects a fresh render attempt
         if job["status"] == "failed":
             job["status"] = "awaiting_selection"
             job["error"] = None
-            job["updated_at"] = _now()
-            _persist_job(job)
+        job["updated_at"] = _now()
+        _persist_job(job)
 
     thread = threading.Thread(
         target=_run_render,
@@ -945,6 +969,7 @@ def select_highlights(job_id: str, body: SelectHighlights):
         "status": "rendering",
         "selected_ids": ids,
         "force": force,
+        "caption_style": style,
     }
 
 
