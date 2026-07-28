@@ -143,6 +143,7 @@ body {
   font-weight: 500;
   padding: 0.45rem 0.9rem;
   cursor: pointer;
+  text-decoration: none;
   transition: color 0.2s, background 0.2s;
 }
 
@@ -181,7 +182,8 @@ main {
   padding: 2.5rem 0 4rem;
 }
 
-.panel[hidden] { display: none !important; }
+/* Author display rules (e.g. .field { display: flex }) override UA [hidden]. */
+[hidden] { display: none !important; }
 .panel.is-active { animation: rise 0.45s ease both; }
 
 .hero-block {
@@ -270,9 +272,128 @@ select:focus {
 
 .field-row {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 0.75rem;
   margin-bottom: 1rem;
+}
+.field-row.has-mode {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.step-rail {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-bottom: 0.55rem;
+}
+.step-dot {
+  width: 1.55rem;
+  height: 1.55rem;
+  display: grid;
+  place-items: center;
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: #0e100c;
+}
+.step-dot.is-active {
+  background: var(--accent);
+  color: var(--accent-ink);
+  border-color: var(--accent);
+}
+.step-dot.is-done {
+  border-color: rgba(93, 255, 168, 0.45);
+  color: var(--ok);
+}
+.step-line {
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+  max-width: 3rem;
+}
+.step-label {
+  margin: 0 0 1rem;
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+
+.pick-area {
+  margin-top: 0.5rem;
+  animation: rise 0.4s ease both;
+}
+.pick-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+.topic-list {
+  display: grid;
+  gap: 0.75rem;
+}
+.topic-card {
+  display: grid;
+  grid-template-columns: auto 140px 1fr;
+  gap: 0.85rem;
+  align-items: start;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  background: #12150f;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+  font: inherit;
+  width: 100%;
+  transition: border-color 0.15s, background 0.15s;
+  animation: rise 0.4s ease both;
+}
+.topic-card:hover {
+  border-color: rgba(214, 255, 63, 0.35);
+  background: rgba(214, 255, 63, 0.04);
+}
+.topic-card.is-selected {
+  border-color: var(--accent);
+  background: rgba(214, 255, 63, 0.07);
+}
+.topic-check {
+  width: 1.15rem;
+  height: 1.15rem;
+  margin-top: 0.2rem;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.topic-thumb {
+  width: 140px;
+  height: 79px;
+  object-fit: cover;
+  background: #1a1e16;
+  border: 1px solid var(--line);
+  display: block;
+}
+.topic-thumb.is-placeholder {
+  display: grid;
+  place-items: center;
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--muted);
+}
+.topic-body h3 {
+  margin: 0 0 0.35rem;
+  font-size: 1.02rem;
+  line-height: 1.25;
+}
+.topic-snippet {
+  margin: 0.35rem 0 0;
+  font-size: 0.88rem;
+  color: var(--muted);
+  line-height: 1.45;
+}
+.workbench.is-locked {
+  opacity: 0.55;
+  pointer-events: none;
 }
 
 .upload-field {
@@ -300,6 +421,100 @@ select:focus {
   font-size: 0.9rem;
   color: var(--muted);
   font-family: var(--font-mono);
+}
+
+.recent-block {
+  margin: 0 0 1rem;
+}
+
+.recent-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  margin-bottom: 0.45rem;
+}
+
+.btn-tiny {
+  padding: 0.25rem 0.55rem;
+  font-size: 0.72rem;
+}
+
+.recent-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.recent-chip {
+  appearance: none;
+  border: 1px solid var(--line);
+  background: #0e100c;
+  color: var(--ink);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.35rem 0.7rem 0.35rem 0.35rem;
+  cursor: pointer;
+  max-width: 100%;
+  font-family: var(--font-body);
+  font-size: 0.78rem;
+  text-align: left;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.recent-chip:hover {
+  border-color: rgba(214, 255, 63, 0.45);
+  background: rgba(214, 255, 63, 0.05);
+}
+
+.recent-chip.is-selected {
+  border-color: var(--accent);
+  background: rgba(214, 255, 63, 0.08);
+}
+
+.recent-chip-thumb {
+  width: 88px;
+  height: 50px;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: #1a1e16;
+  display: block;
+}
+
+.recent-chip-thumb.is-placeholder {
+  display: grid;
+  place-items: center;
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  color: var(--muted);
+  letter-spacing: 0.04em;
+}
+
+.recent-chip-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  padding-right: 0.15rem;
+}
+
+.recent-chip-id {
+  font-family: var(--font-body);
+  font-size: 0.8rem;
+  font-weight: 500;
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 16rem;
+}
+
+.recent-chip-meta {
+  font-size: 0.65rem;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  white-space: nowrap;
 }
 
 .actions {
@@ -388,6 +603,9 @@ select:focus {
   border: 1px solid var(--line);
   color: var(--muted);
 }
+.badge.is-analyzing { color: var(--run); border-color: rgba(126, 200, 255, 0.4); }
+.badge.is-rendering { color: var(--run); border-color: rgba(126, 200, 255, 0.4); }
+.badge.is-awaiting_selection { color: var(--accent); border-color: rgba(214, 255, 63, 0.45); }
 .badge.is-running { color: var(--run); border-color: rgba(126, 200, 255, 0.4); }
 .badge.is-completed { color: var(--ok); border-color: rgba(93, 255, 168, 0.4); }
 .badge.is-failed { color: var(--warn); border-color: rgba(255, 107, 61, 0.45); }
@@ -414,9 +632,10 @@ select:focus {
 
 .short-card {
   display: grid;
-  grid-template-columns: minmax(140px, 200px) 1fr;
-  gap: 1rem;
-  padding: 1rem;
+  grid-template-columns: 120px 1fr;
+  gap: 0.85rem;
+  align-items: start;
+  padding: 0.75rem;
   border: 1px solid var(--line);
   background: #12150f;
   animation: rise 0.45s ease both;
@@ -424,6 +643,7 @@ select:focus {
 
 .short-card video {
   width: 100%;
+  max-width: 120px;
   aspect-ratio: 9 / 16;
   object-fit: cover;
   background: #000;
@@ -527,6 +747,8 @@ select:focus {
   .config-grid { grid-template-columns: 1fr; }
   .short-card { grid-template-columns: 1fr; }
   .short-card video { max-width: 220px; }
+  .topic-card { grid-template-columns: auto 1fr; }
+  .topic-thumb { width: 100%; height: auto; aspect-ratio: 16 / 9; grid-column: 2; }
   .top {
     flex-wrap: wrap;
   }

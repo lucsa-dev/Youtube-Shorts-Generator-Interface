@@ -22,9 +22,9 @@
       </div>
     </div>
     <nav class="tabs" role="tablist">
-      <button class="tab is-active" data-tab="generate" role="tab" aria-selected="true">Gerar</button>
-      <button class="tab" data-tab="jobs" role="tab" aria-selected="false">Jobs</button>
-      <button class="tab" data-tab="config" role="tab" aria-selected="false">Config</button>
+      <a class="tab is-active" href="/" data-tab="generate" role="tab" aria-selected="true">Gerar</a>
+      <a class="tab" href="/jobs" data-tab="jobs" role="tab" aria-selected="false">Jobs</a>
+      <a class="tab" href="/config" data-tab="config" role="tab" aria-selected="false">Config</a>
     </nav>
     <div class="status-pill" id="api-status" title="Status das chaves">
       <span class="dot"></span>
@@ -38,12 +38,29 @@
       <div class="hero-block">
         <h1 class="display">Corta. Rankeia.<br /><em>Publica.</em></h1>
         <p class="lede">
-          Cole um vídeo longo do YouTube e receba shorts 9:16 ranqueados por viralidade —
-          hook, score e motivo em cada clip.
+          Cole um vídeo longo do YouTube. A IA lista os tópicos virais —
+          você escolhe quais viram shorts 9:16.
         </p>
       </div>
 
       <form id="generate-form" class="workbench" autocomplete="off">
+        <div class="step-rail" aria-hidden="true">
+          <span class="step-dot is-active" data-step="1">1</span>
+          <span class="step-line"></span>
+          <span class="step-dot" data-step="2">2</span>
+          <span class="step-line"></span>
+          <span class="step-dot" data-step="3">3</span>
+        </div>
+        <p class="step-label" id="step-label">1 · Configurar fonte</p>
+
+        <div class="recent-block" id="recent-block" hidden>
+          <div class="recent-head">
+            <span class="label">Recentes</span>
+            <button type="button" class="btn ghost btn-tiny" id="refresh-sources">Atualizar</button>
+          </div>
+          <div class="recent-list" id="recent-sources"></div>
+        </div>
+
         <label class="field field-grow">
           <span class="label">Fonte</span>
           <input
@@ -55,16 +72,11 @@
         </label>
 
         <div class="field-row">
-          <label class="field">
+          <label class="field" id="mode-field" hidden>
             <span class="label">Modo</span>
             <select name="mode" id="mode">
-              <option value="api">API (MuAPI)</option>
-              <option value="local">Local (yt-dlp + Whisper)</option>
+              <option value="local" selected>Local (yt-dlp + Whisper)</option>
             </select>
-          </label>
-          <label class="field">
-            <span class="label">Clips</span>
-            <input type="number" name="num_clips" id="num_clips" min="1" max="20" value="3" />
           </label>
           <label class="field">
             <span class="label">Proporção</span>
@@ -84,24 +96,20 @@
               <option value="1080">1080p</option>
             </select>
           </label>
-          <label class="field">
-            <span class="label">Idioma Whisper</span>
-            <input type="text" name="language" id="language" placeholder="auto (ex: pt, en)" />
-          </label>
         </div>
 
         <label class="field upload-field" id="upload-wrap">
-          <span class="label">Arquivo local <em>(somente modo local)</em></span>
+          <span class="label">Arquivo local <em id="upload-mode-note">(somente modo local)</em></span>
           <input type="file" name="file" id="file" accept="video/*,.mp4,.mkv,.webm,.mov" />
           <span class="upload-hint" id="file-hint">Arraste um mp4 ou clique para escolher</span>
         </label>
 
         <div class="actions">
           <button type="submit" class="btn primary" id="submit-btn">
-            <span>Gerar shorts</span>
+            <span>Analisar vídeo</span>
             <span class="btn-arrow" aria-hidden="true">→</span>
           </button>
-          <p class="hint" id="form-hint">Pipeline: download → transcrição → ranking → crop vertical</p>
+          <p class="hint" id="form-hint">A IA encontra os tópicos; você escolhe quais cortar</p>
         </div>
       </form>
 
@@ -114,6 +122,25 @@
           <span class="badge" id="active-job-badge">queued</span>
         </div>
         <pre class="log" id="job-log" aria-live="polite"></pre>
+
+        <div class="pick-area" id="pick-area" hidden>
+          <div class="section-head">
+            <div>
+              <h2 style="font-size:1.2rem">Tópicos encontrados</h2>
+              <p class="hint" id="pick-hint">Selecione os momentos que deseja transformar em shorts</p>
+            </div>
+            <div class="pick-actions">
+              <button type="button" class="btn ghost" id="pick-all">Todos</button>
+              <button type="button" class="btn ghost" id="pick-none">Nenhum</button>
+              <button type="button" class="btn primary" id="pick-continue" disabled>
+                Continuar com selecionados
+                <span class="btn-arrow" aria-hidden="true">→</span>
+              </button>
+            </div>
+          </div>
+          <div class="topic-list" id="topic-list"></div>
+        </div>
+
         <div class="results" id="results"></div>
       </div>
     </section>
@@ -133,7 +160,7 @@
     <section class="panel" id="panel-config" role="tabpanel" hidden>
       <div class="section-head">
         <h2>Configuração (.env)</h2>
-        <p class="lede small">Chaves secretas ficam mascaradas. Deixe em branco para manter o valor atual.</p>
+        <p class="lede small">Idioma padrão vale para todas as gerações. Chaves secretas ficam mascaradas — deixe em branco para manter o valor atual.</p>
       </div>
       <form id="config-form" class="config-grid"></form>
       <div class="actions">
@@ -144,7 +171,7 @@
   </main>
 
   <footer class="foot">
-    <span>CLI equivalente: <code>python main.py URL --mode api --num-clips 3</code></span>
+    <span>CLI: <code>python main.py URL --mode local --num-clips 3</code> · Web: análise → seleção → corte</span>
   </footer>
 
   <script src="/app.js"></script>
