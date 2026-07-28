@@ -26,10 +26,6 @@
       <a class="tab" href="/jobs" data-tab="jobs" role="tab" aria-selected="false">Jobs</a>
       <a class="tab" href="/config" data-tab="config" role="tab" aria-selected="false">Config</a>
     </nav>
-    <div class="status-pill" id="api-status" title="Status das chaves">
-      <span class="dot"></span>
-      <span class="status-text">checando…</span>
-    </div>
   </header>
 
   <main>
@@ -44,12 +40,12 @@
       </div>
 
       <form id="generate-form" class="workbench" autocomplete="off">
-        <div class="step-rail" aria-hidden="true">
-          <span class="step-dot is-active" data-step="1">1</span>
-          <span class="step-line"></span>
-          <span class="step-dot" data-step="2">2</span>
-          <span class="step-line"></span>
-          <span class="step-dot" data-step="3">3</span>
+        <div class="step-rail" role="navigation" aria-label="Etapas do job">
+          <button type="button" class="step-dot is-active" data-step="1" aria-current="step">1</button>
+          <span class="step-line" aria-hidden="true"></span>
+          <button type="button" class="step-dot" data-step="2" disabled>2</button>
+          <span class="step-line" aria-hidden="true"></span>
+          <button type="button" class="step-dot" data-step="3" disabled>3</button>
         </div>
         <p class="step-label" id="step-label">1 · Configurar fonte</p>
 
@@ -104,12 +100,20 @@
           <span class="upload-hint" id="file-hint">Arraste um mp4 ou clique para escolher</span>
         </label>
 
-        <div class="actions">
+        <div class="actions" id="new-job-actions">
           <button type="submit" class="btn primary" id="submit-btn">
             <span>Analisar vídeo</span>
             <span class="btn-arrow" aria-hidden="true">→</span>
           </button>
           <p class="hint" id="form-hint">A IA encontra os tópicos; você escolhe quais cortar</p>
+        </div>
+        <div class="actions" id="edit-job-actions" hidden>
+          <button type="button" class="btn primary" id="apply-format-btn">
+            <span>Aplicar proporção</span>
+            <span class="btn-arrow" aria-hidden="true">→</span>
+          </button>
+          <button type="button" class="btn ghost" id="goto-topics-btn">Ir para tópicos</button>
+          <p class="hint" id="edit-form-hint">Mudar a proporção regenera todos os shorts deste job</p>
         </div>
       </form>
 
@@ -133,7 +137,7 @@
               <button type="button" class="btn ghost" id="pick-all">Todos</button>
               <button type="button" class="btn ghost" id="pick-none">Nenhum</button>
               <button type="button" class="btn primary" id="pick-continue" disabled>
-                Continuar com selecionados
+                <span id="pick-continue-label">Continuar com selecionados</span>
                 <span class="btn-arrow" aria-hidden="true">→</span>
               </button>
             </div>

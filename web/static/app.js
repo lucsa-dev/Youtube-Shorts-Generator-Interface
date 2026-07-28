@@ -8,6 +8,13 @@
     lastLogCount: 0,
     selectedIds: new Set(),
     highlights: [],
+    viewStep: 1,
+    maxStep: 1,
+    jobStatus: null,
+    jobParams: null,
+    lastJob: null,
+    renderedIds: new Set(),
+    followJobStep: true,
   };
 
   /* ---------- Router ---------- */
@@ -56,16 +63,38 @@
         watchJob(route.jobId, { syncUrl: false });
       } else {
         $("#run-area").hidden = false;
+        showFlowView(state.viewStep);
       }
       return;
     }
     showTab(route.tab);
     if (route.tab === "generate") {
-      setFlowStep(1);
-      $("#generate-form")?.classList.remove("is-locked");
+      resetGeneratePanel();
     }
     if (route.tab === "jobs") loadJobs();
     if (route.tab === "config") loadConfig();
+  }
+
+  function resetGeneratePanel() {
+    if (state.pollTimer) {
+      clearInterval(state.pollTimer);
+      state.pollTimer = null;
+    }
+    state.activeJobId = null;
+    state.lastJob = null;
+    state.jobStatus = null;
+    state.jobParams = null;
+    state.selectedIds = new Set();
+    state.highlights = [];
+    state.renderedIds = new Set();
+    state.maxStep = 1;
+    state.viewStep = 1;
+    state.followJobStep = true;
+    $("#run-area").hidden = true;
+    $("#pick-area").hidden = true;
+    $("#results").innerHTML = "";
+    $("#job-log").textContent = "";
+    setFlowStep(1);
   }
 
   $$(".tab").forEach((tab) => {
@@ -79,11 +108,25 @@
     applyRoute(parseRoute(location.pathname));
   });
 
-  function setFlowStep(step) {
+  function statusToStep(status) {
+    if (status === "awaiting_selection") return 2;
+    if (status === "rendering" || status === "completed") return 3;
+    return 1;
+  }
+
+  function setFlowStep(step, { maxStep } = {}) {
+    if (maxStep != null) state.maxStep = Math.max(state.maxStep, maxStep);
+    state.viewStep = step;
+    state.maxStep = Math.max(state.maxStep, step);
+
     $$(".step-dot").forEach((dot) => {
       const n = Number(dot.dataset.step);
+      const reachable = n <= state.maxStep;
       dot.classList.toggle("is-active", n === step);
-      dot.classList.toggle("is-done", n < step);
+      dot.classList.toggle("is-done", n < step || (n <= state.maxStep && n !== step));
+      dot.disabled = !reachable;
+      if (n === step) dot.setAttribute("aria-current", "step");
+      else dot.removeAttribute("aria-current");
     });
     const labels = {
       1: "1 · Configurar fonte",
@@ -92,8 +135,82 @@
     };
     const el = $("#step-label");
     if (el) el.textContent = labels[step] || labels[1];
+    showFlowView(step);
+  }
+
+  function showFlowView(step) {
     const form = $("#generate-form");
-    if (form) form.classList.toggle("is-locked", step > 1);
+    const hasJob = Boolean(state.activeJobId);
+    const editable =
+      hasJob &&
+      step === 1 &&
+      ["awaiting_selection", "completed"].includes(state.jobStatus);
+
+    form?.classList.toggle("is-locked", hasJob && !editable);
+    form?.classList.toggle("is-editing-job", editable);
+
+    const newActions = $("#new-job-actions");
+    const editActions = $("#edit-job-actions");
+    if (newActions) newActions.hidden = editable;
+    if (editActions) editActions.hidden = !editable;
+
+    const pick = $("#pick-area");
+    const results = $("#results");
+    const run = $("#run-area");
+
+    if (!hasJob) {
+      if (run) run.hidden = true;
+      return;
+    }
+    if (run) run.hidden = false;
+
+    const canPick =
+      state.highlights.length > 0 &&
+      ["awaiting_selection", "completed", "rendering"].includes(state.jobStatus);
+
+    if (pick) {
+      pick.hidden = !(step === 2 && canPick);
+    }
+    if (results) {
+      results.hidden = step !== 3;
+      if (step === 3 && state.lastJob?.result?.shorts) {
+        renderResults(state.lastJob);
+      }
+    }
+
+    syncPickContinueLabel();
+  }
+
+  $$(".step-dot").forEach((dot) => {
+    dot.addEventListener("click", () => {
+      const n = Number(dot.dataset.step);
+      if (dot.disabled || n > state.maxStep) return;
+      state.followJobStep = false;
+      setFlowStep(n);
+      if (n === 2 && state.lastJob) renderTopicPicker(state.lastJob);
+      if (n === 3 && state.lastJob?.result) renderResults(state.lastJob);
+    });
+  });
+
+  function fillFormFromJob(job) {
+    const params = job?.params || {};
+    state.jobParams = params;
+    if (params.url) $("#url").value = params.url;
+    if (params.mode && [...modeEl.options].some((o) => o.value === params.mode)) {
+      modeEl.value = params.mode;
+      syncUploadState();
+    }
+    if (params.aspect_ratio) $("#aspect_ratio").value = params.aspect_ratio;
+    if (params.download_format) $("#download_format").value = params.download_format;
+  }
+
+  function syncPickContinueLabel() {
+    const label = $("#pick-continue-label");
+    if (!label) return;
+    const hasRendered = state.renderedIds.size > 0 || state.jobStatus === "completed";
+    label.textContent = hasRendered
+      ? "Atualizar shorts"
+      : "Continuar com selecionados";
   }
 
   /* ---------- Mode / upload ---------- */
@@ -236,29 +353,14 @@
     fileHint.textContent = f.name;
   });
 
-  /* ---------- Health / config status ---------- */
+  /* ---------- Health / mode options ---------- */
   async function refreshHealth() {
-    const pill = $("#api-status");
     try {
       const res = await fetch("/api/health");
       const data = await res.json();
-      const s = data.config || {};
-      syncModeOptions(s);
-      const parts = [];
-      if (s.muapi) parts.push("MuAPI");
-      if (s.openai) parts.push("OpenAI");
-      if (s.gemini) parts.push("Gemini");
-      if (parts.length) {
-        pill.className = "status-pill is-ok";
-        $(".status-text", pill).textContent = parts.join(" · ");
-      } else {
-        pill.className = "status-pill is-warn";
-        $(".status-text", pill).textContent = "sem chaves — veja Config";
-      }
+      syncModeOptions(data.config || {});
     } catch {
       syncModeOptions({ modes: ["local"], default_mode: "local" });
-      pill.className = "status-pill is-warn";
-      $(".status-text", pill).textContent = "API offline";
     }
   }
 
@@ -367,6 +469,10 @@
     state.lastLogCount = 0;
     state.selectedIds = new Set();
     state.highlights = [];
+    state.renderedIds = new Set();
+    state.lastJob = null;
+    state.jobStatus = "queued";
+    state.maxStep = 1;
     $("#run-area").hidden = false;
     $("#pick-area").hidden = true;
     $("#topic-list").innerHTML = "";
@@ -374,7 +480,8 @@
     $("#job-log").textContent = "";
     $("#results").innerHTML = "";
     setBadge("queued");
-    setFlowStep(1);
+    state.followJobStep = true;
+    setFlowStep(1, { maxStep: 1 });
     if (syncUrl) {
       const path = pathFor("generate", jobId);
       if (location.pathname !== path) {
@@ -392,7 +499,11 @@
       const res = await fetch(`/api/jobs/${state.activeJobId}`);
       if (!res.ok) return;
       const job = await res.json();
+      state.lastJob = job;
+      state.jobStatus = job.status;
       setBadge(job.status);
+      fillFormFromJob(job);
+
       const logs = job.logs || [];
       if (logs.length > state.lastLogCount) {
         const logEl = $("#job-log");
@@ -404,24 +515,44 @@
         logEl.scrollTop = logEl.scrollHeight;
       }
 
+      const reached = statusToStep(job.status);
+      state.maxStep = Math.max(state.maxStep, reached);
+
       if (job.status === "analyzing" || job.status === "queued") {
-        setFlowStep(1);
+        if (state.followJobStep) setFlowStep(1);
+        else showFlowView(state.viewStep);
       } else if (job.status === "awaiting_selection") {
-        setFlowStep(2);
-        renderTopicPicker(job);
+        prepareSelection(job);
+        if (state.followJobStep) setFlowStep(2);
+        else showFlowView(state.viewStep);
+        if (state.viewStep === 2) renderTopicPicker(job);
         if (state.pollTimer) {
           clearInterval(state.pollTimer);
           state.pollTimer = null;
         }
       } else if (job.status === "rendering") {
-        setFlowStep(3);
-        $("#pick-area").hidden = true;
+        state.maxStep = Math.max(state.maxStep, 3);
+        if (state.followJobStep) setFlowStep(3);
+        else showFlowView(state.viewStep);
       } else if (job.status === "completed" && job.result) {
-        setFlowStep(3);
-        $("#pick-area").hidden = true;
-        renderResults(job);
-        clearInterval(state.pollTimer);
-        state.pollTimer = null;
+        const shorts = job.result.shorts || [];
+        state.renderedIds = new Set(
+          shorts.map((s, i) => Number(s.id ?? i)).filter((n) => !Number.isNaN(n))
+        );
+        prepareSelection(job);
+        if (state.pollTimer) {
+          clearInterval(state.pollTimer);
+          state.pollTimer = null;
+        }
+        if (state.followJobStep) {
+          setFlowStep(3);
+          renderResults(job);
+        } else {
+          state.maxStep = Math.max(state.maxStep, 3);
+          showFlowView(state.viewStep);
+          if (state.viewStep === 2) renderTopicPicker(job);
+          if (state.viewStep === 3) renderResults(job);
+        }
         loadJobs();
         loadSources();
       } else if (job.status === "failed") {
@@ -429,10 +560,27 @@
         state.pollTimer = null;
         const logEl = $("#job-log");
         logEl.textContent += `\n\nFALHOU: ${job.error || "erro desconhecido"}`;
+        showFlowView(state.viewStep);
       }
     } catch {
       /* ignore transient poll errors */
     }
+  }
+
+  function prepareSelection(job) {
+    const highlights = job.result?.highlights || [];
+    state.highlights = highlights;
+    if (state.selectedIds.size === 0) {
+      const selectedFromJob = job.params?.selected_ids || job.result?.selected_ids;
+      if (Array.isArray(selectedFromJob) && selectedFromJob.length) {
+        state.selectedIds = new Set(selectedFromJob.map(Number));
+      } else if (state.renderedIds.size) {
+        state.selectedIds = new Set(state.renderedIds);
+      } else {
+        highlights.forEach((h, i) => state.selectedIds.add(Number(h.id ?? i)));
+      }
+    }
+    if (state.viewStep === 2) renderTopicPicker(job);
   }
 
   function setBadge(status) {
@@ -446,7 +594,7 @@
     state.highlights = highlights;
     const list = $("#topic-list");
     const pick = $("#pick-area");
-    pick.hidden = false;
+    if (state.viewStep === 2) pick.hidden = false;
 
     if (!highlights.length) {
       list.innerHTML = `<p class="empty">Nenhum tópico encontrado.</p>`;
@@ -455,15 +603,22 @@
       return;
     }
 
-    // Default: select all
     if (state.selectedIds.size === 0) {
-      highlights.forEach((h, i) => state.selectedIds.add(Number(h.id ?? i)));
+      const fromJob = job.params?.selected_ids || job.result?.selected_ids;
+      if (Array.isArray(fromJob) && fromJob.length) {
+        fromJob.forEach((id) => state.selectedIds.add(Number(id)));
+      } else if (state.renderedIds.size) {
+        state.renderedIds.forEach((id) => state.selectedIds.add(id));
+      } else {
+        highlights.forEach((h, i) => state.selectedIds.add(Number(h.id ?? i)));
+      }
     }
 
     list.innerHTML = "";
     highlights.forEach((h, i) => {
       const id = Number(h.id ?? i);
       const selected = state.selectedIds.has(id);
+      const already = state.renderedIds.has(id);
       const card = document.createElement("button");
       card.type = "button";
       card.className = `topic-card${selected ? " is-selected" : ""}`;
@@ -477,7 +632,9 @@
         ${thumb}
         <div class="topic-body">
           <div class="score"><strong>${h.score ?? "—"}</strong> / 100</div>
-          <h3>${escapeHtml(h.title || `Tópico #${i + 1}`)}</h3>
+          <h3>${escapeHtml(h.title || `Tópico #${i + 1}`)}${
+            already ? ` <span class="topic-ready">pronto</span>` : ""
+          }</h3>
           <p class="meta-row"><strong>Tempo:</strong> ${fmtTime(h.start_time)} → ${fmtTime(h.end_time)}</p>
           <p class="meta-row"><strong>Hook:</strong> ${escapeHtml(h.hook_sentence || "—")}</p>
           <p class="topic-snippet">${escapeHtml(h.snippet || h.virality_reason || "")}</p>
@@ -488,7 +645,6 @@
     });
 
     syncPickContinue();
-    $("#pick-hint").textContent = `${state.selectedIds.size} de ${highlights.length} selecionados · ordenados por tempo`;
   }
 
   function toggleTopic(id, card) {
@@ -510,7 +666,16 @@
     const n = state.selectedIds.size;
     const total = state.highlights.length;
     $("#pick-continue").disabled = n === 0;
-    $("#pick-hint").textContent = `${n} de ${total} selecionados · ordenados por tempo`;
+    const ready = [...state.selectedIds].filter((id) => state.renderedIds.has(id)).length;
+    const neu = n - ready;
+    let hint = `${n} de ${total} selecionados`;
+    if (state.renderedIds.size) {
+      hint += ` · ${ready} prontos · ${neu} novos`;
+    } else {
+      hint += " · ordenados por tempo";
+    }
+    $("#pick-hint").textContent = hint;
+    syncPickContinueLabel();
   }
 
   $("#pick-all").addEventListener("click", () => {
@@ -545,14 +710,70 @@
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+      state.jobStatus = "rendering";
+      state.followJobStep = true;
       setFlowStep(3);
-      $("#pick-area").hidden = true;
       setBadge("rendering");
       if (state.pollTimer) clearInterval(state.pollTimer);
       pollJob();
       state.pollTimer = setInterval(pollJob, 2000);
     } catch (err) {
       $("#pick-hint").textContent = `erro: ${err.message}`;
+      btn.disabled = false;
+    }
+  });
+
+  $("#goto-topics-btn")?.addEventListener("click", () => {
+    if (state.maxStep >= 2) {
+      state.followJobStep = false;
+      setFlowStep(2);
+      if (state.lastJob) renderTopicPicker(state.lastJob);
+    }
+  });
+
+  $("#apply-format-btn")?.addEventListener("click", async () => {
+    if (!state.activeJobId) return;
+    const btn = $("#apply-format-btn");
+    const hint = $("#edit-form-hint");
+    const aspect = $("#aspect_ratio").value;
+    btn.disabled = true;
+    hint.textContent = "aplicando proporção…";
+    try {
+      const res = await fetch(`/api/jobs/${state.activeJobId}/params`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ aspect_ratio: aspect, regenerate: true }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+      if (!data.changed) {
+        hint.textContent = "proporção já estava aplicada";
+        btn.disabled = false;
+        return;
+      }
+      if (data.regenerating) {
+        hint.textContent = "regenerando todos os shorts…";
+        state.jobStatus = "rendering";
+        state.renderedIds = new Set();
+        state.followJobStep = true;
+        setBadge("rendering");
+        setFlowStep(3);
+        if (state.pollTimer) clearInterval(state.pollTimer);
+        pollJob();
+        state.pollTimer = setInterval(pollJob, 2000);
+      } else {
+        hint.textContent = "proporção salva — escolha os tópicos na etapa 2";
+        state.renderedIds = new Set();
+        state.followJobStep = true;
+        setFlowStep(2);
+        if (state.lastJob) {
+          state.lastJob.params = { ...state.lastJob.params, aspect_ratio: aspect };
+          renderTopicPicker(state.lastJob);
+        }
+      }
+    } catch (err) {
+      hint.textContent = `erro: ${err.message}`;
+    } finally {
       btn.disabled = false;
     }
   });
