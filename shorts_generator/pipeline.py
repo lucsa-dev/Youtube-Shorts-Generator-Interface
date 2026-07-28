@@ -9,7 +9,7 @@ Two modes:
 The web UI runs analysis and clipping as separate steps so the user can pick
 which highlights to render. CLI still runs the full pipeline in one shot.
 """
-from typing import Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 from .clipper import crop_highlights
 from .config import normalize_language, resolve_content_language
@@ -136,6 +136,7 @@ def render_selected_shorts(
     analysis: Dict,
     selected_ids: Sequence[int],
     aspect_ratio: str = "9:16",
+    on_short_done: Optional[Callable[[Dict, int, int], None]] = None,
 ) -> Dict:
     """Crop only the highlights the user selected from an analysis result."""
     highlights = analysis.get("highlights") or []
@@ -160,9 +161,13 @@ def render_selected_shorts(
     if mode == "local":
         from .local.clipper import crop_highlights_local
 
-        shorts = crop_highlights_local(source, selected, aspect_ratio=aspect_ratio)
+        shorts = crop_highlights_local(
+            source, selected, aspect_ratio=aspect_ratio, on_short_done=on_short_done
+        )
     else:
-        shorts = crop_highlights(source, selected, aspect_ratio=aspect_ratio)
+        shorts = crop_highlights(
+            source, selected, aspect_ratio=aspect_ratio, on_short_done=on_short_done
+        )
 
     return {
         "mode": mode,

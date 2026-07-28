@@ -161,13 +161,16 @@ def crop_highlights_local(
     highlights: List[Dict],
     aspect_ratio: str = "9:16",
     out_dir: Optional[str] = None,
+    on_short_done=None,
 ) -> List[Dict]:
     out_dir = out_dir or LOCAL_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
     results: List[Dict] = []
+    total = len(highlights)
     for i, h in enumerate(highlights, 1):
-        out_path = os.path.join(out_dir, f"short_{i:02d}.mp4")
-        print(f"[clip/local] {i}/{len(highlights)}: {h.get('title', '(untitled)')}", flush=True)
+        hid = h.get("id", i)
+        out_path = os.path.join(out_dir, f"short_{int(hid):02d}.mp4")
+        print(f"[clip/local] {i}/{total}: {h.get('title', '(untitled)')}", flush=True)
         try:
             crop_clip_local(
                 source_path,
@@ -176,8 +179,11 @@ def crop_highlights_local(
                 aspect_ratio,
                 out_path,
             )
-            results.append({**h, "clip_url": out_path})
+            short = {**h, "clip_url": out_path}
         except Exception as e:
             print(f"[clip/local] {i} failed: {e}", flush=True)
-            results.append({**h, "clip_url": None, "error": str(e)})
+            short = {**h, "clip_url": None, "error": str(e)}
+        results.append(short)
+        if on_short_done:
+            on_short_done(short, i, total)
     return results
