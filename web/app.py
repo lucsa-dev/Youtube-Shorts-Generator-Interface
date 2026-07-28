@@ -274,6 +274,11 @@ def _public_result(job_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
         public["highlights"] = [
             _public_highlight(job_id, h, i) for i, h in enumerate(highlights)
         ]
+    speakers = public.get("speakers") or []
+    if isinstance(speakers, list):
+        public["speakers"] = [
+            _public_speaker(job_id, sp, i) for i, sp in enumerate(speakers)
+        ]
     # Truncate transcript segments in API responses for speed
     transcript = public.get("transcript")
     if isinstance(transcript, dict) and "segments" in transcript:
@@ -284,6 +289,17 @@ def _public_result(job_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
             "segment_count": len(segs) if isinstance(segs, list) else 0,
         }
     return public
+
+
+def _public_speaker(job_id: str, speaker: Any, index: int) -> Dict[str, Any]:
+    if not isinstance(speaker, dict):
+        return {"id": f"S{index + 1}"}
+    out = dict(speaker)
+    sid = str(out.get("id") or f"S{index + 1}").strip().upper() or f"S{index + 1}"
+    portrait = JOBS_DIR / job_id / "cast" / f"{sid}.jpg"
+    if portrait.exists():
+        out["portrait_url"] = f"/api/jobs/{job_id}/cast/{sid}"
+    return out
 
 
 def _public_highlight(job_id: str, highlight: Dict[str, Any], index: int) -> Dict[str, Any]:
@@ -322,34 +338,134 @@ def _extract_frame(source: str, timestamp: float, dest: Path) -> bool:
         return False
 
 
-def _generate_thumbnails(job_id: str, result: Dict[str, Any], original_url: str = "") -> None:
-    """Best-effort frame grabs for each highlight; YouTube poster as fallback."""
+def _crop_face_square(image_path: Path, dest: Path, size: int = 256) -> bool:
+    """Crop largest face (Haar) to a square JPEG; fall back to center crop."""
+    try:
+        import cv2  # type: ignore
+    except ImportError:
+        # Without OpenCV just keep the full frame if dest differs
+        if image_path.resolve() != dest.resolve():
+            try:
+                dest.write_bytes(image_path.read_bytes())
+                return True
+            except OSError:
+                return False
+        return image_path.exists()
+
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return False
+    h, w = img.shape[:2]
+    if h < 8 or w < 8:
+        return False
+
+    x0 = y0 = 0
+    side = min(w, h)
+    face_cascade = None
+    if hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data"):
+        cascade_path = getattr(cv2.data, "haarcascades", "") + "haarcascade_frontalface_default.xml"
+        if cascade_path and Path(cascade_path).exists():
+            face_cascade = cv2.CascadeClassifier(cascade_path)
+            if face_cascade.empty():
+                face_cascade = None
+    if face_cascade is not None:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(
+            gray, scaleFactor=1.1, minNeighbors=4, minSize=(48, 48)
+        )
+        if len(faces) > 0:
+            fx, fy, fw, fh = max(faces, key=lambda f: int(f[2]) * int(f[3]))
+            # Pad around the face so hair/shoulders remain
+            pad = int(max(fw, fh) * 0.55)
+            cx = fx + fw // 2
+            cy = fy + fh // 2
+            side = min(w, h, max(fw, fh) + 2 * pad)
+            x0 = max(0, min(w - side, cx - side // 2))
+            y0 = max(0, min(h - side, cy - side // 2))
+        else:
+            x0 = max(0, (w - side) // 2)
+            y0 = max(0, (h - side) // 2)
+    else:
+        x0 = max(0, (w - side) // 2)
+        y0 = max(0, (h - side) // 2)
+
+    crop = img[y0 : y0 + side, x0 : x0 + side]
+    if crop.size == 0:
+        return False
+    out = cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    return bool(cv2.imwrite(str(dest), out, [int(cv2.IMWRITE_JPEG_QUALITY), 88]))
+
+
+def _resolve_job_source(result: Dict[str, Any], original_url: str = ""):
+    """Return (ffmpeg_source_or_None, youtube_id_or_None)."""
     source = result.get("source_video_url") or ""
     yt_id = _youtube_id_from_url(original_url) or _youtube_id_from_url(source)
     local_source = Path(source)
     if not local_source.is_absolute() and source and not source.startswith("http"):
         local_source = ROOT / source
-    use_ffmpeg = False
-    ffmpeg_src = source
     if local_source.exists() and local_source.is_file():
-        use_ffmpeg = True
-        ffmpeg_src = str(local_source)
-    elif source.startswith("http"):
-        use_ffmpeg = True
-        ffmpeg_src = source
+        return str(local_source), yt_id
+    if source.startswith("http"):
+        return source, yt_id
+    return None, yt_id
+
+
+def _generate_cast_portraits(job_id: str, result: Dict[str, Any], original_url: str = "") -> None:
+    """Grab a face-ish still for each speaker candidate (best-effort)."""
+    speakers = result.get("speakers") or []
+    if not isinstance(speakers, list) or not speakers:
+        return
+    ffmpeg_src, _yt_id = _resolve_job_source(result, original_url)
+    if not ffmpeg_src:
+        return
+
+    cast_dir = JOBS_DIR / job_id / "cast"
+    cast_dir.mkdir(parents=True, exist_ok=True)
+    for i, sp in enumerate(speakers):
+        if not isinstance(sp, dict):
+            continue
+        sid = str(sp.get("id") or f"S{i + 1}").strip().upper() or f"S{i + 1}"
+        try:
+            t = float(sp.get("sample_time") if sp.get("sample_time") is not None else 5.0 * (i + 1))
+        except (TypeError, ValueError):
+            t = 5.0 * (i + 1)
+        dest = cast_dir / f"{sid}.jpg"
+        tmp = cast_dir / f".{sid}.full.jpg"
+        if not _extract_frame(ffmpeg_src, t, tmp):
+            # Try a few nearby timestamps if the first grab fails
+            ok = False
+            for delta in (2.0, 8.0, 15.0, 30.0):
+                if _extract_frame(ffmpeg_src, max(0.0, t + delta), tmp):
+                    ok = True
+                    break
+            if not ok:
+                continue
+        if _crop_face_square(tmp, dest):
+            sp["portrait_url"] = f"/api/jobs/{job_id}/cast/{sid}"
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _generate_thumbnails(job_id: str, result: Dict[str, Any], original_url: str = "") -> None:
+    """Best-effort frame grabs for each highlight; YouTube poster as fallback."""
+    ffmpeg_src, yt_id = _resolve_job_source(result, original_url)
+    use_ffmpeg = bool(ffmpeg_src)
 
     for i, h in enumerate(result.get("highlights") or []):
         hid = int(h.get("id", i))
         dest = JOBS_DIR / job_id / "thumbs" / f"{hid}.jpg"
         ok = False
-        if use_ffmpeg:
+        if use_ffmpeg and ffmpeg_src:
             ok = _extract_frame(ffmpeg_src, float(h.get("start_time", 0)), dest)
         if not ok and yt_id:
             h["thumbnail_url"] = f"https://i.ytimg.com/vi/{yt_id}/hqdefault.jpg"
 
 
 def _run_analyze(job_id: str) -> None:
-    from shorts_generator import analyze_video
+    from shorts_generator import prepare_video
 
     with _jobs_lock:
         job = _jobs[job_id]
@@ -358,17 +474,78 @@ def _run_analyze(job_id: str) -> None:
         params = dict(job["params"])
         _persist_job(job)
 
-    _append_log(job_id, f"Analisando vídeo (mode={params['mode']})…")
+    _append_log(job_id, f"Preparando vídeo (mode={params['mode']})…")
     capture = LogCapture(job_id, sys.stdout)
     err_capture = LogCapture(job_id, sys.stderr)
 
     try:
         with redirect_stdout(capture), redirect_stderr(err_capture):
-            result = analyze_video(
+            result = prepare_video(
                 youtube_url=params["url"],
                 download_format=params["download_format"],
                 language=params.get("language") or None,
                 mode=params["mode"],
+            )
+        speakers = result.get("speakers") or []
+        try:
+            _generate_cast_portraits(
+                job_id, result, original_url=params.get("url") or ""
+            )
+        except Exception as e:
+            _append_log(job_id, f"Aviso: retratos dos locutores falharam ({e})")
+        with _jobs_lock:
+            job = _jobs[job_id]
+            job["status"] = "awaiting_cast"
+            job["result"] = result
+            job["error"] = None
+            job["updated_at"] = _now()
+            _persist_job(job)
+        _append_log(
+            job_id,
+            f"Transcrição pronta — {len(speakers)} locutor(es) detectado(s). "
+            "Confirme os nomes para gerar os títulos.",
+        )
+    except Exception as e:
+        tb = traceback.format_exc()
+        with _jobs_lock:
+            job = _jobs[job_id]
+            job["status"] = "failed"
+            job["error"] = str(e)
+            job["updated_at"] = _now()
+            job["finished_at"] = _now()
+            _persist_job(job)
+        _append_log(job_id, f"ERRO: {e}")
+        _append_log(job_id, tb)
+
+
+def _run_rank_highlights(
+    job_id: str,
+    speaker_names: Dict[str, str],
+    *,
+    skip_cast: bool = False,
+) -> None:
+    from shorts_generator import finalize_analysis
+
+    with _jobs_lock:
+        job = _jobs[job_id]
+        job["status"] = "ranking"
+        job["updated_at"] = _now()
+        params = dict(job["params"])
+        prepared = dict(job.get("result") or {})
+        _persist_job(job)
+
+    _append_log(job_id, "Rotulando falas e ranqueando tópicos virais…")
+    capture = LogCapture(job_id, sys.stdout)
+    err_capture = LogCapture(job_id, sys.stderr)
+
+    try:
+        with redirect_stdout(capture), redirect_stderr(err_capture):
+            result = finalize_analysis(
+                prepared,
+                speaker_names=speaker_names,
+                skip_cast=skip_cast,
+                num_clips=None,
+                language=params.get("language") or None,
             )
         _append_log(job_id, "Gerando miniaturas dos tópicos…")
         _generate_thumbnails(job_id, result, original_url=params.get("url") or "")
@@ -388,13 +565,14 @@ def _run_analyze(job_id: str) -> None:
         tb = traceback.format_exc()
         with _jobs_lock:
             job = _jobs[job_id]
-            job["status"] = "failed"
+            # Keep prepared transcript/speakers so the user can retry naming
+            job["status"] = "awaiting_cast"
             job["error"] = str(e)
             job["updated_at"] = _now()
-            job["finished_at"] = _now()
             _persist_job(job)
-        _append_log(job_id, f"ERRO: {e}")
+        _append_log(job_id, f"ERRO no ranking: {e}")
         _append_log(job_id, tb)
+        _append_log(job_id, "Ajuste os nomes dos locutores e tente novamente.")
 
 
 def _short_id(short: Dict[str, Any], fallback: int = -1) -> int:
@@ -420,7 +598,10 @@ def _build_render_result(
         "mode": analysis.get("mode"),
         "phase": phase,
         "source_video_url": analysis.get("source_video_url"),
+        "source_url": analysis.get("source_url"),
+        "metadata": analysis.get("metadata") or {},
         "transcript": analysis.get("transcript"),
+        "speakers": analysis.get("speakers") or [],
         "highlights": analysis.get("highlights") or [],
         "selected_ids": list(selected_ids),
         "shorts": shorts,
@@ -581,8 +762,19 @@ class SelectHighlights(BaseModel):
     caption_style: Optional[Dict[str, Any]] = None
 
 
+class CastSpeakerName(BaseModel):
+    id: str
+    name: str = ""
+
+
+class ConfirmCast(BaseModel):
+    speakers: List[CastSpeakerName] = Field(default_factory=list)
+    skip: bool = False
+
+
 class UpdateJobParams(BaseModel):
     aspect_ratio: Optional[str] = None
+    download_format: Optional[str] = None
     regenerate: bool = True
     caption_style: Optional[Dict[str, Any]] = None
 
@@ -901,6 +1093,17 @@ def get_thumb(job_id: str, index: int):
     return FileResponse(path, media_type="image/jpeg", filename=f"thumb_{index}.jpg")
 
 
+@app.get("/api/jobs/{job_id}/cast/{speaker_id}")
+def get_cast_portrait(job_id: str, speaker_id: str):
+    sid = re.sub(r"[^A-Za-z0-9_-]", "", speaker_id or "").upper()
+    if not sid:
+        raise HTTPException(404, "Retrato não encontrado")
+    path = JOBS_DIR / job_id / "cast" / f"{sid}.jpg"
+    if not path.exists():
+        raise HTTPException(404, "Retrato não encontrado")
+    return FileResponse(path, media_type="image/jpeg", filename=f"cast_{sid}.jpg")
+
+
 def _sorted_selection_ids(highlights: List[Dict[str, Any]], ids: List[int]) -> List[int]:
     by_id = {int(h.get("id", i)): h for i, h in enumerate(highlights)}
     return sorted(ids, key=lambda i: float(by_id[i].get("start_time", 0)))
@@ -919,6 +1122,37 @@ def _job_allows_selection(job: Dict[str, Any]) -> bool:
     if status == "failed" and _job_highlights(job):
         return True
     return False
+
+
+@app.post("/api/jobs/{job_id}/cast")
+def confirm_cast(job_id: str, body: ConfirmCast):
+    """Confirm speaker names (or skip) and continue to highlight ranking."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job não encontrado")
+        if job.get("status") != "awaiting_cast":
+            raise HTTPException(
+                400,
+                f"Job não está aguardando locutores (status={job['status']})",
+            )
+        result = job.get("result") or {}
+        if not result.get("transcript"):
+            raise HTTPException(400, "Job ainda não tem transcrição")
+        names = {
+            str(s.id).strip().upper(): (s.name or "").strip()
+            for s in (body.speakers or [])
+            if str(s.id).strip()
+        }
+
+    thread = threading.Thread(
+        target=_run_rank_highlights,
+        args=(job_id, names),
+        kwargs={"skip_cast": bool(body.skip)},
+        daemon=True,
+    )
+    thread.start()
+    return {"id": job_id, "status": "ranking", "skip": bool(body.skip)}
 
 
 @app.post("/api/jobs/{job_id}/select")
@@ -982,6 +1216,10 @@ def update_job_params(job_id: str, body: UpdateJobParams):
     if aspect not in ("9:16", "1:1", "4:5", "16:9"):
         raise HTTPException(400, "aspect_ratio inválido")
 
+    fmt = (body.download_format or "").strip() or None
+    if fmt is not None and fmt not in ("360", "480", "720", "1080"):
+        raise HTTPException(400, "download_format inválido")
+
     log_msg = None
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -993,8 +1231,12 @@ def update_job_params(job_id: str, body: UpdateJobParams):
                 f"Não é possível alterar params agora (status={job['status']})",
             )
         prev = (job["params"].get("aspect_ratio") or "9:16").strip()
+        prev_fmt = (job["params"].get("download_format") or "720").strip()
         changed = prev != aspect
+        fmt_changed = bool(fmt and fmt != prev_fmt)
         job["params"]["aspect_ratio"] = aspect
+        if fmt:
+            job["params"]["download_format"] = fmt
         selected = [int(i) for i in (job["params"].get("selected_ids") or [])]
         if not selected and job.get("result"):
             selected = [
@@ -1002,19 +1244,24 @@ def update_job_params(job_id: str, body: UpdateJobParams):
                 for i, s in enumerate(job["result"].get("shorts") or [])
             ]
         should_render = bool(body.regenerate and changed and selected)
-        if changed:
-            job["params"]["force_rerender"] = True
-            # Drop existing crops so UI doesn't show stale aspect until re-render
-            if job.get("result") and not should_render:
-                job["result"] = dict(job["result"])
-                job["result"]["shorts"] = []
-                job["status"] = "awaiting_selection"
+        if changed or fmt_changed:
+            if changed:
+                job["params"]["force_rerender"] = True
+                # Drop existing crops so UI doesn't show stale aspect until re-render
+                if job.get("result") and not should_render:
+                    job["result"] = dict(job["result"])
+                    job["result"]["shorts"] = []
+                    job["status"] = "awaiting_selection"
             job["updated_at"] = _now()
             _persist_job(job)
-            log_msg = (
-                f"Proporção alterada: {prev} → {aspect}"
-                + (" — regenerando todos os shorts…" if should_render else "")
-            )
+            parts = []
+            if changed:
+                parts.append(f"Proporção: {prev} → {aspect}")
+            if fmt_changed:
+                parts.append(f"Resolução salva: {fmt} (vale no próximo download)")
+            if should_render:
+                parts.append("regenerando todos os shorts…")
+            log_msg = " · ".join(parts) if parts else None
         else:
             return {
                 "id": job_id,
@@ -1037,7 +1284,7 @@ def update_job_params(job_id: str, body: UpdateJobParams):
         return {
             "id": job_id,
             "status": "rendering",
-            "params": {"aspect_ratio": aspect},
+            "params": {"aspect_ratio": aspect, "download_format": fmt or prev_fmt},
             "changed": True,
             "regenerating": True,
             "selected_ids": selected,
@@ -1146,7 +1393,13 @@ def _load_persisted_jobs() -> None:
                 data["result"] = json.loads(result_path.read_text(encoding="utf-8"))
             data.setdefault("logs", [])
             # Interrupted in-flight runs: recover to selection if analysis exists
-            if data.get("status") in ("queued", "analyzing", "rendering", "running"):
+            if data.get("status") in (
+                "queued",
+                "analyzing",
+                "ranking",
+                "rendering",
+                "running",
+            ):
                 if _job_highlights(data):
                     data["status"] = "awaiting_selection"
                     data["error"] = None
@@ -1161,6 +1414,22 @@ def _load_persisted_jobs() -> None:
                     )
                     data["updated_at"] = _now()
                     _persist_job(data)
+                elif data.get("status") == "ranking" and (data.get("result") or {}).get(
+                    "transcript"
+                ):
+                    data["status"] = "awaiting_cast"
+                    data["error"] = None
+                    data["logs"].append(
+                        {
+                            "ts": _now(),
+                            "message": (
+                                "Servidor reiniciou durante o ranking — "
+                                "confirme os locutores novamente."
+                            ),
+                        }
+                    )
+                    data["updated_at"] = _now()
+                    _persist_job(data)
                 else:
                     data["status"] = "failed"
                     data["error"] = (
@@ -1168,7 +1437,7 @@ def _load_persisted_jobs() -> None:
                     )
                     data["updated_at"] = _now()
                     _persist_job(data)
-            # awaiting_selection + completed/failed stay as-is
+            # awaiting_cast / awaiting_selection / completed / failed stay as-is
             _jobs[job_id] = data
         except Exception:
             continue

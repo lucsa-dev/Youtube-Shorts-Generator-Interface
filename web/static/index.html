@@ -48,6 +48,8 @@
           <button type="button" class="step-dot" data-step="3" disabled>3</button>
           <span class="step-line" aria-hidden="true"></span>
           <button type="button" class="step-dot" data-step="4" disabled>4</button>
+          <span class="step-line" aria-hidden="true"></span>
+          <button type="button" class="step-dot" data-step="5" disabled>5</button>
         </div>
         <p class="step-label" id="step-label">1 · Configurar fonte</p>
 
@@ -77,24 +79,6 @@
                 <option value="local" selected>Local (yt-dlp + Whisper)</option>
               </select>
             </label>
-            <label class="field">
-              <span class="label">Proporção</span>
-              <select name="aspect_ratio" id="aspect_ratio">
-                <option value="9:16">9:16 Shorts / TikTok / Reels</option>
-                <option value="1:1">1:1 Quadrado</option>
-                <option value="4:5">4:5 Feed</option>
-                <option value="16:9">16:9 Landscape</option>
-              </select>
-            </label>
-            <label class="field">
-              <span class="label">Resolução</span>
-              <select name="download_format" id="download_format">
-                <option value="360">360p</option>
-                <option value="480">480p</option>
-                <option value="720" selected>720p</option>
-                <option value="1080">1080p</option>
-              </select>
-            </label>
           </div>
 
           <label class="field upload-field" id="upload-wrap">
@@ -108,28 +92,35 @@
               <span>Analisar vídeo</span>
               <span class="btn-arrow" aria-hidden="true">→</span>
             </button>
-            <p class="hint" id="form-hint">A IA encontra os tópicos; você escolhe quais cortar</p>
+            <p class="hint" id="form-hint">Confirme os locutores, escolha tópicos e corte os shorts</p>
           </div>
           <div class="actions" id="edit-job-actions" hidden>
-            <button type="button" class="btn primary" id="apply-format-btn">
-              <span>Aplicar proporção</span>
-              <span class="btn-arrow" aria-hidden="true">→</span>
-            </button>
             <button type="button" class="btn ghost" id="goto-topics-btn">Ir para tópicos</button>
-            <p class="hint" id="edit-form-hint">Mudar a proporção regenera todos os shorts deste job</p>
+            <button type="button" class="btn ghost" id="goto-format-btn">Ir para formato</button>
+            <p class="hint" id="edit-form-hint">Proporção e resolução ficam no passo Formato</p>
           </div>
         </div>
       </form>
 
       <div class="run-area" id="run-area" hidden>
-        <div class="run-head">
-          <div>
-            <p class="eyebrow">Job ativo</p>
-            <h2 id="active-job-title">—</h2>
+        <div class="cast-area" id="cast-area" hidden>
+          <div class="section-head">
+            <div>
+              <h2 style="font-size:1.2rem">Quem está falando?</h2>
+              <p class="hint" id="cast-hint">
+                Confirme os nomes dos locutores — isso melhora os títulos dos shorts
+              </p>
+            </div>
+            <div class="pick-actions">
+              <button type="button" class="btn ghost" id="cast-skip">Pular</button>
+              <button type="button" class="btn primary" id="cast-continue">
+                <span>Continuar com estes nomes</span>
+                <span class="btn-arrow" aria-hidden="true">→</span>
+              </button>
+            </div>
           </div>
-          <span class="badge" id="active-job-badge">queued</span>
+          <div class="cast-list" id="cast-list"></div>
         </div>
-        <pre class="log" id="job-log" aria-live="polite"></pre>
 
         <div class="pick-area" id="pick-area" hidden>
           <div class="section-head">
@@ -149,6 +140,44 @@
           <div class="topic-list" id="topic-list"></div>
         </div>
 
+        <div class="format-area" id="format-area" hidden>
+          <div class="section-head">
+            <div>
+              <h2 style="font-size:1.2rem">Formato do short</h2>
+              <p class="hint" id="format-hint">
+                Escolha a proporção do corte. A resolução vale para novos downloads (análise).
+              </p>
+            </div>
+            <div class="pick-actions">
+              <button type="button" class="btn ghost" id="format-back">← Tópicos</button>
+              <button type="button" class="btn primary" id="format-continue">
+                <span>Continuar para legendas</span>
+                <span class="btn-arrow" aria-hidden="true">→</span>
+              </button>
+            </div>
+          </div>
+          <div class="field-row format-fields">
+            <label class="field">
+              <span class="label">Proporção</span>
+              <select name="aspect_ratio" id="aspect_ratio">
+                <option value="9:16">9:16 Shorts / TikTok / Reels</option>
+                <option value="1:1">1:1 Quadrado</option>
+                <option value="4:5">4:5 Feed</option>
+                <option value="16:9">16:9 Landscape</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="label">Resolução</span>
+              <select name="download_format" id="download_format">
+                <option value="360">360p</option>
+                <option value="480">480p</option>
+                <option value="720" selected>720p</option>
+                <option value="1080">1080p</option>
+              </select>
+            </label>
+          </div>
+        </div>
+
         <div class="caption-area" id="caption-area" hidden>
           <div class="section-head">
             <div>
@@ -156,7 +185,7 @@
               <p class="hint" id="caption-hint">Escolha o tema e ajuste tipografia — as palavras destacam no ritmo da fala</p>
             </div>
             <div class="pick-actions">
-              <button type="button" class="btn ghost" id="caption-back">← Tópicos</button>
+              <button type="button" class="btn ghost" id="caption-back">← Formato</button>
               <button type="button" class="btn primary" id="caption-continue">
                 <span id="caption-continue-label">Gerar shorts</span>
                 <span class="btn-arrow" aria-hidden="true">→</span>
@@ -235,6 +264,8 @@
 
         <div class="results" id="results"></div>
       </div>
+
+      <pre class="log" id="job-log" aria-live="polite" hidden></pre>
     </section>
 
     <!-- JOBS -->

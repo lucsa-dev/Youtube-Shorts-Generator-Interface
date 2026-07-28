@@ -77,7 +77,6 @@
       if (state.activeJobId !== route.jobId) {
         watchJob(route.jobId, { syncUrl: false });
       } else {
-        $("#run-area").hidden = false;
         showFlowView(state.viewStep);
       }
       return;
@@ -107,8 +106,14 @@
     state.followJobStep = true;
     $("#run-area").hidden = true;
     $("#pick-area").hidden = true;
+    const formatArea = $("#format-area");
+    if (formatArea) formatArea.hidden = true;
+    const castArea = $("#cast-area");
+    if (castArea) castArea.hidden = true;
     $("#results").innerHTML = "";
-    $("#job-log").textContent = "";
+    const logEl = $("#job-log");
+    logEl.textContent = "";
+    logEl.hidden = true;
     setFlowStep(1);
   }
 
@@ -124,8 +129,9 @@
   });
 
   function statusToStep(status) {
+    if (status === "awaiting_cast" || status === "ranking") return 2;
     if (status === "awaiting_selection") return 2;
-    if (status === "rendering" || status === "completed") return 4;
+    if (status === "rendering" || status === "completed") return 5;
     return 1;
   }
 
@@ -143,11 +149,15 @@
       if (n === step) dot.setAttribute("aria-current", "step");
       else dot.removeAttribute("aria-current");
     });
+    const castGate =
+      step === 2 &&
+      (state.jobStatus === "awaiting_cast" || state.jobStatus === "ranking");
     const labels = {
       1: "1 · Configurar fonte",
-      2: "2 · Escolher tópicos",
-      3: "3 · Legendas karaoke",
-      4: "4 · Cortar shorts",
+      2: castGate ? "2 · Identificar locutores" : "2 · Escolher tópicos",
+      3: "3 · Formato",
+      4: "4 · Legendas karaoke",
+      5: "5 · Cortar shorts",
     };
     const el = $("#step-label");
     if (el) el.textContent = labels[step] || labels[1];
@@ -161,16 +171,17 @@
     const selectableStatus = ["awaiting_selection", "completed", "rendering", "failed"].includes(
       state.jobStatus
     );
+    const castStatus = ["awaiting_cast", "ranking"].includes(state.jobStatus);
     const editable =
       hasJob &&
       step === 1 &&
-      (["awaiting_selection", "completed"].includes(state.jobStatus) ||
-        (state.jobStatus === "failed" && hasTopics));
+      (["awaiting_selection", "completed", "awaiting_cast"].includes(state.jobStatus) ||
+        (state.jobStatus === "failed" && (hasTopics || castStatus)));
 
     const step1Fields = $("#step1-fields");
     if (step1Fields) step1Fields.hidden = step !== 1;
 
-    // Lock only on step 1 while the job is running (fields are hidden on steps 2–4).
+    // Lock only on step 1 while the job is running (fields are hidden on later steps).
     form?.classList.toggle("is-locked", hasJob && step === 1 && !editable);
     form?.classList.toggle("is-editing-job", editable);
 
@@ -179,32 +190,49 @@
     if (newActions) newActions.hidden = editable;
     if (editActions) editActions.hidden = !editable;
 
+    const cast = $("#cast-area");
     const pick = $("#pick-area");
+    const format = $("#format-area");
     const captions = $("#caption-area");
     const results = $("#results");
     const run = $("#run-area");
+    const logEl = $("#job-log");
 
     if (!hasJob) {
       if (run) run.hidden = true;
+      if (logEl) logEl.hidden = true;
       return;
     }
-    if (run) run.hidden = false;
+    if (logEl) logEl.hidden = false;
 
     const canPick = hasTopics && selectableStatus;
+    const showCast = step === 2 && state.jobStatus === "awaiting_cast";
+    const showPick = step === 2 && canPick;
+    const showFormat = step === 3 && canPick;
+    const showCaptions = step === 4 && canPick;
+    const showResults = step === 5;
 
+    if (cast) {
+      cast.hidden = !showCast;
+      if (showCast && state.lastJob) renderCastForm(state.lastJob);
+    }
     if (pick) {
-      pick.hidden = !(step === 2 && canPick);
+      pick.hidden = !showPick;
+    }
+    if (format) {
+      format.hidden = !showFormat;
     }
     if (captions) {
-      captions.hidden = !(step === 3 && canPick);
-      if (step === 3 && canPick) syncCaptionForm();
+      captions.hidden = !showCaptions;
+      if (showCaptions) syncCaptionForm();
     }
     if (results) {
-      results.hidden = step !== 4;
-      if (step === 4 && state.lastJob?.result) {
+      results.hidden = !showResults;
+      if (showResults && state.lastJob?.result) {
         renderResults(state.lastJob);
       }
     }
+    if (run) run.hidden = !(showCast || showPick || showFormat || showCaptions || showResults);
 
     syncPickContinueLabel();
   }
@@ -215,9 +243,12 @@
       if (dot.disabled || n > state.maxStep) return;
       state.followJobStep = false;
       setFlowStep(n);
-      if (n === 2 && state.lastJob) renderTopicPicker(state.lastJob);
-      if (n === 3) syncCaptionForm();
-      if (n === 4 && state.lastJob?.result) renderResults(state.lastJob);
+      if (n === 2 && state.lastJob) {
+        if (state.jobStatus === "awaiting_cast") renderCastForm(state.lastJob);
+        else renderTopicPicker(state.lastJob);
+      }
+      if (n === 4) syncCaptionForm();
+      if (n === 5 && state.lastJob?.result) renderResults(state.lastJob);
     });
   });
 
@@ -239,7 +270,7 @@
   function syncPickContinueLabel() {
     const label = $("#pick-continue-label");
     if (!label) return;
-    label.textContent = "Continuar para legendas";
+    label.textContent = "Continuar para formato";
     const capLabel = $("#caption-continue-label");
     if (capLabel) {
       const hasRendered = state.renderedIds.size > 0 || state.jobStatus === "completed";
@@ -482,6 +513,9 @@
 
     const fd = new FormData(e.target);
     if (!fileInput.files?.length) fd.delete("file");
+    // Formato fica no passo 3 — envia defaults atuais dos selects
+    fd.set("aspect_ratio", $("#aspect_ratio")?.value || "9:16");
+    fd.set("download_format", $("#download_format")?.value || "720");
     // Idioma vem de CONTENT_LANGUAGE na Config (padrão das gerações)
 
     try {
@@ -507,13 +541,17 @@
     state.lastJob = null;
     state.jobStatus = "queued";
     state.maxStep = 1;
-    $("#run-area").hidden = false;
+    $("#run-area").hidden = true;
     $("#pick-area").hidden = true;
+    const formatArea = $("#format-area");
+    if (formatArea) formatArea.hidden = true;
+    const castArea = $("#cast-area");
+    if (castArea) castArea.hidden = true;
     $("#topic-list").innerHTML = "";
-    $("#active-job-title").textContent = jobId;
-    $("#job-log").textContent = "";
+    const logEl = $("#job-log");
+    logEl.textContent = "";
+    logEl.hidden = false;
     $("#results").innerHTML = "";
-    setBadge("queued");
     state.followJobStep = true;
     setFlowStep(1, { maxStep: 1 });
     if (syncUrl) {
@@ -535,7 +573,6 @@
       const job = await res.json();
       state.lastJob = job;
       state.jobStatus = job.status;
-      setBadge(job.status);
       fillFormFromJob(job);
 
       const logs = job.logs || [];
@@ -555,16 +592,35 @@
       if (job.status === "analyzing" || job.status === "queued") {
         if (state.followJobStep) setFlowStep(1);
         else showFlowView(state.viewStep);
+      } else if (job.status === "awaiting_cast") {
+        state.maxStep = Math.max(state.maxStep, 2);
+        const btn = $("#cast-continue");
+        const skipBtn = $("#cast-skip");
+        if (btn) btn.disabled = false;
+        if (skipBtn) skipBtn.disabled = false;
+        if (state.followJobStep) setFlowStep(2);
+        else showFlowView(state.viewStep);
+        if (state.viewStep === 2) renderCastForm(job);
+        if (state.pollTimer) {
+          clearInterval(state.pollTimer);
+          state.pollTimer = null;
+        }
+      } else if (job.status === "ranking") {
+        state.maxStep = Math.max(state.maxStep, 2);
+        if (state.followJobStep) setFlowStep(2);
+        else showFlowView(state.viewStep);
+        const cast = $("#cast-area");
+        if (cast) cast.hidden = true;
       } else if (job.status === "awaiting_selection") {
         prepareSelection(job);
-        // Allow navigating to caption step if they already picked topics before
+        // Allow navigating to format/caption steps if they already picked topics
         if (state.selectedIds.size > 0) {
-          state.maxStep = Math.max(state.maxStep, 3);
+          state.maxStep = Math.max(state.maxStep, 4);
         }
         if (state.followJobStep) setFlowStep(2);
         else showFlowView(state.viewStep);
         if (state.viewStep === 2) renderTopicPicker(job);
-        if (state.viewStep === 3) syncCaptionForm();
+        if (state.viewStep === 4) syncCaptionForm();
         if (state.pollTimer) {
           clearInterval(state.pollTimer);
           state.pollTimer = null;
@@ -583,10 +639,10 @@
           state.selectedIds = new Set(job.result.selected_ids.map(Number));
         }
         state.highlights = job.result?.highlights || state.highlights;
-        state.maxStep = Math.max(state.maxStep, 4);
-        if (state.followJobStep) setFlowStep(4);
+        state.maxStep = Math.max(state.maxStep, 5);
+        if (state.followJobStep) setFlowStep(5);
         else showFlowView(state.viewStep);
-        if (state.viewStep === 4) renderResults(job);
+        if (state.viewStep === 5) renderResults(job);
       } else if (job.status === "completed" && job.result) {
         const shorts = job.result.shorts || [];
         state.renderedIds = new Set(
@@ -598,14 +654,14 @@
           state.pollTimer = null;
         }
         if (state.followJobStep) {
-          setFlowStep(4);
+          setFlowStep(5);
           renderResults(job);
         } else {
-          state.maxStep = Math.max(state.maxStep, 4);
+          state.maxStep = Math.max(state.maxStep, 5);
           showFlowView(state.viewStep);
           if (state.viewStep === 2) renderTopicPicker(job);
-          if (state.viewStep === 3) syncCaptionForm();
-          if (state.viewStep === 4) renderResults(job);
+          if (state.viewStep === 4) syncCaptionForm();
+          if (state.viewStep === 5) renderResults(job);
         }
         const capBtn = $("#caption-continue");
         if (capBtn) capBtn.disabled = false;
@@ -619,14 +675,23 @@
         const logEl = $("#job-log");
         logEl.textContent += `\n\nFALHOU: ${job.error || "erro desconhecido"}`;
         const highlights = job.result?.highlights || [];
+        const speakers = job.result?.speakers || [];
         if (highlights.length) {
           // Análise sobreviveu — permite retentar a seleção/corte
           prepareSelection(job);
-          state.maxStep = Math.max(state.maxStep, 3);
+          state.maxStep = Math.max(state.maxStep, 4);
           if (state.followJobStep) setFlowStep(2);
           else showFlowView(state.viewStep);
           if (state.viewStep === 2) renderTopicPicker(job);
-          if (state.viewStep === 3) syncCaptionForm();
+          if (state.viewStep === 4) syncCaptionForm();
+        } else if (speakers.length && job.result?.transcript) {
+          // Ranking falhou — volta para naming de locutores
+          job.status = "awaiting_cast";
+          state.jobStatus = "awaiting_cast";
+          state.maxStep = Math.max(state.maxStep, 2);
+          if (state.followJobStep) setFlowStep(2);
+          else showFlowView(state.viewStep);
+          if (state.viewStep === 2) renderCastForm(job);
         } else {
           showFlowView(state.viewStep);
         }
@@ -652,11 +717,93 @@
     if (state.viewStep === 2) renderTopicPicker(job);
   }
 
-  function setBadge(status) {
-    const el = $("#active-job-badge");
-    el.textContent = status;
-    el.className = `badge is-${status}`;
+  function renderCastForm(job) {
+    const speakers = job.result?.speakers || [];
+    const list = $("#cast-list");
+    const area = $("#cast-area");
+    if (!list || !area) return;
+    if (state.viewStep === 2 && state.jobStatus === "awaiting_cast") {
+      area.hidden = false;
+    }
+
+    if (!speakers.length) {
+      list.innerHTML = `<p class="empty">Nenhum locutor detectado — você pode pular esta etapa.</p>`;
+      return;
+    }
+
+    list.innerHTML = "";
+    speakers.forEach((sp, i) => {
+      const sid = String(sp.id || `S${i + 1}`);
+      const suggested = sp.suggested_name || sp.name || "";
+      const role = sp.role || "unknown";
+      const quote = sp.sample_quote || "";
+      const evidence = sp.evidence || "";
+      const portrait = sp.portrait_url || "";
+      const card = document.createElement("div");
+      card.className = "cast-card";
+      card.dataset.id = sid;
+      const face = portrait
+        ? `<img class="cast-face" src="${escapeAttr(portrait)}" alt="" loading="lazy" />`
+        : `<span class="cast-face is-placeholder" aria-hidden="true">${escapeHtml(sid)}</span>`;
+      card.innerHTML = `
+        ${face}
+        <div class="cast-body">
+          <label class="field">
+            <span class="label">Nome ${role !== "unknown" ? `(${escapeHtml(role)})` : ""}</span>
+            <input type="text" class="cast-name" data-id="${escapeAttr(sid)}"
+              value="${escapeAttr(suggested)}"
+              placeholder="Ex.: Rodrigo Pimentel" />
+          </label>
+          ${quote ? `<p class="cast-quote">“${escapeHtml(quote)}”</p>` : ""}
+          ${evidence ? `<p class="cast-evidence">${escapeHtml(evidence)}</p>` : ""}
+        </div>
+      `;
+      list.appendChild(card);
+    });
   }
+
+  async function submitCast({ skip = false } = {}) {
+    if (!state.activeJobId) return;
+    const btn = $("#cast-continue");
+    const skipBtn = $("#cast-skip");
+    if (btn) btn.disabled = true;
+    if (skipBtn) skipBtn.disabled = true;
+
+    const speakers = [...$$(".cast-name")].map((input) => ({
+      id: input.dataset.id,
+      name: input.value.trim(),
+    }));
+
+    try {
+      const res = await fetch(`/api/jobs/${state.activeJobId}/cast`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ speakers, skip: Boolean(skip) }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+      state.jobStatus = "ranking";
+      const cast = $("#cast-area");
+      if (cast) cast.hidden = true;
+      const hint = $("#cast-hint");
+      if (hint) {
+        hint.textContent = skip
+          ? "Pulando locutores — ranqueando tópicos…"
+          : "Nomes salvos — rotulando falas e ranqueando tópicos…";
+      }
+      if (state.pollTimer) clearInterval(state.pollTimer);
+      pollJob();
+      state.pollTimer = setInterval(pollJob, 1500);
+    } catch (err) {
+      const hint = $("#cast-hint");
+      if (hint) hint.textContent = `erro: ${err.message}`;
+      if (btn) btn.disabled = false;
+      if (skipBtn) skipBtn.disabled = false;
+    }
+  }
+
+  $("#cast-continue")?.addEventListener("click", () => submitCast({ skip: false }));
+  $("#cast-skip")?.addEventListener("click", () => submitCast({ skip: true }));
 
   function renderTopicPicker(job) {
     const highlights = job.result?.highlights || [];
@@ -704,6 +851,11 @@
           <h3>${escapeHtml(h.title || `Tópico #${i + 1}`)}${
             already ? ` <span class="topic-ready">pronto</span>` : ""
           }</h3>
+          ${
+            h.attributed_to
+              ? `<p class="meta-row"><strong>Locutor:</strong> ${escapeHtml(h.attributed_to)}</p>`
+              : ""
+          }
           <p class="meta-row"><strong>Tempo:</strong> ${fmtTime(h.start_time)} → ${fmtTime(h.end_time)}</p>
           <p class="meta-row"><strong>Hook:</strong> ${escapeHtml(h.hook_sentence || "—")}</p>
           <p class="topic-snippet">${escapeHtml(h.snippet || h.virality_reason || "")}</p>
@@ -771,7 +923,58 @@
     if (!state.activeJobId || state.selectedIds.size === 0) return;
     state.followJobStep = false;
     setFlowStep(3, { maxStep: 3 });
-    syncCaptionForm();
+  });
+
+  $("#format-back")?.addEventListener("click", () => {
+    state.followJobStep = false;
+    setFlowStep(2);
+    if (state.lastJob) renderTopicPicker(state.lastJob);
+  });
+
+  $("#format-continue")?.addEventListener("click", async () => {
+    if (!state.activeJobId || state.selectedIds.size === 0) return;
+    const btn = $("#format-continue");
+    const hint = $("#format-hint");
+    const aspect = $("#aspect_ratio")?.value || "9:16";
+    const fmt = $("#download_format")?.value || "720";
+    if (btn) btn.disabled = true;
+    if (hint) hint.textContent = "salvando formato…";
+    try {
+      const res = await fetch(`/api/jobs/${state.activeJobId}/params`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          aspect_ratio: aspect,
+          download_format: fmt,
+          regenerate: false,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+      if (state.lastJob) {
+        state.lastJob.params = {
+          ...state.lastJob.params,
+          aspect_ratio: aspect,
+          download_format: fmt,
+        };
+      }
+      state.jobParams = {
+        ...(state.jobParams || {}),
+        aspect_ratio: aspect,
+        download_format: fmt,
+      };
+      if (hint) {
+        hint.textContent =
+          "Escolha a proporção do corte. A resolução vale para novos downloads (análise).";
+      }
+      state.followJobStep = false;
+      setFlowStep(4, { maxStep: 4 });
+      syncCaptionForm();
+    } catch (err) {
+      if (hint) hint.textContent = `erro: ${err.message}`;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
   });
 
   /* ---------- Caption karaoke UI ---------- */
@@ -916,13 +1119,16 @@
     const bold = $("#caption-bold")?.checked;
     const font = $("#caption-font")?.value || "Arial Black";
     const border = Number($("#caption-outline")?.value || 4);
-    // Scale text relative to frame width so 9:16 vs 16:9 stay readable
+    // PlayRes design width matches ASS default (1080). With paint-order
+    // stroke→fill, only the outer half of -webkit-text-stroke shows, so
+    // stroke width must be 2× ASS Outline to match burn-in.
     const frameW = frame.clientWidth || 280;
     const scale = frameW / 1080;
+    const strokePx = border > 0 ? border * scale * 2 : 0;
     preview.style.fontFamily = `"${font}", Impact, sans-serif`;
-    preview.style.fontSize = `${Math.max(14, Math.round(size * scale * 0.95))}px`;
+    preview.style.fontSize = `${Math.max(14, Math.round(size * scale))}px`;
     preview.style.fontWeight = bold ? "900" : "600";
-    preview.style.webkitTextStroke = `${Math.max(1, border * scale * 0.9)}px ${outline}`;
+    preview.style.webkitTextStroke = strokePx > 0 ? `${strokePx}px ${outline}` : "0";
     preview.style.paintOrder = "stroke fill";
     $$(".cap-word", preview).forEach((w, i) => {
       w.style.color = i <= 1 ? primary : secondary;
@@ -1002,7 +1208,7 @@
   });
 
   $("#aspect_ratio")?.addEventListener("change", () => {
-    if (state.viewStep === 3) updateCaptionPreview();
+    if (state.viewStep === 4) updateCaptionPreview();
   });
 
   $("#caption-preview-bg")?.addEventListener("load", updateCaptionPreview);
@@ -1018,8 +1224,7 @@
 
   $("#caption-back")?.addEventListener("click", () => {
     state.followJobStep = false;
-    setFlowStep(2);
-    if (state.lastJob) renderTopicPicker(state.lastJob);
+    setFlowStep(3);
   });
 
   $("#caption-continue")?.addEventListener("click", async () => {
@@ -1038,8 +1243,7 @@
       if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
       state.jobStatus = "rendering";
       state.followJobStep = true;
-      setFlowStep(4);
-      setBadge("rendering");
+      setFlowStep(5);
       if (state.lastJob?.result) {
         const ready = [...state.selectedIds].filter((id) => state.renderedIds.has(id));
         const pending = [...state.selectedIds].filter((id) => !state.renderedIds.has(id));
@@ -1082,79 +1286,17 @@
     if (state.maxStep >= 2) {
       state.followJobStep = false;
       setFlowStep(2);
-      if (state.lastJob) renderTopicPicker(state.lastJob);
+      if (state.lastJob) {
+        if (state.jobStatus === "awaiting_cast") renderCastForm(state.lastJob);
+        else renderTopicPicker(state.lastJob);
+      }
     }
   });
 
-  $("#apply-format-btn")?.addEventListener("click", async () => {
-    if (!state.activeJobId) return;
-    const btn = $("#apply-format-btn");
-    const hint = $("#edit-form-hint");
-    const aspect = $("#aspect_ratio").value;
-    btn.disabled = true;
-    hint.textContent = "aplicando proporção…";
-    try {
-      const res = await fetch(`/api/jobs/${state.activeJobId}/params`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ aspect_ratio: aspect, regenerate: true }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
-      if (!data.changed) {
-        hint.textContent = "proporção já estava aplicada";
-        btn.disabled = false;
-        return;
-      }
-      if (data.regenerating) {
-        hint.textContent = "regenerando todos os shorts…";
-        state.jobStatus = "rendering";
-        state.renderedIds = new Set();
-        state.followJobStep = true;
-        setBadge("rendering");
-        setFlowStep(4);
-        if (state.lastJob?.result) {
-          const ids = [
-            ...(state.selectedIds.size
-              ? state.selectedIds
-              : state.lastJob.params?.selected_ids ||
-                state.lastJob.result?.selected_ids ||
-                []),
-          ].map(Number);
-          renderResults({
-            ...state.lastJob,
-            status: "rendering",
-            result: {
-              ...state.lastJob.result,
-              shorts: [],
-              selected_ids: ids,
-              render_progress: {
-                total: ids.length,
-                done: 0,
-                current_id: ids[0] ?? null,
-                pending_ids: ids.slice(1),
-                done_ids: [],
-              },
-            },
-          });
-        }
-        if (state.pollTimer) clearInterval(state.pollTimer);
-        pollJob();
-        state.pollTimer = setInterval(pollJob, 1500);
-      } else {
-        hint.textContent = "proporção salva — escolha os tópicos na etapa 2";
-        state.renderedIds = new Set();
-        state.followJobStep = true;
-        setFlowStep(2);
-        if (state.lastJob) {
-          state.lastJob.params = { ...state.lastJob.params, aspect_ratio: aspect };
-          renderTopicPicker(state.lastJob);
-        }
-      }
-    } catch (err) {
-      hint.textContent = `erro: ${err.message}`;
-    } finally {
-      btn.disabled = false;
+  $("#goto-format-btn")?.addEventListener("click", () => {
+    if (state.maxStep >= 3 && state.selectedIds.size > 0) {
+      state.followJobStep = false;
+      setFlowStep(3);
     }
   });
 
