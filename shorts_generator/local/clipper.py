@@ -162,9 +162,14 @@ def crop_highlights_local(
     aspect_ratio: str = "9:16",
     out_dir: Optional[str] = None,
     on_short_done=None,
+    transcript: Optional[Dict] = None,
+    caption_style: Optional[Dict] = None,
 ) -> List[Dict]:
+    from ..captions import apply_karaoke_captions, resolve_style
+
     out_dir = out_dir or LOCAL_OUTPUT_DIR
     os.makedirs(out_dir, exist_ok=True)
+    style = resolve_style(caption_style) if caption_style is not None else None
     results: List[Dict] = []
     total = len(highlights)
     for i, h in enumerate(highlights, 1):
@@ -172,14 +177,27 @@ def crop_highlights_local(
         out_path = os.path.join(out_dir, f"short_{int(hid):02d}.mp4")
         print(f"[clip/local] {i}/{total}: {h.get('title', '(untitled)')}", flush=True)
         try:
+            start = float(h["start_time"])
+            end = float(h["end_time"])
             crop_clip_local(
                 source_path,
-                float(h["start_time"]),
-                float(h["end_time"]),
+                start,
+                end,
                 aspect_ratio,
                 out_path,
             )
+            if style and style.get("enabled", True):
+                apply_karaoke_captions(
+                    out_path,
+                    transcript,
+                    start,
+                    end,
+                    style,
+                    out_path=out_path,
+                )
             short = {**h, "clip_url": out_path}
+            if style:
+                short["caption_style"] = style
         except Exception as e:
             print(f"[clip/local] {i} failed: {e}", flush=True)
             short = {**h, "clip_url": None, "error": str(e)}

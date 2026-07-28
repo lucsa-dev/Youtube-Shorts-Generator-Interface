@@ -137,8 +137,11 @@ def render_selected_shorts(
     selected_ids: Sequence[int],
     aspect_ratio: str = "9:16",
     on_short_done: Optional[Callable[[Dict, int, int], None]] = None,
+    caption_style: Optional[Dict] = None,
 ) -> Dict:
     """Crop only the highlights the user selected from an analysis result."""
+    from .captions import resolve_style
+
     highlights = analysis.get("highlights") or []
     by_id = {int(h.get("id", i)): h for i, h in enumerate(highlights)}
     selected: List[Dict] = []
@@ -155,6 +158,8 @@ def render_selected_shorts(
     selected = sorted(selected, key=lambda h: float(h.get("start_time", 0)))
     source = analysis["source_video_url"]
     mode = (analysis.get("mode") or "api").lower()
+    transcript = analysis.get("transcript")
+    style = resolve_style(caption_style)
 
     print(f"[pipeline] cropping {len(selected)} selected highlights", flush=True)
 
@@ -162,20 +167,32 @@ def render_selected_shorts(
         from .local.clipper import crop_highlights_local
 
         shorts = crop_highlights_local(
-            source, selected, aspect_ratio=aspect_ratio, on_short_done=on_short_done
+            source,
+            selected,
+            aspect_ratio=aspect_ratio,
+            on_short_done=on_short_done,
+            transcript=transcript,
+            caption_style=style,
         )
     else:
         shorts = crop_highlights(
             source, selected, aspect_ratio=aspect_ratio, on_short_done=on_short_done
         )
+        if style.get("enabled"):
+            print(
+                "[pipeline] karaoke burn-in is only supported in --mode local "
+                "(API clips are remote URLs)",
+                flush=True,
+            )
 
     return {
         "mode": mode,
         "phase": "completed",
         "source_video_url": source,
-        "transcript": analysis.get("transcript"),
+        "transcript": transcript,
         "highlights": highlights,
         "selected_ids": [int(h.get("id", 0)) for h in selected],
+        "caption_style": style,
         "shorts": shorts,
     }
 
