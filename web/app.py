@@ -396,7 +396,19 @@ def _run_analyze(job_id: str) -> None:
         _append_log(job_id, tb)
 
 
-def _run_render(job_id: str, selected_ids: List[int]) -> None:
+def _short_id(short: Dict[str, Any], fallback: int = -1) -> int:
+    try:
+        return int(short.get("id", fallback))
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _run_render(
+    job_id: str,
+    selected_ids: List[int],
+    *,
+    force_all: bool = False,
+) -> None:
     from shorts_generator import render_selected_shorts
 
     with _jobs_lock:
@@ -406,19 +418,71 @@ def _run_render(job_id: str, selected_ids: List[int]) -> None:
         params = dict(job["params"])
         analysis = dict(job.get("result") or {})
         job["params"]["selected_ids"] = selected_ids
+        force = force_all or bool(params.get("force_rerender"))
+        job["params"]["force_rerender"] = False
+        if force and job.get("result"):
+            job["result"] = dict(job["result"])
+            job["result"]["shorts"] = []
+            analysis = dict(job["result"])
         _persist_job(job)
 
-    _append_log(job_id, f"Cortando {len(selected_ids)} tópicos selecionados…")
+    existing = analysis.get("shorts") or []
+    existing_by_id = {
+        _short_id(s, i): s
+        for i, s in enumerate(existing)
+        if s.get("clip_url") and not s.get("error")
+    }
+    if force:
+        reuse_ids: List[int] = []
+        render_ids = list(selected_ids)
+    else:
+        reuse_ids = [sid for sid in selected_ids if sid in existing_by_id]
+        render_ids = [sid for sid in selected_ids if sid not in existing_by_id]
+
+    dropped = [s for s in existing if _short_id(s) not in set(selected_ids)]
+    if reuse_ids and not render_ids:
+        _append_log(
+            job_id,
+            f"Seleção atualizada: {len(reuse_ids)} shorts reaproveitados, "
+            f"{len(dropped)} removidos — nada novo para cortar.",
+        )
+    elif reuse_ids:
+        _append_log(
+            job_id,
+            f"Cortando {len(render_ids)} novos · "
+            f"reaproveitando {len(reuse_ids)} · removendo {len(dropped)}…",
+        )
+    else:
+        _append_log(job_id, f"Cortando {len(render_ids)} tópicos selecionados…")
+
     capture = LogCapture(job_id, sys.stdout)
     err_capture = LogCapture(job_id, sys.stderr)
 
     try:
-        with redirect_stdout(capture), redirect_stderr(err_capture):
-            result = render_selected_shorts(
-                analysis,
-                selected_ids,
-                aspect_ratio=params.get("aspect_ratio") or "9:16",
-            )
+        new_shorts: List[Dict[str, Any]] = []
+        if render_ids:
+            with redirect_stdout(capture), redirect_stderr(err_capture):
+                partial = render_selected_shorts(
+                    analysis,
+                    render_ids,
+                    aspect_ratio=params.get("aspect_ratio") or "9:16",
+                )
+            new_shorts = partial.get("shorts") or []
+
+        merged_by_id = {
+            **{sid: existing_by_id[sid] for sid in reuse_ids},
+            **{_short_id(s, i): s for i, s in enumerate(new_shorts)},
+        }
+        shorts = [merged_by_id[sid] for sid in selected_ids if sid in merged_by_id]
+        result = {
+            "mode": analysis.get("mode"),
+            "phase": "completed",
+            "source_video_url": analysis.get("source_video_url"),
+            "transcript": analysis.get("transcript"),
+            "highlights": analysis.get("highlights") or [],
+            "selected_ids": list(selected_ids),
+            "shorts": shorts,
+        }
         with _jobs_lock:
             job = _jobs[job_id]
             job["status"] = "completed"
@@ -429,7 +493,8 @@ def _run_render(job_id: str, selected_ids: List[int]) -> None:
             _persist_job(job)
         _append_log(
             job_id,
-            f"Concluído: {len(result.get('shorts', []))} shorts gerados.",
+            f"Concluído: {len(shorts)} shorts "
+            f"({len(new_shorts)} novos, {len(reuse_ids)} reaproveitados).",
         )
     except Exception as e:
         tb = traceback.format_exc()
@@ -446,6 +511,12 @@ def _run_render(job_id: str, selected_ids: List[int]) -> None:
 
 class SelectHighlights(BaseModel):
     ids: List[int] = Field(default_factory=list)
+    force: bool = False
+
+
+class UpdateJobParams(BaseModel):
+    aspect_ratio: Optional[str] = None
+    regenerate: bool = True
 
 
 @app.get("/api/health")
@@ -741,19 +812,26 @@ def get_thumb(job_id: str, index: int):
     return FileResponse(path, media_type="image/jpeg", filename=f"thumb_{index}.jpg")
 
 
+def _sorted_selection_ids(highlights: List[Dict[str, Any]], ids: List[int]) -> List[int]:
+    by_id = {int(h.get("id", i)): h for i, h in enumerate(highlights)}
+    return sorted(ids, key=lambda i: float(by_id[i].get("start_time", 0)))
+
+
 @app.post("/api/jobs/{job_id}/select")
 def select_highlights(job_id: str, body: SelectHighlights):
     with _jobs_lock:
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "Job não encontrado")
-        if job["status"] != "awaiting_selection":
+        if job["status"] not in ("awaiting_selection", "completed"):
             raise HTTPException(
                 400,
-                f"Job não está aguardando seleção (status={job['status']})",
+                f"Job não permite nova seleção (status={job['status']})",
             )
         result = job.get("result") or {}
         highlights = result.get("highlights") or []
+        if not highlights:
+            raise HTTPException(400, "Job ainda não tem tópicos analisados")
         valid_ids = {int(h.get("id", i)) for i, h in enumerate(highlights)}
         ids = [int(i) for i in (body.ids or [])]
         if not ids:
@@ -761,13 +839,103 @@ def select_highlights(job_id: str, body: SelectHighlights):
         bad = [i for i in ids if i not in valid_ids]
         if bad:
             raise HTTPException(400, f"IDs inválidos: {bad}")
-        # Keep chronological order of selection by highlight start time
-        by_id = {int(h.get("id", i)): h for i, h in enumerate(highlights)}
-        ids = sorted(ids, key=lambda i: float(by_id[i].get("start_time", 0)))
+        ids = _sorted_selection_ids(highlights, ids)
+        force = bool(body.force) or bool(job["params"].get("force_rerender"))
 
-    thread = threading.Thread(target=_run_render, args=(job_id, ids), daemon=True)
+    thread = threading.Thread(
+        target=_run_render,
+        args=(job_id, ids),
+        kwargs={"force_all": force},
+        daemon=True,
+    )
     thread.start()
-    return {"id": job_id, "status": "rendering", "selected_ids": ids}
+    return {
+        "id": job_id,
+        "status": "rendering",
+        "selected_ids": ids,
+        "force": force,
+    }
+
+
+@app.patch("/api/jobs/{job_id}/params")
+def update_job_params(job_id: str, body: UpdateJobParams):
+    """Update render params (e.g. aspect ratio). Changing format forces full re-crop."""
+    aspect = (body.aspect_ratio or "").strip()
+    if not aspect:
+        raise HTTPException(400, "Informe aspect_ratio")
+    if aspect not in ("9:16", "1:1", "4:5", "16:9"):
+        raise HTTPException(400, "aspect_ratio inválido")
+
+    log_msg = None
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            raise HTTPException(404, "Job não encontrado")
+        if job["status"] not in ("awaiting_selection", "completed"):
+            raise HTTPException(
+                400,
+                f"Não é possível alterar params agora (status={job['status']})",
+            )
+        prev = (job["params"].get("aspect_ratio") or "9:16").strip()
+        changed = prev != aspect
+        job["params"]["aspect_ratio"] = aspect
+        selected = [int(i) for i in (job["params"].get("selected_ids") or [])]
+        if not selected and job.get("result"):
+            selected = [
+                _short_id(s, i)
+                for i, s in enumerate(job["result"].get("shorts") or [])
+            ]
+        should_render = bool(body.regenerate and changed and selected)
+        if changed:
+            job["params"]["force_rerender"] = True
+            # Drop existing crops so UI doesn't show stale aspect until re-render
+            if job.get("result") and not should_render:
+                job["result"] = dict(job["result"])
+                job["result"]["shorts"] = []
+                job["status"] = "awaiting_selection"
+            job["updated_at"] = _now()
+            _persist_job(job)
+            log_msg = (
+                f"Proporção alterada: {prev} → {aspect}"
+                + (" — regenerando todos os shorts…" if should_render else "")
+            )
+        else:
+            return {
+                "id": job_id,
+                "status": job["status"],
+                "params": job["params"],
+                "changed": False,
+            }
+
+    if log_msg:
+        _append_log(job_id, log_msg)
+
+    if should_render:
+        thread = threading.Thread(
+            target=_run_render,
+            args=(job_id, selected),
+            kwargs={"force_all": True},
+            daemon=True,
+        )
+        thread.start()
+        return {
+            "id": job_id,
+            "status": "rendering",
+            "params": {"aspect_ratio": aspect},
+            "changed": True,
+            "regenerating": True,
+            "selected_ids": selected,
+        }
+
+    with _jobs_lock:
+        job = _jobs[job_id]
+        return {
+            "id": job_id,
+            "status": job["status"],
+            "params": job["params"],
+            "changed": True,
+            "regenerating": False,
+        }
 
 
 @app.post("/api/jobs")
