@@ -1,21 +1,29 @@
 """Local transcription via faster-whisper.
 
-Reads a local media file and returns the same shape the highlight generator
-expects: {duration, segments[start, end, text]}.
+Reads a local media file and returns:
+  {duration, segments[{start, end, text, words?}], words?}
+
+Word timestamps power karaoke burn-in. Cache is JSON (preferred) with a
+legacy .srt fallback for segment-only reads.
 """
+import json
 import os
 import re
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from ..config import LOCAL_OUTPUT_DIR, LOCAL_WHISPER_DEVICE, LOCAL_WHISPER_MODEL
 
 
 def _transcript_cache_path(media_path: str) -> Path:
-    """Return the .srt cache path for a media file."""
+    """Return the .transcript.json cache path for a media file."""
     cache_dir = Path(LOCAL_OUTPUT_DIR)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir / (Path(media_path).stem + ".srt")
+    return cache_dir / (Path(media_path).stem + ".transcript.json")
+
+
+def _legacy_srt_cache_path(media_path: str) -> Path:
+    return Path(LOCAL_OUTPUT_DIR) / (Path(media_path).stem + ".srt")
 
 
 def _format_srt_timestamp(seconds: float) -> str:
@@ -37,8 +45,9 @@ def _parse_srt_timestamp(value: str) -> float:
     return hours * 3600 + minutes * 60 + seconds + (millis / 1000.0)
 
 
-def _write_srt_cache(media_path: str, transcript: Dict) -> Path:
-    cache_path = _transcript_cache_path(media_path)
+def _write_srt_sidecar(media_path: str, transcript: Dict) -> Path:
+    cache_path = _legacy_srt_cache_path(media_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
     lines = []
     for idx, segment in enumerate(transcript.get("segments", []), start=1):
         start = _format_srt_timestamp(float(segment["start"]))
@@ -48,7 +57,6 @@ def _write_srt_cache(media_path: str, transcript: Dict) -> Path:
         lines.append(f"{start} --> {end}")
         lines.append(text)
         lines.append("")
-
     cache_path.write_text("\n".join(lines), encoding="utf-8")
     return cache_path
 
@@ -56,7 +64,7 @@ def _write_srt_cache(media_path: str, transcript: Dict) -> Path:
 def _load_srt_cache(cache_path: Path) -> Dict:
     content = cache_path.read_text(encoding="utf-8-sig").strip()
     if not content:
-        return {"duration": 0.0, "segments": []}
+        return {"duration": 0.0, "segments": [], "words": []}
 
     segments = []
     for block in re.split(r"\n\s*\n", content):
@@ -78,7 +86,23 @@ def _load_srt_cache(cache_path: Path) -> Dict:
         )
 
     duration = segments[-1]["end"] if segments else 0.0
-    return {"duration": duration, "segments": segments}
+    return {"duration": duration, "segments": segments, "words": []}
+
+
+def _write_json_cache(media_path: str, transcript: Dict) -> Path:
+    cache_path = _transcript_cache_path(media_path)
+    cache_path.write_text(json.dumps(transcript, ensure_ascii=False), encoding="utf-8")
+    return cache_path
+
+
+def _load_json_cache(cache_path: Path) -> Dict:
+    data = json.loads(cache_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        return {"duration": 0.0, "segments": [], "words": []}
+    data.setdefault("words", [])
+    data.setdefault("segments", [])
+    data.setdefault("duration", 0.0)
+    return data
 
 
 def _resolve_device() -> str:
@@ -95,26 +119,53 @@ def _resolve_device() -> str:
     return "cpu"
 
 
+def _segment_words(segment) -> List[Dict]:
+    words = []
+    for w in getattr(segment, "words", None) or []:
+        text = (getattr(w, "word", None) or "").strip()
+        if not text:
+            continue
+        words.append({
+            "start": float(w.start),
+            "end": float(w.end),
+            "word": text,
+        })
+    return words
+
+
 def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
-    """Run faster-whisper on a local file path, caching the result as .srt."""
-    cache_path = _transcript_cache_path(media_path)
-    if cache_path.exists():
-        source_mtime = os.path.getmtime(media_path)
-        cache_mtime = cache_path.stat().st_mtime
-        if cache_mtime >= source_mtime:
-            print(f"[transcribe/local] reusing cached transcript: {cache_path}", flush=True)
-            cached = _load_srt_cache(cache_path)
-            # Treat empty cache as invalid (likely from a failed/partial run) — delete and re-transcribe
-            if not cached["segments"] or cached["duration"] <= 0.0:
-                print(f"[transcribe/local] cache is empty/invalid, deleting: {cache_path}", flush=True)
-                cache_path.unlink(missing_ok=True)
-            else:
-                print(
-                    f"[transcribe/local] {len(cached['segments'])} cached segments, "
-                    f"{cached['duration']:.0f}s of audio",
-                    flush=True,
-                )
-                return cached
+    """Run faster-whisper on a local file path, caching the result as JSON."""
+    json_cache = _transcript_cache_path(media_path)
+    srt_cache = _legacy_srt_cache_path(media_path)
+    source_mtime = os.path.getmtime(media_path)
+
+    if json_cache.exists() and json_cache.stat().st_mtime >= source_mtime:
+        print(f"[transcribe/local] reusing cached transcript: {json_cache}", flush=True)
+        cached = _load_json_cache(json_cache)
+        if not cached["segments"] or float(cached.get("duration") or 0) <= 0.0:
+            print(f"[transcribe/local] cache is empty/invalid, deleting: {json_cache}", flush=True)
+            json_cache.unlink(missing_ok=True)
+        elif not (cached.get("words") or []):
+            print(
+                f"[transcribe/local] cache has no word timestamps, deleting: {json_cache}",
+                flush=True,
+            )
+            json_cache.unlink(missing_ok=True)
+        else:
+            n_words = len(cached.get("words") or [])
+            print(
+                f"[transcribe/local] {len(cached['segments'])} cached segments, "
+                f"{n_words} words, {cached['duration']:.0f}s of audio",
+                flush=True,
+            )
+            return cached
+
+    # Legacy SRT has no word timestamps — ignore so karaoke gets real timings.
+    if srt_cache.exists() and not json_cache.exists():
+        print(
+            f"[transcribe/local] legacy SRT found without words — re-transcribing: {srt_cache}",
+            flush=True,
+        )
 
     try:
         from faster_whisper import WhisperModel  # type: ignore
@@ -137,6 +188,7 @@ def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
         "language": language,
         "beam_size": 5,
         "condition_on_previous_text": False,
+        "word_timestamps": True,
     }
     if LOCAL_WHISPER_VAD_FILTER:
         transcribe_kwargs["vad_filter"] = True
@@ -147,16 +199,27 @@ def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
     segments_iter, info = model.transcribe(**transcribe_kwargs)
 
     segments = []
+    all_words: List[Dict] = []
     for s in segments_iter:
-        segments.append({
+        words = _segment_words(s)
+        all_words.extend(words)
+        seg = {
             "start": float(s.start),
             "end": float(s.end),
             "text": (s.text or "").strip(),
-        })
+        }
+        if words:
+            seg["words"] = words
+        segments.append(seg)
 
     duration = float(getattr(info, "duration", 0.0)) or (segments[-1]["end"] if segments else 0.0)
-    print(f"[transcribe/local] {len(segments)} segments, {duration:.0f}s of audio", flush=True)
-    transcript = {"duration": duration, "segments": segments}
-    cache_path = _write_srt_cache(media_path, transcript)
+    print(
+        f"[transcribe/local] {len(segments)} segments, {len(all_words)} words, "
+        f"{duration:.0f}s of audio",
+        flush=True,
+    )
+    transcript = {"duration": duration, "segments": segments, "words": all_words}
+    cache_path = _write_json_cache(media_path, transcript)
+    _write_srt_sidecar(media_path, transcript)
     print(f"[transcribe/local] wrote cache: {cache_path}", flush=True)
     return transcript
