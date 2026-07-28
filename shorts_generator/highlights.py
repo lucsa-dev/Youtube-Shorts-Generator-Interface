@@ -15,6 +15,11 @@ import re
 from typing import Callable, Dict, List, Optional
 
 from . import muapi
+from .config import (
+    CLIP_START_LEAD_IN,
+    CLIP_START_LEAD_IN_MAX,
+    CLIP_START_LEAD_IN_MIN,
+)
 
 
 LLMFn = Callable[[str], str]
@@ -60,9 +65,12 @@ Rules:
 - Explain in one sentence why this clip is viral ("virality_reason")
 - start_time / end_time must span the FULL self-contained segment, not just the hook line
 - CRITICAL language rule: write title, hook_sentence, and virality_reason entirely in {output_language}. Do NOT use English unless the output language is English. Prefer hooks taken from / closely paraphrasing the transcript.
+- When KNOWN SPEAKERS are provided (podcast/interview/debate), titles MUST attribute the main speaker or public figure when known — e.g. "{{Name}} fala sobre {{topic}}" or "{{Name}}: {{claim}}". Prefer guests / public figures over hosts. Never invent names outside the provided list. Fill attributed_to with that person's name (or empty string if none).
+
+{cast_block}
 
 Respond ONLY with valid JSON (no markdown, no explanation):
-{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string"}}]}}"""
+{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string","attributed_to":"string"}}]}}"""
 
 
 CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
@@ -176,6 +184,9 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
                 "virality_reason": str(
                     item.get("virality_reason") or item.get("reason") or ""
                 ).strip(),
+                "attributed_to": str(
+                    item.get("attributed_to") or item.get("speaker") or ""
+                ).strip(),
             }
         )
 
@@ -192,6 +203,149 @@ def _segment_ends_thought(text: str) -> bool:
     return bool(_SENTENCE_END_RE.search(t))
 
 
+def _flatten_words(segments: List[Dict], transcript_words: Optional[List[Dict]] = None) -> List[Dict]:
+    """Word list for boundary snapping — prefer per-segment words, else flat transcript.words."""
+    words: List[Dict] = []
+    for seg in segments:
+        for w in seg.get("words") or []:
+            try:
+                ws, we = float(w["start"]), float(w["end"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if we <= ws:
+                continue
+            words.append(
+                {
+                    "start": ws,
+                    "end": we,
+                    "word": str(w.get("word") or w.get("text") or ""),
+                }
+            )
+    if words:
+        words.sort(key=lambda w: w["start"])
+        return words
+    for w in transcript_words or []:
+        try:
+            ws, we = float(w["start"]), float(w["end"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if we <= ws:
+            continue
+        words.append(
+            {
+                "start": ws,
+                "end": we,
+                "word": str(w.get("word") or w.get("text") or ""),
+            }
+        )
+    words.sort(key=lambda w: w["start"])
+    return words
+
+
+def _snap_start_off_mid_word(t: float, words: List[Dict], speech_start: float) -> float:
+    """If t falls inside a word, move to that word's start (never chop a syllable)."""
+    for w in words:
+        ws = float(w["start"])
+        we = float(w["end"])
+        if ws < t < we:
+            # Include the whole word; never start later than the speech onset we padded from.
+            return min(ws, speech_start)
+    return t
+
+
+def apply_start_lead_in(
+    start: float,
+    end: float,
+    segments: List[Dict],
+    words: List[Dict],
+    video_duration: float,
+    max_seconds: float = MAX_CLIP_SECONDS,
+    lead_in: float = CLIP_START_LEAD_IN,
+    lead_min: float = CLIP_START_LEAD_IN_MIN,
+    lead_max: float = CLIP_START_LEAD_IN_MAX,
+) -> float:
+    """Pull ``start`` earlier so the first word has breathing room.
+
+    Prefers landing on the end of the previous sentence or inside a short
+    silence; falls back to ``start - lead_in``. Never cuts mid-word.
+    """
+    speech_start = float(start)
+    if lead_in <= 0 or speech_start <= 0:
+        return speech_start
+
+    lead_min = max(0.0, min(lead_min, lead_in))
+    lead_max = max(lead_in, lead_max)
+    # Don't blow past max clip length just for padding.
+    room = max(0.0, max_seconds - (float(end) - speech_start))
+    if room < lead_min:
+        return speech_start
+    lead_max = min(lead_max, room)
+    lead_in = min(lead_in, lead_max)
+    lead_min = min(lead_min, lead_in)
+
+    window_lo = max(0.0, speech_start - lead_max)
+    ideal = max(0.0, speech_start - lead_in)
+    # Candidates: (priority, distance_to_ideal, time) — lower priority wins.
+    candidates: List[tuple] = []
+
+    for seg in segments:
+        se = float(seg.get("end") or 0)
+        if not (window_lo <= se <= speech_start):
+            continue
+        if not _segment_ends_thought(str(seg.get("text") or "")):
+            continue
+        # Small breath after the previous sentence when silence allows.
+        next_starts = [
+            float(s["start"])
+            for s in segments
+            if float(s.get("start") or -1) > se + 1e-6
+        ]
+        gap_to_next = (min(next_starts) - se) if next_starts else (speech_start - se)
+        breath = min(0.2, max(0.0, gap_to_next * 0.5))
+        cand = min(se + breath, speech_start)
+        if cand >= window_lo and speech_start - cand >= lead_min * 0.85:
+            candidates.append((0, abs(cand - ideal), cand))
+
+    if words:
+        for i in range(len(words) - 1):
+            we = float(words[i]["end"])
+            ns = float(words[i + 1]["start"])
+            gap = ns - we
+            if gap < 0.15:
+                continue
+            if not (window_lo <= we < speech_start):
+                continue
+            cand = min(we + min(0.25, gap * 0.5), speech_start)
+            if cand < window_lo or cand >= speech_start:
+                continue
+            if speech_start - cand < lead_min * 0.85:
+                continue
+            candidates.append((1, abs(cand - ideal), cand))
+
+    candidates.append((2, abs(ideal - ideal), ideal))
+    candidates.sort()
+    new_start = float(candidates[0][2])
+    new_start = _snap_start_off_mid_word(new_start, words, speech_start)
+    new_start = max(0.0, min(new_start, speech_start))
+
+    # Word-start snap can overshoot lead_max — clamp, then escape mid-word forward.
+    if new_start < window_lo:
+        new_start = window_lo
+        for w in words:
+            ws = float(w["start"])
+            we = float(w["end"])
+            if ws < new_start < we:
+                new_start = min(we, speech_start)
+                break
+
+    new_start = min(new_start, float(video_duration))
+
+    # If snapping erased most of the pad, keep the original speech onset.
+    if speech_start - new_start < 0.15:
+        return speech_start
+    return new_start
+
+
 def expand_highlight_to_context(
     highlight: Dict,
     segments: List[Dict],
@@ -199,6 +353,7 @@ def expand_highlight_to_context(
     min_seconds: float = MIN_CLIP_SECONDS,
     target_seconds: float = TARGET_CLIP_SECONDS,
     max_seconds: float = MAX_CLIP_SECONDS,
+    words: Optional[List[Dict]] = None,
 ) -> Dict:
     """Grow a hook-sized window into a self-contained clip using transcript segments.
 
@@ -207,6 +362,7 @@ def expand_highlight_to_context(
       2. Expand backward (setup) and forward (payoff) until >= min_seconds,
          preferring target_seconds and ending on a completed thought.
       3. Cap at max_seconds.
+      4. Pull start back with a short lead-in (sentence end / silence / pad).
     """
     if not segments:
         return highlight
@@ -214,6 +370,7 @@ def expand_highlight_to_context(
     start = float(highlight["start_time"])
     end = float(highlight["end_time"])
     video_duration = float(video_duration or segments[-1]["end"])
+    flat_words = words if words is not None else _flatten_words(segments)
 
     # Indices of segments that overlap the proposed window (or nearest).
     idxs = [
@@ -294,6 +451,23 @@ def expand_highlight_to_context(
             if end - start > max_seconds:
                 end = start + max_seconds
 
+    speech_onset = start
+    start = apply_start_lead_in(
+        start,
+        end,
+        segments,
+        flat_words,
+        video_duration,
+        max_seconds=max_seconds,
+    )
+    lead = speech_onset - start
+    if lead > 0.15:
+        print(
+            f"[highlights] start lead-in {lead:.2f}s "
+            f"({speech_onset:.2f}s → {start:.2f}s)",
+            flush=True,
+        )
+
     start = max(0.0, min(start, video_duration))
     end = max(start + 0.5, min(end, video_duration))
 
@@ -309,10 +483,11 @@ def expand_highlights_to_context(
 ) -> List[Dict]:
     segments = transcript.get("segments") or []
     duration = float(transcript.get("duration") or (segments[-1]["end"] if segments else 0))
+    words = _flatten_words(segments, transcript.get("words") or [])
     expanded: List[Dict] = []
     for h in highlights:
         before = float(h["end_time"]) - float(h["start_time"])
-        e = expand_highlight_to_context(h, segments, duration)
+        e = expand_highlight_to_context(h, segments, duration, words=words)
         after = float(e["end_time"]) - float(e["start_time"])
         if after < MIN_CLIP_SECONDS - 0.5:
             print(
@@ -349,10 +524,16 @@ def build_transcript_text(transcript: Dict, offset: float = 0.0) -> str:
     relative to the chunk start (0 … duration). The model otherwise copies
     absolute wall-clock times (e.g. 1500s) which then fail sanitization
     against the chunk's relative duration (~1200s).
+
+    If segments carry ``speaker`` (from cast labeling), prefix each line.
     """
-    segments = transcript.get("segments", [])
+    from .cast import build_named_transcript_text
+
+    segments = transcript.get("segments") or []
+    if any(str(s.get("speaker") or "").strip() for s in segments):
+        return build_named_transcript_text(transcript, offset=offset)
     return "\n".join(
-        f"[{max(0.0, float(s['start']) - offset):.1f}s] {s['text'].strip()}"
+        f"[{max(0.0, float(s['start']) - offset):.1f}s] {str(s.get('text') or '').strip()}"
         for s in segments
     )
 
@@ -406,6 +587,7 @@ def call_highlight_api(
     is_chunk: bool = False,
     llm_fn: LLMFn = call_muapi_llm,
     output_language: str = "Brazilian Portuguese (pt-BR)",
+    cast_block: str = "",
 ) -> Dict:
     system = HIGHLIGHT_SYSTEM_PROMPT.format(
         virality_criteria=VIRALITY_CRITERIA,
@@ -413,6 +595,7 @@ def call_highlight_api(
         density=content_info.get("density", "medium"),
         num_clips_instruction=_num_clips_instruction(num_clips, duration, is_chunk),
         output_language=output_language,
+        cast_block=cast_block or "",
     )
     base_prompt = f"{system}\n\nTranscript:\n{transcript_text}"
     prompt = base_prompt
@@ -451,11 +634,12 @@ def call_highlight_api(
             prompt = (
                 base_prompt
                 + "\n\nIMPORTANT: Return ONLY valid JSON with a top-level 'highlights' array."
-                + " Each item must include: title, start_time, end_time, score, hook_sentence, virality_reason."
+                + " Each item must include: title, start_time, end_time, score, hook_sentence, virality_reason, attributed_to."
                 + f" Timestamps must be relative to THIS transcript window (0 to {duration:.1f} seconds)."
                 + f" EVERY clip duration (end_time - start_time) MUST be {int(MIN_CLIP_SECONDS)}–90 seconds"
                 + " and cover setup + claim + payoff — never a single hook sentence."
                 + f" title, hook_sentence, and virality_reason MUST be written in {output_language}."
+                + " When speakers are known, put the person name in the title and attributed_to."
                 + " No markdown fences, no commentary."
             )
 
@@ -510,6 +694,7 @@ def get_highlights(
     num_clips: Optional[int] = 3,
     llm_fn: Optional[LLMFn] = None,
     output_language: Optional[str] = None,
+    speakers: Optional[List[Dict]] = None,
 ) -> Dict:
     """Main entry point — returns {highlights: [...]} sorted by score.
 
@@ -517,18 +702,22 @@ def get_highlights(
     mode passes in a local LLM-backed callable.
     `output_language` controls the language of title / hook / virality_reason.
     Pass ``num_clips=None`` to let the model decide how many topics to return.
+    `speakers` — named cast roster for title attribution (from cast.py).
     """
+    from .cast import cast_context_block
     from .config import language_label, resolve_content_language
 
     llm_fn = llm_fn or call_muapi_llm
     lang_code = resolve_content_language(output_language)
     lang_label = language_label(lang_code)
     duration = transcript.get("duration", 0)
+    cast_speakers = speakers or transcript.get("speakers") or []
+    cast_block = cast_context_block(cast_speakers) if cast_speakers else ""
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
     print(
         f"[highlights] content={content_info.get('content_type')} "
         f"density={content_info.get('density')} duration={duration:.0f}s "
-        f"output_lang={lang_code}",
+        f"output_lang={lang_code} speakers={len(cast_speakers)}",
         flush=True,
     )
 
@@ -549,6 +738,7 @@ def get_highlights(
                 is_chunk=True,
                 llm_fn=llm_fn,
                 output_language=lang_label,
+                cast_block=cast_block,
             )
             for h in result.get("highlights", []):
                 h["start_time"] = float(h["start_time"]) + offset
@@ -565,6 +755,7 @@ def get_highlights(
             num_clips=num_clips,
             llm_fn=llm_fn,
             output_language=lang_label,
+            cast_block=cast_block,
         )
         highlights = expand_highlights_to_context(result.get("highlights", []), transcript)
         highlights = dedupe_highlights(highlights)

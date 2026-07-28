@@ -100,11 +100,17 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
    LOCAL_WHISPER_MODEL=base          # tiny / base / small / medium / large-v3
    LOCAL_WHISPER_DEVICE=auto         # auto / cpu / cuda
    LOCAL_OUTPUT_DIR=output           # where local mp4s land
+
+   # YouTube upload (optional — Web UI button on rendered shorts)
+   YOUTUBE_CLIENT_ID=...
+   YOUTUBE_CLIENT_SECRET=...
+   YOUTUBE_REFRESH_TOKEN=...         # python scripts/youtube_oauth.py
+   YOUTUBE_PRIVACY_STATUS=private    # private | unlisted | public
    ```
 
 ## Web UI
 
-Além da CLI, o projeto inclui uma interface no navegador que expõe as mesmas opções (`mode`, `num_clips`, `aspect_ratio`, `format`, `language`), upload de arquivo no modo local, histórico de jobs, logs ao vivo e edição do `.env`.
+Além da CLI, o projeto inclui uma interface no navegador que expõe as mesmas opções (`mode`, `num_clips`, `aspect_ratio`, `format`, `language`), upload de arquivo no modo local, histórico de jobs, logs ao vivo, edição do `.env` e **envio automático ao YouTube** nos shorts renderizados.
 
 ```bash
 pip install -r requirements.txt

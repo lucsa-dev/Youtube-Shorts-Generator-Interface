@@ -33,6 +33,15 @@ LOCAL_OUTPUT_DIR = os.getenv("LOCAL_OUTPUT_DIR", "output")
 # Face-tracking crop: 0 = freeze on first face, 1 = snap instantly to new position.
 LOCAL_FACE_SMOOTHING = max(0.0, min(1.0, _env_float("LOCAL_FACE_SMOOTHING", 0.15)))
 
+# Pull clip start earlier so the first word isn't clipped (Whisper lands on phoneme onset).
+# Final start prefers end-of-previous-sentence or a short silence inside [min, max].
+CLIP_START_LEAD_IN = max(0.0, _env_float("CLIP_START_LEAD_IN", 1.0))
+CLIP_START_LEAD_IN_MIN = max(0.0, _env_float("CLIP_START_LEAD_IN_MIN", 0.8))
+CLIP_START_LEAD_IN_MAX = max(
+    CLIP_START_LEAD_IN_MIN,
+    _env_float("CLIP_START_LEAD_IN_MAX", 1.2),
+)
+
 # Content language: Whisper recognition + titles/hooks/descriptions from the LLM.
 # ISO-639-1 code. Default Brazilian Portuguese.
 CONTENT_LANGUAGE = os.getenv("CONTENT_LANGUAGE", "pt").strip().lower() or "pt"

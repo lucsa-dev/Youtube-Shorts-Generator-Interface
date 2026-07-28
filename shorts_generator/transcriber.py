@@ -64,13 +64,33 @@ def transcribe(media_url: str, language: Optional[str] = None) -> Dict:
     verbose = _extract_verbose_payload(result)
 
     segments = []
+    all_words = []
     for s in verbose.get("segments") or []:
-        segments.append({
+        seg_words = []
+        for w in s.get("words") or []:
+            text = (w.get("word") or w.get("text") or "").strip()
+            if not text:
+                continue
+            word = {
+                "start": float(w.get("start", s.get("start", 0.0))),
+                "end": float(w.get("end", s.get("end", 0.0))),
+                "word": text,
+            }
+            seg_words.append(word)
+            all_words.append(word)
+        seg = {
             "start": float(s.get("start", 0.0)),
             "end": float(s.get("end", 0.0)),
             "text": (s.get("text") or "").strip(),
-        })
+        }
+        if seg_words:
+            seg["words"] = seg_words
+        segments.append(seg)
 
     duration = float(verbose.get("duration") or (segments[-1]["end"] if segments else 0.0))
-    print(f"[transcribe] {len(segments)} segments, {duration:.0f}s of audio", flush=True)
-    return {"duration": duration, "segments": segments}
+    print(
+        f"[transcribe] {len(segments)} segments, {len(all_words)} words, "
+        f"{duration:.0f}s of audio",
+        flush=True,
+    )
+    return {"duration": duration, "segments": segments, "words": all_words}

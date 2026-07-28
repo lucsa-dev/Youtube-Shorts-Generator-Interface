@@ -22,11 +22,17 @@ def crop_clip(source_video_url: str, start_time: float, end_time: float, aspect_
     return _extract_video_url(result)
 
 
-def crop_highlights(source_video_url: str, highlights: list, aspect_ratio: str = "9:16") -> list:
+def crop_highlights(
+    source_video_url: str,
+    highlights: list,
+    aspect_ratio: str = "9:16",
+    on_short_done=None,
+) -> list:
     """Crop every highlight, attaching the resulting URL back onto the dict."""
     out = []
+    total = len(highlights)
     for i, h in enumerate(highlights, 1):
-        print(f"[clip] {i}/{len(highlights)}: {h.get('title', '(untitled)')}", flush=True)
+        print(f"[clip] {i}/{total}: {h.get('title', '(untitled)')}", flush=True)
         try:
             url = crop_clip(
                 source_video_url,
@@ -34,8 +40,11 @@ def crop_highlights(source_video_url: str, highlights: list, aspect_ratio: str =
                 h["end_time"],
                 aspect_ratio=aspect_ratio,
             )
-            out.append({**h, "clip_url": url})
+            short = {**h, "clip_url": url}
         except Exception as e:
             print(f"[clip] {i} failed: {e}", flush=True)
-            out.append({**h, "clip_url": None, "error": str(e)})
+            short = {**h, "clip_url": None, "error": str(e)}
+        out.append(short)
+        if on_short_done:
+            on_short_done(short, i, total)
     return out
