@@ -46,6 +46,7 @@ _jobs_lock = threading.Lock()
 # Editable from the web Config UI. API keys, Whisper, LLM providers stay in .env only.
 CONFIG_KEYS = [
     "CONTENT_LANGUAGE",
+    "LOCAL_OUTPUT_DIR",
     "LOCAL_FACE_SMOOTHING",
 ]
 
@@ -159,20 +160,23 @@ def _read_config() -> Dict[str, Any]:
         val = (raw.get(key) or "").strip()
         if key == "CONTENT_LANGUAGE" and not val:
             val = "pt"
+        if key == "LOCAL_OUTPUT_DIR" and not val:
+            val = "output"
         if key == "LOCAL_FACE_SMOOTHING" and not val:
             val = "0.15"
         secret = key in SECRET_KEYS
         is_set = _is_real_secret(val) if secret else bool(val)
-        items.append(
-            {
-                "key": key,
-                "value": "" if secret else val,
-                "masked": _mask(val) if secret and is_set else None,
-                "is_secret": secret,
-                "is_set": is_set,
-                "input_type": "language" if key == "CONTENT_LANGUAGE" else "text",
-            }
-        )
+        item: Dict[str, Any] = {
+            "key": key,
+            "value": "" if secret else val,
+            "masked": _mask(val) if secret and is_set else None,
+            "is_secret": secret,
+            "is_set": is_set,
+            "input_type": "language" if key == "CONTENT_LANGUAGE" else "text",
+        }
+        if key == "LOCAL_OUTPUT_DIR":
+            item["resolved_path"] = str(Path(val).expanduser().resolve())
+        items.append(item)
     muapi = _is_real_secret(raw.get("MUAPI_API_KEY"))
     openai = _is_real_secret(raw.get("OPENAI_API_KEY"))
     gemini = _is_real_secret(raw.get("GEMINI_API_KEY"))

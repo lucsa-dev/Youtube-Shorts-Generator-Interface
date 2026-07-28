@@ -289,6 +289,14 @@
         const labelExtra =
           item.key === "LOCAL_FACE_SMOOTHING"
             ? ` <em>— suavização do crop de rosto (0–1; padrão 0.15; só modo local)</em>`
+            : item.key === "LOCAL_OUTPUT_DIR"
+              ? ` <em>— pasta onde os shorts (mp4) são salvos</em>`
+              : "";
+        const resolved =
+          item.key === "LOCAL_OUTPUT_DIR" && item.resolved_path
+            ? `<span class="secret-note">caminho absoluto: <code>${escapeHtml(
+                item.resolved_path
+              )}</code></span>`
             : "";
         wrap.innerHTML = `
           <span class="label">${item.key}${labelExtra}</span>
@@ -299,6 +307,7 @@
             value="${escapeAttr(item.value || "")}"
             autocomplete="off"
           />
+          ${resolved}
         `;
       }
       form.appendChild(wrap);
