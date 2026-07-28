@@ -10,7 +10,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 # ASS colour: &HAABBGGRR (alpha, blue, green, red) — alpha 00 = opaque.
 THEMES: Dict[str, Dict[str, Any]] = {
@@ -85,7 +85,12 @@ _STYLE_KEYS = (
     "margin_v",
     "max_words_per_line",
     "enabled",
+    "uppercase",
 )
+
+# Design canvas used by the web preview (frameW / 1080). Keep ASS PlayRes here
+# so libass scales font/outline/margin to the actual clip resolution.
+DESIGN_PLAY_RES = (1080, 1920)
 
 
 def list_themes() -> List[Dict[str, Any]]:
@@ -101,7 +106,12 @@ def resolve_style(raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     theme_id = str(raw.get("theme") or "bold-white")
     base = dict(THEMES.get(theme_id) or THEMES["bold-white"])
     base.pop("label", None)
-    style: Dict[str, Any] = {"theme": theme_id, "enabled": True, **base}
+    style: Dict[str, Any] = {
+        "theme": theme_id,
+        "enabled": True,
+        "uppercase": True,  # match web preview text-transform: uppercase
+        **base,
+    }
     for key in _STYLE_KEYS:
         if key in raw and raw[key] is not None and raw[key] != "":
             style[key] = raw[key]
@@ -112,6 +122,7 @@ def resolve_style(raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     style["max_words_per_line"] = max(1, int(style["max_words_per_line"]))
     style["bold"] = bool(style["bold"])
     style["enabled"] = bool(style.get("enabled", True))
+    style["uppercase"] = bool(style.get("uppercase", True))
     return style
 
 
@@ -259,14 +270,23 @@ def build_ass(
     words: Sequence[Dict[str, float | str]],
     style: Dict[str, Any],
     *,
-    play_res_x: int = 1080,
-    play_res_y: int = 1920,
+    play_res_x: int = DESIGN_PLAY_RES[0],
+    play_res_y: int = DESIGN_PLAY_RES[1],
 ) -> str:
-    """Build karaoke ASS: each line uses \\k tags (centiseconds)."""
+    """Build karaoke ASS: each line uses \\k tags (centiseconds).
+
+    Style numeric fields are authored for DESIGN_PLAY_RES (1080×1920), matching
+    the web preview. Pass that PlayRes so libass scales to the real clip size.
+    """
     style = resolve_style(style)
     bold = -1 if style["bold"] else 0
     font = str(style["font_name"])
     max_w = int(style["max_words_per_line"])
+    uppercase = bool(style.get("uppercase", True))
+    # Preview sits ~10–12% from the bottom; keep margin in that band on design canvas.
+    margin_v = int(style["margin_v"])
+    if margin_v <= 0:
+        margin_v = int(round(play_res_y * 0.12))
 
     header = f"""[Script Info]
 Title: Shorts Lab Karaoke
@@ -279,7 +299,7 @@ PlayResY: {play_res_y}
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Karaoke,{font},{int(style['font_size'])},{style['primary_colour']},{style['secondary_colour']},{style['outline_colour']},{style['back_colour']},{bold},0,0,0,100,100,0,0,1,{int(style['outline'])},{int(style['shadow'])},2,40,40,{int(style['margin_v'])},1
+Style: Karaoke,{font},{int(style['font_size'])},{style['primary_colour']},{style['secondary_colour']},{style['outline_colour']},{style['back_colour']},{bold},0,0,0,100,100,0,0,1,{int(style['outline'])},{int(style['shadow'])},2,40,40,{margin_v},1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -293,28 +313,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         parts: List[str] = []
         for w in chunk:
             dur_cs = max(1, int(round((float(w["end"]) - float(w["start"])) * 100)))
-            parts.append(f"{{\\k{dur_cs}}}{_escape_ass_text(str(w['word']))}")
+            token = str(w["word"])
+            if uppercase:
+                token = token.upper()
+            parts.append(f"{{\\k{dur_cs}}}{_escape_ass_text(token)}")
         text = " ".join(parts)
         lines.append(
             f"Dialogue: 0,{_ass_ts(line_start)},{_ass_ts(line_end)},Karaoke,,0,0,0,,{text}\n"
         )
     return "".join(lines)
-
-
-def probe_video_size(video_path: str) -> Tuple[int, int]:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=width,height",
-        "-of", "csv=p=0:s=x",
-        video_path,
-    ]
-    try:
-        out = subprocess.check_output(cmd, text=True).strip()
-        w_s, h_s = out.split("x", 1)
-        return max(2, int(w_s)), max(2, int(h_s))
-    except (subprocess.CalledProcessError, ValueError, OSError):
-        return 1080, 1920
 
 
 def burn_ass(video_path: str, ass_path: str, out_path: str) -> str:
@@ -359,7 +366,9 @@ def apply_karaoke_captions(
         print("[captions] no words in range — skipping burn-in", flush=True)
         return video_path
 
-    play_x, play_y = probe_video_size(video_path)
+    # Always author ASS against the preview design canvas. Using the raw clip
+    # resolution made font_size/outline look huge on 404×720 (etc.) crops.
+    play_x, play_y = DESIGN_PLAY_RES
     ass_body = build_ass(words, style, play_res_x=play_x, play_res_y=play_y)
 
     final = out_path or video_path
