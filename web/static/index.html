@@ -14,29 +14,95 @@
   <div class="scan" aria-hidden="true"></div>
 
   <header class="top">
-    <div class="brand">
+    <a class="brand" href="/" id="brand-home">
       <span class="brand-mark" aria-hidden="true"></span>
       <div>
         <p class="brand-name">Shorts Lab</p>
-        <p class="brand-sub">AI YouTube Shorts Generator</p>
+        <p class="brand-sub" id="brand-sub">AI YouTube Shorts Generator</p>
       </div>
+    </a>
+    <div class="project-chip" id="project-chip" hidden>
+      <span class="label">Canal</span>
+      <strong id="project-chip-name">—</strong>
+      <a class="btn ghost btn-tiny" href="/" id="back-projects">Projetos</a>
     </div>
-    <nav class="tabs" role="tablist">
+    <nav class="tabs" id="workspace-tabs" role="tablist" hidden>
       <a class="tab is-active" href="/" data-tab="generate" role="tab" aria-selected="true">Gerar</a>
-      <a class="tab" href="/jobs" data-tab="jobs" role="tab" aria-selected="false">Jobs</a>
-      <a class="tab" href="/config" data-tab="config" role="tab" aria-selected="false">Config</a>
+      <a class="tab" href="/" data-tab="jobs" role="tab" aria-selected="false">Jobs</a>
+      <a class="tab" href="/" data-tab="config" role="tab" aria-selected="false">Config</a>
     </nav>
   </header>
 
   <main>
+    <!-- PROJECTS (home) -->
+    <section class="panel is-active" id="panel-projects" role="tabpanel">
+      <div class="hero-block">
+        <h1 class="display">Seus<br /><em>canais.</em></h1>
+        <p class="lede">
+          Cada projeto é um canal do YouTube. Configure as credenciais do canal
+          e gere shorts dentro dele.
+        </p>
+      </div>
+
+      <div class="projects-toolbar">
+        <button type="button" class="btn primary" id="create-project-btn">
+          <span>Criar projeto</span>
+          <span class="btn-arrow" aria-hidden="true">→</span>
+        </button>
+        <button type="button" class="btn ghost" id="refresh-projects">Atualizar</button>
+      </div>
+
+      <form id="create-project-form" class="create-project" hidden>
+        <label class="field field-grow">
+          <span class="label">Nome do canal / projeto</span>
+          <input type="text" id="project-name-input" maxlength="120" placeholder="ex.: Canal Principal" autocomplete="off" />
+        </label>
+        <div class="actions">
+          <button type="submit" class="btn primary">Criar</button>
+          <button type="button" class="btn ghost" id="cancel-create-project">Cancelar</button>
+          <p class="hint" id="create-project-hint"></p>
+        </div>
+      </form>
+
+      <div class="projects-list" id="projects-list">
+        <p class="empty">Carregando projetos…</p>
+      </div>
+    </section>
+
     <!-- GENERATE -->
-    <section class="panel is-active" id="panel-generate" role="tabpanel">
+    <section class="panel" id="panel-generate" role="tabpanel" hidden>
       <div class="hero-block">
         <h1 class="display">Corta. Rankeia.<br /><em>Publica.</em></h1>
         <p class="lede">
           Cole um vídeo longo do YouTube. A IA lista os tópicos virais —
           você escolhe quais viram shorts 9:16.
         </p>
+      </div>
+
+      <div class="project-library" id="project-library">
+        <div class="library-section">
+          <div class="section-head">
+            <div>
+              <h2 style="font-size:1.15rem">Pendentes de render</h2>
+              <p class="hint">Selecionados e ainda sem clip pronto</p>
+            </div>
+            <button type="button" class="btn ghost btn-tiny" id="refresh-library">Atualizar</button>
+          </div>
+          <div class="library-list" id="library-pending">
+            <p class="empty">Nenhum pendente.</p>
+          </div>
+        </div>
+        <div class="library-section">
+          <div class="section-head">
+            <div>
+              <h2 style="font-size:1.15rem">Shorts gerados</h2>
+              <p class="hint">Clips já renderizados neste canal</p>
+            </div>
+          </div>
+          <div class="library-list" id="library-rendered">
+            <p class="empty">Nenhum short gerado ainda.</p>
+          </div>
+        </div>
       </div>
 
       <form id="generate-form" class="workbench" autocomplete="off">
@@ -108,7 +174,7 @@
             <div>
               <h2 style="font-size:1.2rem">Quem está falando?</h2>
               <p class="hint" id="cast-hint">
-                Confirme os nomes dos locutores — isso melhora os títulos dos shorts
+                Confirme, adicione ou remova locutores — isso melhora os títulos dos shorts
               </p>
             </div>
             <div class="pick-actions">
@@ -120,6 +186,9 @@
             </div>
           </div>
           <div class="cast-list" id="cast-list"></div>
+          <div class="cast-footer">
+            <button type="button" class="btn ghost" id="cast-add">+ Adicionar locutor</button>
+          </div>
         </div>
 
         <div class="format-area" id="format-area" hidden>
@@ -281,7 +350,52 @@
     <!-- CONFIG -->
     <section class="panel" id="panel-config" role="tabpanel" hidden>
       <div class="section-head">
-        <h2>Configuração</h2>
+        <h2>Canal YouTube</h2>
+        <p class="lede small">
+          Credenciais OAuth deste projeto (cada canal tem as suas). No Google Cloud:
+          ative YouTube Data API v3 e crie um OAuth client tipo Desktop.
+        </p>
+      </div>
+      <form id="youtube-form" class="config-grid youtube-config">
+        <label class="field config-item">
+          <span class="label">Nome do projeto</span>
+          <input type="text" name="name" id="yt-project-name" maxlength="120" autocomplete="off" />
+        </label>
+        <label class="field config-item">
+          <span class="label">Client ID</span>
+          <input type="text" name="client_id" id="yt-client-id" autocomplete="off" />
+        </label>
+        <label class="field config-item">
+          <span class="label">Client Secret <em>— deixe em branco para manter</em></span>
+          <input type="password" name="client_secret" id="yt-client-secret" placeholder="••••••••" autocomplete="new-password" />
+          <span class="secret-note" id="yt-secret-note" hidden></span>
+        </label>
+        <label class="field config-item">
+          <span class="label">Refresh Token <em>— deixe em branco para manter</em></span>
+          <input type="password" name="refresh_token" id="yt-refresh-token" placeholder="••••••••" autocomplete="new-password" />
+          <span class="secret-note" id="yt-token-note" hidden></span>
+        </label>
+        <label class="field config-item">
+          <span class="label">Privacidade padrão</span>
+          <select name="privacy_status" id="yt-privacy">
+            <option value="private">private</option>
+            <option value="unlisted">unlisted</option>
+            <option value="public">public</option>
+          </select>
+        </label>
+        <div class="field config-item yt-status-box">
+          <span class="label">Status</span>
+          <p class="hint" id="yt-status">—</p>
+        </div>
+      </form>
+      <div class="actions">
+        <button type="submit" form="youtube-form" class="btn primary">Salvar canal</button>
+        <button type="button" class="btn ghost" id="yt-oauth-btn">Conectar YouTube</button>
+        <p class="hint" id="youtube-hint"></p>
+      </div>
+
+      <div class="section-head config-section-gap">
+        <h2>Configuração geral</h2>
         <p class="lede small">Idioma, pasta de saída dos shorts e suavização do crop. Chaves de API, Whisper e modelos ficam apenas no arquivo <code>.env</code>.</p>
       </div>
       <form id="config-form" class="config-grid"></form>
@@ -293,7 +407,7 @@
   </main>
 
   <footer class="foot">
-    <span>CLI: <code>python main.py URL --mode local --num-clips 3</code> · Web: análise → formato → tópicos → legendas → corte</span>
+    <span>Projetos = canais YouTube · dentro: análise → formato → tópicos → legendas → corte</span>
   </footer>
 
   <div class="trim-modal" id="trim-editor" hidden>

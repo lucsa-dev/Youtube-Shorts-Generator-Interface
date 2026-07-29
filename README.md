@@ -100,17 +100,14 @@ Don't want to self-host? The [AI Clipping API](https://muapi.ai/playground/ai-cl
    LOCAL_WHISPER_MODEL=base          # tiny / base / small / medium / large-v3
    LOCAL_WHISPER_DEVICE=auto         # auto / cpu / cuda
    LOCAL_OUTPUT_DIR=output           # where local mp4s land
-
-   # YouTube upload (optional — Web UI button on rendered shorts)
-   YOUTUBE_CLIENT_ID=...
-   YOUTUBE_CLIENT_SECRET=...
-   YOUTUBE_REFRESH_TOKEN=...         # python scripts/youtube_oauth.py
-   YOUTUBE_PRIVACY_STATUS=private    # private | unlisted | public
    ```
+
+   YouTube upload is configured **per project** in the Web UI (Projetos → Config do canal).
+   Use `python scripts/youtube_oauth.py` if you prefer to obtain a refresh token in the terminal and paste it into the project settings.
 
 ## Web UI
 
-Além da CLI, o projeto inclui uma interface no navegador que expõe as mesmas opções (`mode`, `num_clips`, `aspect_ratio`, `format`, `language`), upload de arquivo no modo local, histórico de jobs, logs ao vivo, edição do `.env` e **envio automático ao YouTube** nos shorts renderizados.
+Além da CLI, o projeto inclui uma interface no navegador. A home lista **projetos** (cada um = um canal YouTube). Dentro do projeto: gerar shorts, histórico de jobs, config do canal (OAuth) e envio ao YouTube nos clips renderizados.
 
 ```bash
 pip install -r requirements.txt

@@ -2,7 +2,11 @@
   const $ = (sel, root = document) => root.querySelector(sel);
   const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 
+  const CAST_MAX_SPEAKERS = 6;
+
   const state = {
+    projectId: null,
+    project: null,
     activeJobId: null,
     pollTimer: null,
     lastLogCount: 0,
@@ -13,6 +17,8 @@
     jobStatus: null,
     jobParams: null,
     lastJob: null,
+    castRoster: null,
+    castRosterJobId: null,
     renderedIds: new Set(),
     followJobStep: true,
     captionThemes: [],
@@ -51,22 +57,49 @@
   /* ---------- Router ---------- */
   function parseRoute(pathname) {
     const path = (pathname || "/").replace(/\/+$/, "") || "/";
-    if (path === "/") return { tab: "generate", jobId: null };
-    if (path === "/config") return { tab: "config", jobId: null };
-    if (path === "/jobs") return { tab: "jobs", jobId: null };
+    if (path === "/") return { tab: "projects", projectId: null, jobId: null };
+
+    const projectJob = path.match(/^\/projects\/([^/]+)\/jobs\/([^/]+)$/);
+    if (projectJob) {
+      return { tab: "generate", projectId: projectJob[1], jobId: projectJob[2] };
+    }
+    const projectJobs = path.match(/^\/projects\/([^/]+)\/jobs$/);
+    if (projectJobs) {
+      return { tab: "jobs", projectId: projectJobs[1], jobId: null };
+    }
+    const projectConfig = path.match(/^\/projects\/([^/]+)\/config$/);
+    if (projectConfig) {
+      return { tab: "config", projectId: projectConfig[1], jobId: null };
+    }
+    const projectRoot = path.match(/^\/projects\/([^/]+)$/);
+    if (projectRoot) {
+      return { tab: "generate", projectId: projectRoot[1], jobId: null };
+    }
+
+    // Legacy routes — keep shell working until a project is chosen
+    if (path === "/config") return { tab: "projects", projectId: null, jobId: null, legacy: "config" };
+    if (path === "/jobs") return { tab: "projects", projectId: null, jobId: null, legacy: "jobs" };
     const jobMatch = path.match(/^\/jobs\/([^/]+)$/);
-    if (jobMatch) return { tab: "generate", jobId: jobMatch[1] };
-    return { tab: "generate", jobId: null };
+    if (jobMatch) return { tab: "projects", projectId: null, jobId: jobMatch[1], legacy: "job" };
+    return { tab: "projects", projectId: null, jobId: null };
   }
 
   function pathFor(tab, jobId = null) {
-    if (jobId) return `/jobs/${jobId}`;
-    if (tab === "jobs") return "/jobs";
-    if (tab === "config") return "/config";
-    return "/";
+    const pid = state.projectId;
+    if (!pid) return "/";
+    if (jobId) return `/projects/${pid}/jobs/${jobId}`;
+    if (tab === "jobs") return `/projects/${pid}/jobs`;
+    if (tab === "config") return `/projects/${pid}/config`;
+    return `/projects/${pid}`;
   }
 
   function showTab(name) {
+    const workspace = name !== "projects";
+    const tabs = $("#workspace-tabs");
+    const chip = $("#project-chip");
+    if (tabs) tabs.hidden = !workspace;
+    if (chip) chip.hidden = !workspace;
+
     $$(".tab").forEach((t) => {
       const on = t.dataset.tab === name;
       t.classList.toggle("is-active", on);
@@ -79,6 +112,48 @@
     });
   }
 
+  function setProjectChrome(project) {
+    state.project = project || null;
+    const name = project?.name || "Canal";
+    const chipName = $("#project-chip-name");
+    const brandSub = $("#brand-sub");
+    if (chipName) chipName.textContent = name;
+    if (brandSub) {
+      brandSub.textContent = project
+        ? `Canal · ${name}`
+        : "AI YouTube Shorts Generator";
+    }
+    // Keep tab hrefs in sync for middle-click / copy link
+    $$(".tab").forEach((t) => {
+      t.setAttribute("href", pathFor(t.dataset.tab));
+    });
+  }
+
+  async function ensureProject(projectId) {
+    if (!projectId) {
+      state.projectId = null;
+      setProjectChrome(null);
+      return null;
+    }
+    if (state.projectId === projectId && state.project) {
+      setProjectChrome(state.project);
+      return state.project;
+    }
+    state.projectId = projectId;
+    try {
+      const res = await fetch(`/api/projects/${projectId}`);
+      if (!res.ok) throw new Error("Projeto não encontrado");
+      const project = await res.json();
+      setProjectChrome(project);
+      return project;
+    } catch (err) {
+      state.projectId = null;
+      setProjectChrome(null);
+      navigate("/", { replace: true });
+      return null;
+    }
+  }
+
   function navigate(path, { replace = false } = {}) {
     const next = path || "/";
     if (location.pathname !== next) {
@@ -87,7 +162,40 @@
     applyRoute(parseRoute(next));
   }
 
-  function applyRoute(route) {
+  async function applyRoute(route) {
+    if (route.legacy === "job" && route.jobId) {
+      // Resolve project from job, then redirect into project URL
+      try {
+        const res = await fetch(`/api/jobs/${route.jobId}`);
+        if (res.ok) {
+          const job = await res.json();
+          if (job.project_id) {
+            navigate(`/projects/${job.project_id}/jobs/${route.jobId}`, { replace: true });
+            return;
+          }
+        }
+      } catch (_) {
+        /* fall through to projects home */
+      }
+      navigate("/", { replace: true });
+      return;
+    }
+    if (route.legacy) {
+      navigate("/", { replace: true });
+      return;
+    }
+
+    if (!route.projectId) {
+      state.projectId = null;
+      setProjectChrome(null);
+      showTab("projects");
+      loadProjects();
+      return;
+    }
+
+    const project = await ensureProject(route.projectId);
+    if (!project) return;
+
     if (route.jobId) {
       showTab("generate");
       if (state.activeJobId !== route.jobId) {
@@ -97,12 +205,17 @@
       }
       return;
     }
+
     showTab(route.tab);
     if (route.tab === "generate") {
       resetGeneratePanel();
+      loadProjectLibrary();
     }
     if (route.tab === "jobs") loadJobs();
-    if (route.tab === "config") loadConfig();
+    if (route.tab === "config") {
+      loadConfig();
+      loadYoutubeConfig();
+    }
   }
 
   function resetGeneratePanel() {
@@ -121,6 +234,7 @@
     state.viewStep = 1;
     state.followJobStep = true;
     closeTrimEditor({ silent: true });
+    setProjectLibraryVisible(true);
     $("#run-area").hidden = true;
     $("#pick-area").hidden = true;
     const formatArea = $("#format-area");
@@ -137,8 +251,21 @@
   $$(".tab").forEach((tab) => {
     tab.addEventListener("click", (e) => {
       e.preventDefault();
+      if (!state.projectId) {
+        navigate("/");
+        return;
+      }
       navigate(pathFor(tab.dataset.tab));
     });
+  });
+
+  $("#brand-home")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    navigate("/");
+  });
+  $("#back-projects")?.addEventListener("click", (e) => {
+    e.preventDefault();
+    navigate("/");
   });
 
   window.addEventListener("popstate", () => {
@@ -148,8 +275,30 @@
   function statusToStep(status) {
     if (status === "awaiting_cast" || status === "ranking") return 2;
     if (status === "awaiting_selection") return 2;
-    if (status === "rendering" || status === "completed") return 5;
+    if (status === "rendering" || status === "completed" || status === "interrupted")
+      return 5;
     return 1;
+  }
+
+  function incompleteRenderInfo(job) {
+    const result = job?.result || {};
+    const progress = result.render_progress || null;
+    const selected = (job?.params?.selected_ids || result.selected_ids || [])
+      .map(Number)
+      .filter((n) => !Number.isNaN(n));
+    const ready = (result.shorts || []).filter((s) => s.clip_url && !s.error);
+    const total = Number(progress?.total) || selected.length || 0;
+    const done = Number(progress?.done);
+    const doneCount = Number.isFinite(done) ? done : ready.length;
+    if (total <= 0 || doneCount >= total) return null;
+    const phase = result.phase;
+    if (
+      !["rendering", "failed", "interrupted"].includes(phase) &&
+      ready.length <= 0
+    ) {
+      return null;
+    }
+    return { done: doneCount, total, progress, ready };
   }
 
   function selectionResumeStep(job) {
@@ -277,14 +426,20 @@
     const form = $("#generate-form");
     const hasJob = Boolean(state.activeJobId);
     const hasTopics = state.highlights.length > 0;
-    const selectableStatus = ["awaiting_selection", "completed", "rendering", "failed"].includes(
-      state.jobStatus
-    );
+    const selectableStatus = [
+      "awaiting_selection",
+      "completed",
+      "rendering",
+      "failed",
+      "interrupted",
+    ].includes(state.jobStatus);
     const castStatus = ["awaiting_cast", "ranking"].includes(state.jobStatus);
     const editable =
       hasJob &&
       step === 1 &&
-      (["awaiting_selection", "completed", "awaiting_cast"].includes(state.jobStatus) ||
+      (["awaiting_selection", "completed", "awaiting_cast", "interrupted"].includes(
+        state.jobStatus
+      ) ||
         (state.jobStatus === "failed" && (hasTopics || castStatus)));
 
     const step1Fields = $("#step1-fields");
@@ -365,7 +520,9 @@
       state.followJobStep = false;
       setFlowStep(n);
       if (
-        ["awaiting_selection", "completed", "failed"].includes(state.jobStatus) &&
+        ["awaiting_selection", "completed", "failed", "interrupted"].includes(
+          state.jobStatus
+        ) &&
         n >= 2 &&
         n <= 4
       ) {
@@ -545,6 +702,255 @@
     fileHint.textContent = f.name;
   });
 
+  function setProjectLibraryVisible(visible) {
+    const box = $("#project-library");
+    if (box) box.hidden = !visible;
+  }
+
+  function pendingStatusLabel(status) {
+    const map = {
+      selected: "selecionado",
+      queued: "na fila",
+      rendering: "renderizando",
+      failed: "falhou",
+      interrupted: "pausado",
+      awaiting_selection: "selecionado",
+      pending: "pendente",
+    };
+    return map[status] || status || "pendente";
+  }
+
+  function libraryCardHtml(item, { pending = false } = {}) {
+    const title = item.title || (pending ? `Tópico #${item.short_id}` : `Short #${item.short_id}`);
+    const score = item.score != null && item.score !== "" ? `${item.score}` : "—";
+    const thumb = item.thumbnail_url
+      ? `<img class="library-thumb" src="${escapeAttr(item.thumbnail_url)}" alt="" loading="lazy" />`
+      : `<span class="library-thumb is-empty" aria-hidden="true">9:16</span>`;
+    const time =
+      item.start_time != null && item.end_time != null
+        ? `${fmtTime(item.start_time)} → ${fmtTime(item.end_time)}`
+        : "";
+    const side = pending
+      ? `<span class="badge is-${escapeAttr(
+          item.pending_status === "failed"
+            ? "failed"
+            : item.pending_status === "rendering"
+              ? "rendering"
+              : item.pending_status === "interrupted"
+                ? "interrupted"
+                : "awaiting_selection"
+        )}">${escapeHtml(pendingStatusLabel(item.pending_status))}</span>`
+      : item.youtube_url
+        ? `<a class="btn ghost btn-tiny" href="${escapeAttr(
+            item.youtube_url
+          )}" target="_blank" rel="noopener" data-stop>YouTube</a>`
+        : item.youtube_upload_status === "uploading"
+          ? `<span class="hint">enviando…</span>`
+          : item.youtube_upload_status === "failed"
+            ? `<span class="hint">upload falhou</span>`
+            : `<span class="hint">pronto</span>`;
+    return `
+      ${thumb}
+      <div>
+        <h3>${escapeHtml(title)}</h3>
+        <p class="meta-row"><strong>${escapeHtml(score)}</strong>/100${
+          time ? ` · ${escapeHtml(time)}` : ""
+        }</p>
+        <p class="meta-row">${escapeHtml(truncate(item.hook_sentence || item.source_url || "", 72))}</p>
+      </div>
+      <div class="library-card-side">${side}</div>
+    `;
+  }
+
+  async function loadProjectLibrary() {
+    const pendingBox = $("#library-pending");
+    const renderedBox = $("#library-rendered");
+    if (!pendingBox || !renderedBox) return;
+    if (!state.projectId) {
+      setProjectLibraryVisible(false);
+      return;
+    }
+    setProjectLibraryVisible(!state.activeJobId);
+    if (state.activeJobId) return;
+
+    pendingBox.innerHTML = `<p class="empty">Carregando…</p>`;
+    renderedBox.innerHTML = `<p class="empty">Carregando…</p>`;
+    try {
+      const res = await fetch(`/api/projects/${state.projectId}/library`);
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      const pending = data.pending || [];
+      const rendered = data.rendered || [];
+
+      if (!pending.length) {
+        pendingBox.innerHTML = `<p class="empty">Nenhum pendente.</p>`;
+      } else {
+        pendingBox.innerHTML = "";
+        pending.forEach((item, i) => {
+          const card = document.createElement("div");
+          card.className = "library-card";
+          card.setAttribute("role", "button");
+          card.tabIndex = 0;
+          card.style.animationDelay = `${i * 0.04}s`;
+          card.innerHTML = libraryCardHtml(item, { pending: true });
+          const open = () => navigate(pathFor("generate", item.job_id));
+          card.addEventListener("click", (ev) => {
+            if (ev.target.closest?.("[data-stop]")) return;
+            open();
+          });
+          card.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter" || ev.key === " ") {
+              ev.preventDefault();
+              open();
+            }
+          });
+          pendingBox.appendChild(card);
+        });
+      }
+
+      if (!rendered.length) {
+        renderedBox.innerHTML = `<p class="empty">Nenhum short gerado ainda.</p>`;
+      } else {
+        renderedBox.innerHTML = "";
+        rendered.forEach((item, i) => {
+          const card = document.createElement("div");
+          card.className = "library-card";
+          card.setAttribute("role", "button");
+          card.tabIndex = 0;
+          card.style.animationDelay = `${i * 0.04}s`;
+          card.innerHTML = libraryCardHtml(item, { pending: false });
+          const open = () => navigate(pathFor("generate", item.job_id));
+          card.addEventListener("click", (ev) => {
+            if (ev.target.closest?.("[data-stop]")) return;
+            open();
+          });
+          card.addEventListener("keydown", (ev) => {
+            if (ev.key === "Enter" || ev.key === " ") {
+              ev.preventDefault();
+              open();
+            }
+          });
+          renderedBox.appendChild(card);
+        });
+      }
+    } catch (err) {
+      pendingBox.innerHTML = `<p class="empty">Erro: ${escapeHtml(err.message)}</p>`;
+      renderedBox.innerHTML = `<p class="empty">Erro ao carregar.</p>`;
+    }
+  }
+
+  $("#refresh-library")?.addEventListener("click", () => {
+    loadProjectLibrary();
+  });
+
+  /* ---------- Projects ---------- */
+  async function loadProjects() {
+    const list = $("#projects-list");
+    if (!list) return;
+    try {
+      const res = await fetch("/api/projects");
+      const projects = await res.json();
+      if (!projects.length) {
+        list.innerHTML = `<p class="empty">Nenhum projeto ainda. Crie um canal para começar.</p>`;
+        return;
+      }
+      list.innerHTML = "";
+      projects.forEach((p, i) => {
+        const yt = p.youtube || {};
+        const card = document.createElement("div");
+        card.className = "project-card";
+        card.style.animationDelay = `${i * 0.05}s`;
+        card.setAttribute("role", "button");
+        card.tabIndex = 0;
+        const channel =
+          yt.channel_title ||
+          (yt.configured ? "YouTube conectado" : "YouTube não configurado");
+        card.innerHTML = `
+          <div>
+            <h3>${escapeHtml(p.name)}</h3>
+            <p class="meta-row">${escapeHtml(channel)}</p>
+          </div>
+          <div class="project-card-actions">
+            <span class="badge ${yt.configured ? "is-completed" : "is-failed"}">${
+              yt.configured ? "pronto" : "configurar"
+            }</span>
+            <button type="button" class="btn ghost btn-tiny" data-delete-project="${escapeAttr(
+              p.id
+            )}">Excluir</button>
+          </div>
+        `;
+        const open = () => navigate(`/projects/${p.id}`);
+        card.addEventListener("click", (ev) => {
+          if (ev.target.closest?.("[data-delete-project]")) return;
+          open();
+        });
+        card.addEventListener("keydown", (ev) => {
+          if (ev.key === "Enter" || ev.key === " ") {
+            ev.preventDefault();
+            open();
+          }
+        });
+        list.appendChild(card);
+      });
+    } catch (err) {
+      list.innerHTML = `<p class="empty">Erro ao carregar: ${escapeHtml(err.message)}</p>`;
+    }
+  }
+
+  $("#create-project-btn")?.addEventListener("click", () => {
+    const form = $("#create-project-form");
+    if (!form) return;
+    form.hidden = false;
+    $("#project-name-input")?.focus();
+  });
+  $("#cancel-create-project")?.addEventListener("click", () => {
+    const form = $("#create-project-form");
+    if (form) form.hidden = true;
+    const hint = $("#create-project-hint");
+    if (hint) hint.textContent = "";
+  });
+  $("#refresh-projects")?.addEventListener("click", loadProjects);
+
+  $("#create-project-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const hint = $("#create-project-hint");
+    const name = ($("#project-name-input")?.value || "").trim() || "Novo canal";
+    if (hint) hint.textContent = "criando…";
+    try {
+      const res = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+      $("#create-project-form").hidden = true;
+      $("#project-name-input").value = "";
+      navigate(`/projects/${data.id}/config`);
+    } catch (err) {
+      if (hint) hint.textContent = `erro: ${err.message}`;
+    }
+  });
+
+  $("#projects-list")?.addEventListener("click", async (ev) => {
+    const btn = ev.target.closest?.("[data-delete-project]");
+    if (!btn) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const id = btn.getAttribute("data-delete-project");
+    if (!id) return;
+    if (!confirm("Excluir este projeto? Os jobs existentes permanecem, mas ficam sem canal.")) {
+      return;
+    }
+    try {
+      const res = await fetch(`/api/projects/${id}`, { method: "DELETE" });
+      if (!res.ok) throw new Error(await res.text());
+      await loadProjects();
+    } catch (err) {
+      alert(`Erro ao excluir: ${err.message}`);
+    }
+  });
+
   /* ---------- Health / mode options ---------- */
   async function refreshHealth() {
     try {
@@ -557,6 +963,48 @@
   }
 
   /* ---------- Config ---------- */
+  async function loadYoutubeConfig() {
+    if (!state.projectId) return;
+    const hint = $("#youtube-hint");
+    try {
+      const res = await fetch(`/api/projects/${state.projectId}`);
+      if (!res.ok) throw new Error("Projeto não encontrado");
+      const project = await res.json();
+      state.project = project;
+      setProjectChrome(project);
+      const yt = project.youtube || {};
+      $("#yt-project-name").value = project.name || "";
+      $("#yt-client-id").value = yt.client_id || "";
+      $("#yt-client-secret").value = "";
+      $("#yt-refresh-token").value = "";
+      $("#yt-privacy").value = yt.privacy_status || "private";
+      const secretNote = $("#yt-secret-note");
+      const tokenNote = $("#yt-token-note");
+      if (secretNote) {
+        secretNote.hidden = !yt.client_secret_set;
+        secretNote.textContent = yt.client_secret_set
+          ? `salvo: ${yt.client_secret_masked || "••••"}`
+          : "";
+      }
+      if (tokenNote) {
+        tokenNote.hidden = !yt.refresh_token_set;
+        tokenNote.textContent = yt.refresh_token_set
+          ? `salvo: ${yt.refresh_token_masked || "••••"}`
+          : "";
+      }
+      const status = $("#yt-status");
+      if (status) {
+        const bits = [];
+        bits.push(yt.configured ? "Canal pronto para upload" : "Faltam credenciais");
+        if (yt.channel_title) bits.push(yt.channel_title);
+        status.textContent = bits.join(" · ");
+      }
+      if (hint) hint.textContent = "";
+    } catch (err) {
+      if (hint) hint.textContent = `erro: ${err.message}`;
+    }
+  }
+
   async function loadConfig() {
     const form = $("#config-form");
     form.innerHTML = "";
@@ -608,6 +1056,89 @@
     }
   }
 
+  $("#youtube-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!state.projectId) return;
+    const hint = $("#youtube-hint");
+    const fd = new FormData(e.target);
+    const name = String(fd.get("name") || "").trim();
+    const youtube = {
+      client_id: String(fd.get("client_id") || "").trim(),
+      privacy_status: String(fd.get("privacy_status") || "private"),
+    };
+    const secret = String(fd.get("client_secret") || "").trim();
+    const token = String(fd.get("refresh_token") || "").trim();
+    if (secret) youtube.client_secret = secret;
+    if (token) youtube.refresh_token = token;
+    if (hint) hint.textContent = "salvando…";
+    try {
+      const res = await fetch(`/api/projects/${state.projectId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, youtube }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(
+          typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`
+        );
+      }
+      state.project = data;
+      setProjectChrome(data);
+      if (hint) hint.textContent = "canal salvo";
+      await loadYoutubeConfig();
+    } catch (err) {
+      if (hint) hint.textContent = `erro: ${err.message}`;
+    }
+  });
+
+  $("#yt-oauth-btn")?.addEventListener("click", async () => {
+    if (!state.projectId) return;
+    const hint = $("#youtube-hint");
+    const btn = $("#yt-oauth-btn");
+    // Persist client id/secret first if typed
+    const form = $("#youtube-form");
+    if (form) {
+      const fd = new FormData(form);
+      const youtube = {
+        client_id: String(fd.get("client_id") || "").trim(),
+        privacy_status: String(fd.get("privacy_status") || "private"),
+      };
+      const secret = String(fd.get("client_secret") || "").trim();
+      if (secret) youtube.client_secret = secret;
+      const name = String(fd.get("name") || "").trim();
+      await fetch(`/api/projects/${state.projectId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, youtube }),
+      });
+    }
+    if (hint) {
+      hint.textContent =
+        "Abrindo OAuth no navegador… autorize o acesso e volte aqui.";
+    }
+    if (btn) btn.disabled = true;
+    try {
+      const res = await fetch(`/api/projects/${state.projectId}/youtube/oauth`, {
+        method: "POST",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(
+          typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`
+        );
+      }
+      state.project = data;
+      setProjectChrome(data);
+      if (hint) hint.textContent = "YouTube conectado";
+      await loadYoutubeConfig();
+    } catch (err) {
+      if (hint) hint.textContent = `erro: ${err.message}`;
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
   $("#config-form").addEventListener("submit", async (e) => {
     e.preventDefault();
     const hint = $("#config-hint");
@@ -633,6 +1164,10 @@
   /* ---------- Generate ---------- */
   $("#generate-form").addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (!state.projectId) {
+      $("#form-hint").textContent = "abra um projeto antes de gerar";
+      return;
+    }
     const btn = $("#submit-btn");
     const hint = $("#form-hint");
     btn.disabled = true;
@@ -643,6 +1178,7 @@
     // Formato fica no passo 2 — envia defaults atuais dos selects
     fd.set("aspect_ratio", $("#aspect_ratio")?.value || "9:16");
     fd.set("download_format", $("#download_format")?.value || "720");
+    fd.set("project_id", state.projectId);
     // Idioma vem de CONTENT_LANGUAGE na Config (padrão das gerações)
 
     try {
@@ -666,9 +1202,12 @@
     state.highlights = [];
     state.renderedIds = new Set();
     state.lastJob = null;
+    state.castRoster = null;
+    state.castRosterJobId = null;
     state.jobStatus = "queued";
     state.maxStep = 1;
     closeTrimEditor({ silent: true });
+    setProjectLibraryVisible(false);
     $("#run-area").hidden = true;
     $("#pick-area").hidden = true;
     const formatArea = $("#format-area");
@@ -773,6 +1312,29 @@
         if (state.followJobStep) setFlowStep(5);
         else showFlowView(state.viewStep);
         if (state.viewStep === 5) renderResults(job);
+      } else if (job.status === "interrupted") {
+        const shorts = job.result?.shorts || [];
+        state.renderedIds = new Set(
+          shorts
+            .filter((s) => s.clip_url && !s.error)
+            .map((s, i) => Number(s.id ?? i))
+            .filter((n) => !Number.isNaN(n))
+        );
+        prepareSelection(job);
+        state.maxStep = Math.max(state.maxStep, 5);
+        if (state.pollTimer) {
+          clearInterval(state.pollTimer);
+          state.pollTimer = null;
+        }
+        if (state.followJobStep) setFlowStep(5);
+        else showFlowView(state.viewStep);
+        if (state.viewStep === 3) syncCaptionForm();
+        if (state.viewStep === 4) renderTopicPicker(job);
+        if (state.viewStep === 5) renderResults(job);
+        const capBtn = $("#caption-continue");
+        if (capBtn) capBtn.disabled = false;
+        loadJobs();
+        loadSources();
       } else if (job.status === "completed" && job.result) {
         const shorts = job.result.shorts || [];
         state.renderedIds = new Set(
@@ -806,7 +1368,21 @@
         logEl.textContent += `\n\nFALHOU: ${job.error || "erro desconhecido"}`;
         const highlights = job.result?.highlights || [];
         const speakers = job.result?.speakers || [];
-        if (highlights.length) {
+        const incomplete = incompleteRenderInfo(job);
+        if (incomplete) {
+          const shorts = job.result?.shorts || [];
+          state.renderedIds = new Set(
+            shorts
+              .filter((s) => s.clip_url && !s.error)
+              .map((s, i) => Number(s.id ?? i))
+              .filter((n) => !Number.isNaN(n))
+          );
+          prepareSelection(job);
+          state.maxStep = Math.max(state.maxStep, 5);
+          if (state.followJobStep) setFlowStep(5);
+          else showFlowView(state.viewStep);
+          if (state.viewStep === 5) renderResults(job);
+        } else if (highlights.length) {
           // Análise sobreviveu — permite retentar a seleção/corte
           prepareSelection(job);
           const resume = selectionResumeStep(job);
@@ -841,30 +1417,69 @@
     if (state.viewStep === 4) renderTopicPicker(job);
   }
 
+  function syncCastNamesFromDom() {
+    if (!Array.isArray(state.castRoster)) return;
+    $$(".cast-name").forEach((input) => {
+      const sp = state.castRoster.find((s) => String(s.id) === String(input.dataset.id));
+      if (sp) sp.name = input.value;
+    });
+  }
+
+  function nextCastSpeakerId(roster) {
+    let max = 0;
+    for (const sp of roster || []) {
+      const m = String(sp.id || "").match(/^S(\d+)$/i);
+      if (m) max = Math.max(max, Number(m[1]) || 0);
+    }
+    return `S${max + 1}`;
+  }
+
+  function ensureCastRoster(job) {
+    const speakers = job?.result?.speakers || [];
+    if (state.castRosterJobId !== job?.id || !Array.isArray(state.castRoster)) {
+      state.castRoster = speakers.map((sp) => ({ ...sp }));
+      state.castRosterJobId = job?.id || null;
+      return state.castRoster;
+    }
+    // Merge portrait updates from server without restoring removed slots
+    for (const sp of state.castRoster) {
+      const fresh = speakers.find((s) => String(s.id) === String(sp.id));
+      if (!fresh) continue;
+      if (fresh.portrait_url) sp.portrait_url = fresh.portrait_url;
+      if (fresh.portrait_time != null) sp.portrait_time = fresh.portrait_time;
+    }
+    return state.castRoster;
+  }
+
   function renderCastForm(job) {
-    const speakers = job.result?.speakers || [];
     const list = $("#cast-list");
     const area = $("#cast-area");
+    const addBtn = $("#cast-add");
     if (!list || !area) return;
     if (state.viewStep === 2 && state.jobStatus === "awaiting_cast") {
       area.hidden = false;
     }
 
-    if (!speakers.length) {
-      list.innerHTML = `<p class="empty">Nenhum locutor detectado — você pode pular esta etapa.</p>`;
-      return;
+    syncCastNamesFromDom();
+    const speakers = ensureCastRoster(job);
+
+    if (addBtn) {
+      addBtn.disabled = speakers.length >= CAST_MAX_SPEAKERS;
+      addBtn.title =
+        speakers.length >= CAST_MAX_SPEAKERS
+          ? `Máximo de ${CAST_MAX_SPEAKERS} locutores`
+          : "Adicionar um locutor que o sistema não detectou";
     }
 
-    // Preserve in-progress name edits across poll re-renders
-    const typed = {};
-    $$(".cast-name").forEach((input) => {
-      typed[input.dataset.id] = input.value;
-    });
+    if (!speakers.length) {
+      list.innerHTML = `<p class="empty">Nenhum locutor — adicione manualmente ou pule esta etapa.</p>`;
+      return;
+    }
 
     list.innerHTML = "";
     speakers.forEach((sp, i) => {
       const sid = String(sp.id || `S${i + 1}`);
-      const suggested = typed[sid] ?? (sp.suggested_name || sp.name || "");
+      const suggested = sp.name || sp.suggested_name || "";
       const role = sp.role || "unknown";
       const quote = sp.sample_quote || "";
       const evidence = sp.evidence || "";
@@ -885,12 +1500,17 @@
           </button>
         </div>
         <div class="cast-body">
-          <label class="field">
-            <span class="label">Nome ${role !== "unknown" ? `(${escapeHtml(role)})` : ""}</span>
-            <input type="text" class="cast-name" data-id="${escapeAttr(sid)}"
-              value="${escapeAttr(suggested)}"
-              placeholder="Ex.: Rodrigo Pimentel" />
-          </label>
+          <div class="cast-body-head">
+            <label class="field">
+              <span class="label">Nome ${role !== "unknown" ? `(${escapeHtml(role)})` : ""}</span>
+              <input type="text" class="cast-name" data-id="${escapeAttr(sid)}"
+                value="${escapeAttr(suggested)}"
+                placeholder="Ex.: Rodrigo Pimentel" />
+            </label>
+            <button type="button" class="cast-remove" data-id="${escapeAttr(sid)}" title="Remover este locutor">
+              Remover
+            </button>
+          </div>
           ${quote ? `<p class="cast-quote">“${escapeHtml(quote)}”</p>` : ""}
           ${evidence ? `<p class="cast-evidence">${escapeHtml(evidence)}</p>` : ""}
         </div>
@@ -909,8 +1529,83 @@
       card.querySelector(".cast-next-photo")?.addEventListener("click", () => {
         cycleCastPortrait(sid, card);
       });
+      card.querySelector(".cast-remove")?.addEventListener("click", () => {
+        removeCastSpeaker(sid);
+      });
       list.appendChild(card);
     });
+  }
+
+  function castRosterPayload() {
+    syncCastNamesFromDom();
+    return (state.castRoster || []).map((sp) => ({
+      id: sp.id,
+      name: (sp.name || sp.suggested_name || "").trim(),
+    }));
+  }
+
+  async function persistCastRoster() {
+    if (!state.activeJobId || state.jobStatus !== "awaiting_cast") return;
+    try {
+      const res = await fetch(`/api/jobs/${state.activeJobId}/cast/roster`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ speakers: castRosterPayload() }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+      if (Array.isArray(data.speakers) && state.castRoster) {
+        for (const fresh of data.speakers) {
+          const sp = state.castRoster.find((s) => String(s.id) === String(fresh.id));
+          if (!sp) continue;
+          if (fresh.portrait_url) sp.portrait_url = fresh.portrait_url;
+          if (fresh.portrait_time != null) sp.portrait_time = fresh.portrait_time;
+        }
+      }
+    } catch (err) {
+      const hint = $("#cast-hint");
+      if (hint) hint.textContent = `Salvar locutores: ${err.message}`;
+    }
+  }
+
+  function removeCastSpeaker(sid) {
+    if (!Array.isArray(state.castRoster)) return;
+    syncCastNamesFromDom();
+    state.castRoster = state.castRoster.filter((sp) => String(sp.id) !== String(sid));
+    if (state.lastJob) {
+      if (!state.lastJob.result) state.lastJob.result = {};
+      state.lastJob.result.speakers = state.castRoster;
+      renderCastForm(state.lastJob);
+    }
+    persistCastRoster();
+  }
+
+  function addCastSpeaker() {
+    if (!Array.isArray(state.castRoster)) {
+      state.castRoster = [];
+      state.castRosterJobId = state.activeJobId;
+    }
+    if (state.castRoster.length >= CAST_MAX_SPEAKERS) return;
+    syncCastNamesFromDom();
+    const sid = nextCastSpeakerId(state.castRoster);
+    state.castRoster.push({
+      id: sid,
+      suggested_name: "",
+      name: "",
+      role: "unknown",
+      sample_quote: "",
+      sample_time: null,
+      evidence: "Adicionado manualmente",
+      portrait_url: "",
+    });
+    if (state.lastJob) {
+      if (!state.lastJob.result) state.lastJob.result = {};
+      state.lastJob.result.speakers = state.castRoster;
+      renderCastForm(state.lastJob);
+      const input = $(`.cast-name[data-id="${CSS.escape(sid)}"]`);
+      input?.focus();
+    }
+    persistCastRoster();
   }
 
   function setCastFace(card, sid, portraitUrl, alt) {
@@ -960,9 +1655,12 @@
       const url = data.portrait_url;
       if (url) {
         setCastFace(card, sid, url, sid);
-        const speakers = state.lastJob?.result?.speakers || [];
-        const sp = speakers.find((s) => String(s.id) === String(sid));
-        if (sp) {
+        const speakers = [
+          ...(state.castRoster || []),
+          ...(state.lastJob?.result?.speakers || []),
+        ];
+        for (const sp of speakers) {
+          if (String(sp.id) !== String(sid)) continue;
           sp.portrait_url = url;
           if (data.portrait_time != null) sp.portrait_time = data.portrait_time;
         }
@@ -985,10 +1683,16 @@
     if (btn) btn.disabled = true;
     if (skipBtn) skipBtn.disabled = true;
 
-    const speakers = [...$$(".cast-name")].map((input) => ({
+    syncCastNamesFromDom();
+    const speakers = (state.castRoster || [...$$(".cast-name")].map((input) => ({
       id: input.dataset.id,
-      name: input.value.trim(),
-    }));
+    }))).map((sp) => {
+      const input = $(`.cast-name[data-id="${CSS.escape(String(sp.id))}"]`);
+      return {
+        id: sp.id,
+        name: (input?.value ?? sp.name ?? sp.suggested_name ?? "").trim(),
+      };
+    });
 
     try {
       const res = await fetch(`/api/jobs/${state.activeJobId}/cast`, {
@@ -999,6 +1703,8 @@
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
       state.jobStatus = "ranking";
+      state.castRoster = null;
+      state.castRosterJobId = null;
       const cast = $("#cast-area");
       if (cast) cast.hidden = true;
       const hint = $("#cast-hint");
@@ -1020,6 +1726,7 @@
 
   $("#cast-continue")?.addEventListener("click", () => submitCast({ skip: false }));
   $("#cast-skip")?.addEventListener("click", () => submitCast({ skip: true }));
+  $("#cast-add")?.addEventListener("click", () => addCastSpeaker());
 
   function currentAspectRatio() {
     return (
@@ -2150,6 +2857,62 @@
     }
   });
 
+  async function resumeRender(job) {
+    if (!state.activeJobId) return;
+    const ids = (
+      job?.params?.selected_ids ||
+      job?.result?.selected_ids ||
+      [...state.selectedIds]
+    )
+      .map(Number)
+      .filter((n) => !Number.isNaN(n));
+    if (!ids.length) return;
+    const btn = $("#resume-render-btn");
+    if (btn) btn.disabled = true;
+    const style =
+      job?.params?.caption_style ||
+      state.jobParams?.caption_style ||
+      state.captionStyle ||
+      null;
+    try {
+      const res = await fetch(`/api/jobs/${state.activeJobId}/select`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ids,
+          caption_style: style || undefined,
+          force: false,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+      state.jobStatus = "rendering";
+      state.followJobStep = true;
+      state.selectedIds = new Set(ids);
+      setFlowStep(5);
+      if (state.lastJob) {
+        state.lastJob = {
+          ...state.lastJob,
+          status: "rendering",
+          params: {
+            ...state.lastJob.params,
+            selected_ids: ids,
+            ...(style ? { caption_style: style } : {}),
+          },
+        };
+        renderResults(state.lastJob);
+      }
+      if (state.pollTimer) clearInterval(state.pollTimer);
+      pollJob();
+      state.pollTimer = setInterval(pollJob, 1500);
+    } catch (err) {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = `erro: ${err.message}`;
+      }
+    }
+  }
+
   $("#pick-continue").addEventListener("click", async () => {
     if (!state.activeJobId || state.selectedIds.size === 0) return;
     if (state.trim.highlightId != null && state.trim.dirty) {
@@ -2710,6 +3473,7 @@
   function shortCardState(id, short, progress, jobStatus) {
     if (short?.clip_url && !short.error) return "ready";
     if (short?.error) return "error";
+    if (jobStatus === "interrupted" || jobStatus === "failed") return "paused";
     if (jobStatus !== "rendering") return short ? "error" : "missing";
     const current = progress?.current_id;
     if (current != null && Number(current) === id) return "rendering";
@@ -2762,6 +3526,11 @@
         <div class="short-skeleton-shine"></div>
         <span class="short-skeleton-label">Na fila</span>
       </div>`;
+    } else if (cardState === "paused") {
+      media = `<div class="short-skeleton is-paused">
+        ${thumbImg}
+        <span class="short-skeleton-label">Pausado</span>
+      </div>`;
     } else {
       media = `<p class="empty">Clip indisponível</p>`;
     }
@@ -2773,27 +3542,54 @@
           ? `<p class="meta-row short-status-hint">Cortando agora…</p>`
           : cardState === "pending"
             ? `<p class="meta-row short-status-hint">Aguardando na fila</p>`
-            : "";
+            : cardState === "paused"
+              ? `<p class="meta-row short-status-hint">Aguardando retomada</p>`
+              : "";
 
     const ytUrl = short?.youtube_url || "";
-    const ytActions =
-      cardState === "ready" && clip
-        ? `<div class="short-actions" data-short-id="${escapeAttr(String(id))}">
-            ${
+    const ytStatus = short?.youtube_upload_status || "";
+    const ytError = short?.youtube_upload_error || "";
+    let ytActions = "";
+    if (cardState === "ready" && clip) {
+      if (ytStatus === "uploading") {
+        ytActions = `<div class="short-actions" data-short-id="${escapeAttr(
+          String(id)
+        )}" data-yt-state="uploading">
+            <p class="hint yt-upload-hint">Enviando ao YouTube…</p>
+          </div>`;
+      } else if (ytUrl) {
+        ytActions = `<div class="short-actions" data-short-id="${escapeAttr(
+          String(id)
+        )}" data-yt-state="uploaded" data-yt-url="${escapeAttr(ytUrl)}">
+            <a class="btn ghost btn-tiny" href="${escapeAttr(
               ytUrl
-                ? `<a class="btn ghost btn-tiny" href="${escapeAttr(
-                    ytUrl
-                  )}" target="_blank" rel="noopener">Ver no YouTube</a>
-                   <button type="button" class="btn ghost btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
-                     String(id)
-                   )}">Reenviar</button>`
-                : `<button type="button" class="btn primary btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
-                    String(id)
-                  )}">Enviar ao YouTube</button>`
-            }
-            <p class="hint yt-upload-hint" hidden></p>
-          </div>`
-        : "";
+            )}" target="_blank" rel="noopener">Ver no YouTube</a>
+            <button type="button" class="btn ghost btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
+              String(id)
+            )}">Reenviar</button>
+            <p class="hint yt-upload-hint">${escapeHtml(
+              short?.youtube_privacy
+                ? `Publicado como ${short.youtube_privacy}`
+                : "Enviado"
+            )}</p>
+          </div>`;
+      } else {
+        ytActions = `<div class="short-actions" data-short-id="${escapeAttr(
+          String(id)
+        )}" data-yt-state="${ytStatus === "failed" ? "failed" : "idle"}">
+            <button type="button" class="btn primary btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
+              String(id)
+            )}">Enviar ao YouTube</button>
+            <p class="hint yt-upload-hint"${
+              ytStatus === "failed" ? "" : " hidden"
+            }>${
+              ytStatus === "failed"
+                ? escapeHtml(ytError || "Falha no upload automático")
+                : ""
+            }</p>
+          </div>`;
+      }
+    }
 
     return `
       <div class="short-media">${media}</div>
@@ -2808,122 +3604,6 @@
       </div>
     `;
   }
-
-  function renderTopicPicker(job) {
-    const highlights = job.result?.highlights || [];
-    state.highlights = highlights;
-    const list = $("#topic-list");
-    const pick = $("#pick-area");
-    pick.hidden = false;
-
-    if (!highlights.length) {
-      list.innerHTML = `<p class="empty">Nenhum tópico encontrado.</p>`;
-      $("#pick-continue").disabled = true;
-      $("#pick-hint").textContent = "Nada para selecionar";
-      return;
-    }
-
-    // Default: select all
-    if (state.selectedIds.size === 0) {
-      highlights.forEach((h, i) => state.selectedIds.add(Number(h.id ?? i)));
-    }
-
-    list.innerHTML = "";
-    highlights.forEach((h, i) => {
-      const id = Number(h.id ?? i);
-      const selected = state.selectedIds.has(id);
-      const card = document.createElement("button");
-      card.type = "button";
-      card.className = `topic-card${selected ? " is-selected" : ""}`;
-      card.dataset.id = String(id);
-      card.style.animationDelay = `${i * 0.04}s`;
-      const thumb = h.thumbnail_url
-        ? `<img class="topic-thumb" src="${escapeAttr(h.thumbnail_url)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
-        : `<span class="topic-thumb is-placeholder">frame</span>`;
-      card.innerHTML = `
-        <input class="topic-check" type="checkbox" ${selected ? "checked" : ""} tabindex="-1" aria-hidden="true" />
-        ${thumb}
-        <div class="topic-body">
-          <div class="score"><strong>${h.score ?? "—"}</strong> / 100</div>
-          <h3>${escapeHtml(h.title || `Tópico #${i + 1}`)}</h3>
-          <p class="meta-row"><strong>Tempo:</strong> ${fmtTime(h.start_time)} → ${fmtTime(h.end_time)}</p>
-          <p class="meta-row"><strong>Hook:</strong> ${escapeHtml(h.hook_sentence || "—")}</p>
-          <p class="topic-snippet">${escapeHtml(h.snippet || h.virality_reason || "")}</p>
-        </div>
-      `;
-      card.addEventListener("click", () => toggleTopic(id, card));
-      list.appendChild(card);
-    });
-
-    syncPickContinue();
-    $("#pick-hint").textContent = `${state.selectedIds.size} de ${highlights.length} selecionados · ordenados por tempo`;
-  }
-
-  function toggleTopic(id, card) {
-    if (state.selectedIds.has(id)) {
-      state.selectedIds.delete(id);
-      card.classList.remove("is-selected");
-      const cb = $(".topic-check", card);
-      if (cb) cb.checked = false;
-    } else {
-      state.selectedIds.add(id);
-      card.classList.add("is-selected");
-      const cb = $(".topic-check", card);
-      if (cb) cb.checked = true;
-    }
-    syncPickContinue();
-  }
-
-  function syncPickContinue() {
-    const n = state.selectedIds.size;
-    const total = state.highlights.length;
-    $("#pick-continue").disabled = n === 0;
-    $("#pick-hint").textContent = `${n} de ${total} selecionados · ordenados por tempo`;
-  }
-
-  $("#pick-all").addEventListener("click", () => {
-    state.highlights.forEach((h, i) => state.selectedIds.add(Number(h.id ?? i)));
-    $$(".topic-card").forEach((card) => {
-      card.classList.add("is-selected");
-      const cb = $(".topic-check", card);
-      if (cb) cb.checked = true;
-    });
-    syncPickContinue();
-  });
-
-  $("#pick-none").addEventListener("click", () => {
-    state.selectedIds.clear();
-    $$(".topic-card").forEach((card) => {
-      card.classList.remove("is-selected");
-      const cb = $(".topic-check", card);
-      if (cb) cb.checked = false;
-    });
-    syncPickContinue();
-  });
-
-  $("#pick-continue").addEventListener("click", async () => {
-    if (!state.activeJobId || state.selectedIds.size === 0) return;
-    const btn = $("#pick-continue");
-    btn.disabled = true;
-    try {
-      const res = await fetch(`/api/jobs/${state.activeJobId}/select`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids: [...state.selectedIds] }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
-      setFlowStep(3);
-      $("#pick-area").hidden = true;
-      setBadge("rendering");
-      if (state.pollTimer) clearInterval(state.pollTimer);
-      pollJob();
-      state.pollTimer = setInterval(pollJob, 2000);
-    } catch (err) {
-      $("#pick-hint").textContent = `erro: ${err.message}`;
-      btn.disabled = false;
-    }
-  });
 
   function renderResults(job) {
     const box = $("#results");
@@ -2962,19 +3642,61 @@
     }
     head.style.order = "-1";
 
-    const titleText =
-      jobStatus === "rendering"
-        ? `${done} de ${total} shorts prontos · renderizando…`
-        : `${shorts.length} shorts · ${highlights.length} tópicos analisados`;
+    const uploadingCount = shorts.filter(
+      (s) => s.youtube_upload_status === "uploading"
+    ).length;
+    const remaining = Math.max(0, total - done);
+    let titleText;
+    if (jobStatus === "rendering") {
+      titleText =
+        uploadingCount && done >= total
+          ? `${done} de ${total} shorts prontos · enviando ao YouTube…`
+          : `${done} de ${total} shorts prontos · renderizando…`;
+    } else if (jobStatus === "interrupted") {
+      titleText =
+        remaining > 0
+          ? `${done} de ${total} shorts prontos · faltam ${remaining}`
+          : `${done} de ${total} shorts prontos · interrompido`;
+    } else if (jobStatus === "failed" && remaining > 0 && done > 0) {
+      titleText = `${done} de ${total} shorts prontos · falhou — pode retomar`;
+    } else {
+      titleText = `${shorts.length} shorts · ${highlights.length} tópicos analisados`;
+    }
+
+    const canResume =
+      ["interrupted", "failed"].includes(jobStatus) &&
+      remaining > 0 &&
+      (job.params?.selected_ids?.length || job.result?.selected_ids?.length);
 
     head.innerHTML = `
-      <h2 style="font-size:1.2rem">${titleText}</h2>
-      ${
-        jobStatus === "completed"
-          ? `<a class="btn ghost" href="/api/jobs/${job.id}/result.json" download>Baixar JSON</a>`
-          : `<span class="hint">${done}/${total}</span>`
-      }
+      <div class="results-head-text">
+        <h2 style="font-size:1.2rem">${titleText}</h2>
+        ${
+          jobStatus === "interrupted"
+            ? `<p class="hint">O servidor caiu no meio do corte. Os ${done} já gerados foram preservados.</p>`
+            : ""
+        }
+      </div>
+      <div class="results-head-actions">
+        ${
+          canResume
+            ? `<button type="button" class="btn primary" id="resume-render-btn">Retomar renderização (${remaining} restantes)</button>`
+            : ""
+        }
+        ${
+          jobStatus === "completed"
+            ? `<a class="btn ghost" href="/api/jobs/${job.id}/result.json" download>Baixar JSON</a>`
+            : canResume
+              ? ""
+              : `<span class="hint">${done}/${total}</span>`
+        }
+      </div>
     `;
+
+    const resumeBtn = head.querySelector("#resume-render-btn");
+    if (resumeBtn) {
+      resumeBtn.addEventListener("click", () => resumeRender(job));
+    }
 
     if (!ids.length) {
       [...box.querySelectorAll(".short-card")].forEach((el) => el.remove());
@@ -3001,10 +3723,33 @@
       const highlight = highlightsById.get(id) || short || {};
       const cardState = shortCardState(id, short, progress, jobStatus);
       let card = existing.get(key);
+      const ytState =
+        short?.youtube_upload_status === "uploading"
+          ? "uploading"
+          : short?.youtube_url
+            ? "uploaded"
+            : short?.youtube_upload_status === "failed"
+              ? "failed"
+              : "idle";
+      const ytUrl = short?.youtube_url || "";
 
       if (card && card.dataset.state === cardState && cardState === "ready") {
-        // Keep the same <video> so playback isn't interrupted
+        // Keep the same <video> so playback isn't interrupted — only refresh YT actions
         card.style.order = String(i);
+        const actions = card.querySelector(".short-actions");
+        const prevYt = actions?.dataset.ytState || "";
+        const prevUrl = actions?.dataset.ytUrl || "";
+        if (prevYt !== ytState || prevUrl !== ytUrl) {
+          const meta = card.querySelector(".short-meta");
+          if (meta) {
+            const tmp = document.createElement("div");
+            tmp.innerHTML = buildShortCardHtml(id, highlight, short, cardState, i);
+            const nextActions = tmp.querySelector(".short-actions");
+            if (actions && nextActions) actions.replaceWith(nextActions);
+            else if (!actions && nextActions) meta.appendChild(nextActions);
+            else if (actions && !nextActions) actions.remove();
+          }
+        }
         return;
       }
 
@@ -3105,11 +3850,17 @@
 
   async function loadJobs() {
     const list = $("#jobs-list");
+    if (!state.projectId) {
+      list.innerHTML = `<p class="empty">Abra um projeto para ver os jobs.</p>`;
+      return;
+    }
     try {
-      const res = await fetch("/api/jobs");
+      const res = await fetch(
+        `/api/jobs?project_id=${encodeURIComponent(state.projectId)}`
+      );
       const jobs = await res.json();
       if (!jobs.length) {
-        list.innerHTML = `<p class="empty">Nenhum job ainda.</p>`;
+        list.innerHTML = `<p class="empty">Nenhum job ainda neste canal.</p>`;
         return;
       }
       list.innerHTML = "";
@@ -3125,7 +3876,7 @@
           <span class="hint">${j.highlights_count || j.shorts_count || 0} tópicos · ${j.shorts_count || 0} clips</span>
         `;
         row.addEventListener("click", () => {
-          navigate(`/jobs/${j.id}`);
+          navigate(pathFor("generate", j.id));
         });
         list.appendChild(row);
       }
