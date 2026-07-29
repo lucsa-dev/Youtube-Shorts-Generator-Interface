@@ -65,7 +65,24 @@ Rules:
 - Explain in one sentence why this clip is viral ("virality_reason")
 - start_time / end_time must span the FULL self-contained segment, not just the hook line
 - CRITICAL language rule: write title, hook_sentence, and virality_reason entirely in {output_language}. Do NOT use English unless the output language is English. Prefer hooks taken from / closely paraphrasing the transcript.
-- When KNOWN SPEAKERS are provided (podcast/interview/debate), titles MUST attribute the main speaker or public figure when known — e.g. "{{Name}} fala sobre {{topic}}" or "{{Name}}: {{claim}}". Prefer guests / public figures over hosts. Never invent names outside the provided list. Fill attributed_to with that person's name (or empty string if none).
+
+TITLE SPECIALIST (YouTube Shorts / Reels / TikTok — this is the feed title, not a chapter heading):
+You write titles the way a growth editor writes Shorts titles: scroll-stopping, specific, emotional, and easy to read in under 1 second.
+- The title must SELL the clip. Lead with the claim, provocation, contradiction, or curiosity gap — never with a neutral topic label.
+- Ideal length: ~40–70 characters. Hard max ~80. Cut filler words.
+- Prefer concrete language from the clip (a quote-shaped claim) over abstract themes.
+- Patterns that WORK: bold claim · open question · "X vs Y" · unexpected confession · "ninguém fala isso" energy · specific number/detail when present.
+- Patterns that FAIL (never use): "Nome: tema genérico", "Nome fala sobre X", "o papel de X", "a importância de X", "X e suas consequências", "a verdade sobre X", "a polêmica sobre X", essay/chapter titles, Wikipedia-style labels.
+- Do NOT start every title with the speaker name. Put the person in attributed_to. Optionally weave a short famous name INTO the punchline when it adds social proof (e.g. "Cassius: aborto é assassinato") — but the punchline still comes first or owns the title.
+- Each title must be UNIQUE across the batch — no near-duplicates that only swap synonyms.
+- Title and hook_sentence are different jobs: title = feed bait; hook_sentence = first spoken line / on-screen opener. Do not paste the same string into both.
+- When KNOWN SPEAKERS are provided (podcast/interview/debate), fill attributed_to with the main speaker / public figure (prefer guests over hosts). Never invent names outside the list. attributed_to may be empty if none apply.
+
+Bad → Good examples (Portuguese):
+- BAD: "Cassius Ogrus: liberdade de expressão e suas consequências" → GOOD: "Liberdade total? Tem coisa que não pode"
+- BAD: "Cassius Ogrus: a verdade sobre as vacinas" → GOOD: "Proibir falar de vacina é pior que mentir"
+- BAD: "Cassius Ogrus: o papel da comédia na vida das pessoas" → GOOD: "Meu humor fez gente rir de novo na depressão"
+- BAD: "Cassius Ogrus: O que é sucesso?" → GOOD: "Sucesso pra mim é ter família — ponto"
 
 {cast_block}
 
@@ -639,7 +656,8 @@ def call_highlight_api(
                 + f" EVERY clip duration (end_time - start_time) MUST be {int(MIN_CLIP_SECONDS)}–90 seconds"
                 + " and cover setup + claim + payoff — never a single hook sentence."
                 + f" title, hook_sentence, and virality_reason MUST be written in {output_language}."
-                + " When speakers are known, put the person name in the title and attributed_to."
+                + " Titles must be viral Shorts titles (claim/curiosity), NEVER 'Name: generic topic'."
+                + " Put the speaker in attributed_to, not as a boring title prefix."
                 + " No markdown fences, no commentary."
             )
 
@@ -766,4 +784,8 @@ def get_highlights(
             "and complete-context expansion."
         )
 
-    return {"highlights": highlights}
+    return {
+        "highlights": highlights,
+        "content_type": content_info.get("content_type") or "other",
+        "density": content_info.get("density") or "medium",
+    }

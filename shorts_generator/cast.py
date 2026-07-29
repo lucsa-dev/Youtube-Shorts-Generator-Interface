@@ -411,11 +411,11 @@ def cast_context_block(speakers: List[Dict]) -> str:
         role = sp.get("role") or "unknown"
         lines.append(f"- {name} ({role}, id={sp['id']})")
     lines.append(
-        "Title attribution rules for podcast/interview/debate:\n"
-        "- Prefer titles like \"{FamousName} fala sobre {topic}\" or \"{Name}: {claim}\"\n"
+        "Speaker attribution (podcast/interview/debate):\n"
+        "- Set attributed_to to the speaker the clip is mainly about / from\n"
         "- Prefer the guest / public figure over the host when both speak\n"
         "- Never invent names outside this list\n"
-        "- Set attributed_to to the speaker the clip is mainly about / from"
+        "- Do NOT force \"{Name}: topic\" titles — write a viral Shorts title; keep the name in attributed_to"
     )
     return "\n".join(lines)
 

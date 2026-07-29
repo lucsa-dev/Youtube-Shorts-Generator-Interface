@@ -211,6 +211,8 @@ def finalize_analysis(
         "metadata": prepared.get("metadata") or {},
         "transcript": transcript,
         "speakers": named or candidates,
+        "content_type": highlights_result.get("content_type") or "other",
+        "density": highlights_result.get("density") or "medium",
         "highlights": enriched,
         "shorts": [],
     }
