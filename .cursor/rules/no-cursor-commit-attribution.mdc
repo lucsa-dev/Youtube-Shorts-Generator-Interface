@@ -1,8 +1,0 @@
----
-description: Never add Cursor co-author or Made-with attribution to git commits or PRs
-alwaysApply: true
----
-
-# Sem atribuição Cursor em commits
-
-Nunca adicione `Co-authored-by: Cursor`, `cursoragent@cursor.com`, `Made-with: Cursor` ou qualquer trailer/atribuição do Cursor em mensagens de commit, amend, ou descrições de PR.

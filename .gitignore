@@ -9,3 +9,5 @@ uploads/
 jobs/
 *.mp4
 .DS_Store
+.claude/
+.cursor/
