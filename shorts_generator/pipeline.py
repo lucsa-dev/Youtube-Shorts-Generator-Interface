@@ -150,6 +150,7 @@ def finalize_analysis(
     skip_cast: bool = False,
     num_clips: Optional[int] = None,
     language: Optional[str] = None,
+    virality_profile: Optional[Dict] = None,
 ) -> Dict:
     """Label transcript with confirmed names (optional) and rank highlights."""
     mode = (prepared.get("mode") or "api").lower()
@@ -195,6 +196,7 @@ def finalize_analysis(
         llm_fn=llm_fn,
         output_language=output_lang,
         speakers=named,
+        virality_profile=virality_profile,
     )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:

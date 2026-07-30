@@ -20,6 +20,12 @@ from .config import (
     CLIP_START_LEAD_IN_MAX,
     CLIP_START_LEAD_IN_MIN,
 )
+from .virality import (
+    DEFAULT_HOOK_IN_FIRST_SECONDS,
+    build_profile_prompt_block,
+    build_virality_criteria,
+    normalize_virality_profile,
+)
 
 
 LLMFn = Callable[[str], str]
@@ -31,17 +37,8 @@ Also estimate content density: low (mostly filler/chit-chat), medium, or high (d
 Respond with JSON only: {"content_type": "...", "density": "..."}"""
 
 
-VIRALITY_CRITERIA = """
-Virality signals to prioritize (ranked by impact):
-1. HOOK MOMENTS — statements that create immediate curiosity ("The secret is...", "Nobody talks about...", "I was completely wrong about...")
-2. EMOTIONAL PEAKS — genuine surprise, laughter, anger, vulnerability, excitement; raw unscripted reactions
-3. OPINION BOMBS — strong, polarizing or counter-intuitive statements that trigger agree/disagree
-4. REVELATION MOMENTS — surprising facts, stats, or confessions that reframe how the viewer thinks
-5. CONFLICT/TENSION — disagreement, pushback, or a problem being confronted head-on
-6. QUOTABLE ONE-LINERS — a sentence that works as a standalone quote card
-7. STORY PEAKS — the climax or twist of an anecdote; the payoff moment
-8. PRACTICAL VALUE — a concrete tip, hack, or insight the viewer can immediately apply
-"""
+# Kept for docs / external imports; runtime uses build_virality_criteria(profile).
+VIRALITY_CRITERIA = build_virality_criteria(None)
 
 
 HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has studied thousands of viral clips on TikTok, Instagram Reels, and YouTube Shorts. You know exactly what makes viewers stop scrolling, watch to the end, and share.
@@ -50,20 +47,24 @@ HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has st
 
 Content type: {content_type} | Density: {density}
 
+{profile_block}
+
 Your task: identify the most viral-worthy highlights from the transcript.
 
 Rules:
-- Every highlight must open with a strong HOOK — a line that grabs attention within the first 3 seconds
+- Every highlight must open with a strong HOOK — the critical spoken line is the FIRST thing the viewer hears (within the first ~2–3 seconds)
+- Structure is HOOK → claim/peak → payoff. Do NOT put soft setup or throat-clearing before the hook. Any needed context comes AFTER the opening line.
 - HARD duration rule: every clip MUST be between 45 and 90 seconds. Prefer ~60s. Never return a hook-only snippet.
 - Go longer (91-180s) ONLY when a story arc needs full context to land. Never go under 45 seconds.
-- Each clip must be a COMPLETE mini-argument: setup/context → claim or peak → payoff or consequence. A viewer who never saw the full video must still understand the point.
+- Each clip must be a COMPLETE mini-argument that a viewer who never saw the full video still understands.
 - Never cut mid-sentence or mid-thought — end on a completed idea
 - Clips must not overlap significantly with each other
 - Score 0-100 on viral potential (not general quality)
 - {num_clips_instruction}
 - For each highlight, identify the single best "hook_sentence" — the opening line that would make someone stop scrolling
+- Set "hook_start_time" to the transcript timestamp where that hook_sentence begins speaking
+- start_time must be ≤ hook_start_time and close to it (small silence lead-in only). end_time covers the payoff after the hook.
 - Explain in one sentence why this clip is viral ("virality_reason")
-- start_time / end_time must span the FULL self-contained segment, not just the hook line
 - CRITICAL language rule: write title, hook_sentence, and virality_reason entirely in {output_language}. Do NOT use English unless the output language is English. Prefer hooks taken from / closely paraphrasing the transcript.
 
 TITLE SPECIALIST (YouTube Shorts / Reels / TikTok — this is the feed title, not a chapter heading):
@@ -87,7 +88,7 @@ Bad → Good examples (Portuguese):
 {cast_block}
 
 Respond ONLY with valid JSON (no markdown, no explanation):
-{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"score":int,"hook_sentence":"string","virality_reason":"string","attributed_to":"string"}}]}}"""
+{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"hook_start_time":float,"score":int,"hook_sentence":"string","virality_reason":"string","attributed_to":"string"}}]}}"""
 
 
 CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
@@ -189,11 +190,19 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
             if end <= start:
                 continue
 
+        hook_start_raw = item.get("hook_start_time", item.get("hook_time"))
+        hook_start = _coerce_float(hook_start_raw, default=-1.0)
+        if hook_start < 0:
+            hook_start = start
+        # Clamp into the proposed window when the model drifts.
+        hook_start = max(start, min(hook_start, end))
+
         cleaned.append(
             {
                 "title": str(item.get("title") or "Untitled Highlight").strip(),
                 "start_time": start,
                 "end_time": end,
+                "hook_start_time": hook_start,
                 "score": max(0, min(100, _coerce_int(item.get("score"), default=0))),
                 "hook_sentence": str(
                     item.get("hook_sentence") or item.get("hook") or ""
@@ -208,6 +217,84 @@ def _sanitize_highlights(raw_highlights: object, duration: float) -> List[Dict]:
         )
 
     return cleaned
+
+
+def _norm_match_text(text: str) -> str:
+    t = (text or "").casefold()
+    t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def resolve_hook_start(
+    highlight: Dict,
+    segments: List[Dict],
+    *,
+    search_pad: float = 45.0,
+) -> float:
+    """Locate when the hook line begins speaking in the transcript."""
+    start = float(highlight.get("start_time") or 0)
+    end = float(highlight.get("end_time") or start)
+    declared = float(highlight.get("hook_start_time") or -1)
+    if start <= declared <= end:
+        return declared
+
+    hook = _norm_match_text(str(highlight.get("hook_sentence") or ""))
+    if not hook or not segments:
+        return start if declared < 0 else max(start, min(declared, end))
+
+    # Prefer longer prefix matches of the hook sentence against segments near the window.
+    window_lo = max(0.0, start - search_pad)
+    window_hi = end + search_pad
+    hook_tokens = hook.split()
+    best: Optional[tuple] = None  # (score, start)
+
+    for seg in segments:
+        try:
+            ss = float(seg.get("start") or 0)
+            se = float(seg.get("end") or 0)
+        except (TypeError, ValueError):
+            continue
+        if se < window_lo or ss > window_hi:
+            continue
+        text = _norm_match_text(str(seg.get("text") or ""))
+        if not text:
+            continue
+        score = 0
+        if hook in text or text in hook:
+            score = 100 + min(len(text), len(hook))
+        else:
+            # Overlap of leading hook tokens.
+            seg_tokens = text.split()
+            matched = 0
+            for a, b in zip(hook_tokens, seg_tokens):
+                if a == b:
+                    matched += 1
+                else:
+                    break
+            if matched >= 3 or (matched >= 2 and matched >= len(hook_tokens) * 0.5):
+                score = matched * 10
+            else:
+                # Any significant shared span
+                for n in (8, 6, 5, 4):
+                    if len(hook_tokens) < n:
+                        continue
+                    needle = " ".join(hook_tokens[:n])
+                    if needle and needle in text:
+                        score = n * 8
+                        break
+        if score <= 0:
+            continue
+        # Prefer segments closest to the model's proposed start.
+        dist = abs(ss - start)
+        candidate = (score, -dist, ss)
+        if best is None or candidate > best:
+            best = candidate
+
+    if best is not None:
+        return float(best[2])
+    if declared >= 0:
+        return max(0.0, declared)
+    return start
 
 
 _SENTENCE_END_RE = re.compile(r'[.!?…]"?$')
@@ -371,65 +458,83 @@ def expand_highlight_to_context(
     target_seconds: float = TARGET_CLIP_SECONDS,
     max_seconds: float = MAX_CLIP_SECONDS,
     words: Optional[List[Dict]] = None,
+    hook_in_first_seconds: float = DEFAULT_HOOK_IN_FIRST_SECONDS,
 ) -> Dict:
-    """Grow a hook-sized window into a self-contained clip using transcript segments.
+    """Grow a hook window into a self-contained clip — hook stays early.
 
-    Strategy:
-      1. Snap start/end onto covering Whisper segments.
-      2. Expand backward (setup) and forward (payoff) until >= min_seconds,
-         preferring target_seconds and ending on a completed thought.
-      3. Cap at max_seconds.
-      4. Pull start back with a short lead-in (sentence end / silence / pad).
+    Strategy (hook-first):
+      1. Resolve when the hook line begins speaking.
+      2. Snap onto covering Whisper segments starting at the hook.
+      3. Expand FORWARD (payoff) until >= min / toward target; only tiny
+         backward pad for silence lead-in — never bury the hook behind setup.
+      4. Cap at max_seconds by trimming the END (keep hook at the front).
+      5. Enforce hook_start - clip_start ≤ hook_in_first_seconds.
     """
     if not segments:
         return highlight
 
-    start = float(highlight["start_time"])
-    end = float(highlight["end_time"])
     video_duration = float(video_duration or segments[-1]["end"])
     flat_words = words if words is not None else _flatten_words(segments)
+    hook_t = resolve_hook_start(highlight, segments)
+    hook_t = max(0.0, min(hook_t, video_duration))
+    max_hook_delay = max(1.0, min(5.0, float(hook_in_first_seconds)))
 
-    # Indices of segments that overlap the proposed window (or nearest).
-    idxs = [
-        i
-        for i, s in enumerate(segments)
-        if float(s["end"]) > start and float(s["start"]) < end
-    ]
-    if not idxs:
-        idxs = [
-            min(
-                range(len(segments)),
-                key=lambda i: abs(float(segments[i]["start"]) - start),
-            )
-        ]
+    # Segment covering the hook onset (or nearest).
+    hook_idx = None
+    for i, s in enumerate(segments):
+        ss, se = float(s["start"]), float(s["end"])
+        if ss <= hook_t < se or (ss <= hook_t <= se):
+            hook_idx = i
+            break
+    if hook_idx is None:
+        hook_idx = min(
+            range(len(segments)),
+            key=lambda i: abs(float(segments[i]["start"]) - hook_t),
+        )
 
-    lo, hi = idxs[0], idxs[-1]
+    lo = hi = hook_idx
+    # Prefer starting exactly at the hook segment (critical line first).
     start = float(segments[lo]["start"])
+    # If Whisper segment starts well before the matched hook word, snap later
+    # when we have word timings that land near hook_t.
+    if flat_words:
+        for w in flat_words:
+            ws = float(w["start"])
+            we = float(w["end"])
+            if ws <= hook_t <= we + 0.05:
+                # Don't start mid-word earlier than needed.
+                if ws >= start - 0.01 and hook_t - ws <= max_hook_delay:
+                    start = ws
+                break
     end = float(segments[hi]["end"])
+    # Ensure end is after hook.
+    if end <= start:
+        end = min(video_duration, start + min_seconds)
 
     def dur() -> float:
         return end - start
 
-    # Expand until we hit the minimum (and keep going toward target when cheap).
+    # Expand FORWARD first until minimum / toward target.
     guard = 0
     while dur() < min_seconds and guard < len(segments) * 2:
         guard += 1
-        can_back = lo > 0
         can_fwd = hi < len(segments) - 1
-        if not can_back and not can_fwd:
+        can_back = lo > 0
+        if not can_fwd and not can_back:
             break
-
-        # Prefer padding setup first (context before the hook), then payoff.
-        need = min_seconds - dur()
-        grow_back = can_back and (not can_fwd or need > 0 and (dur() < target_seconds * 0.55 or guard % 2 == 1))
-        if grow_back:
-            lo -= 1
-            start = float(segments[lo]["start"])
-        elif can_fwd:
+        if can_fwd:
             hi += 1
             end = float(segments[hi]["end"])
+            continue
+        # Only grow back if still under min AND hook would stay early.
+        prev_start = float(segments[lo - 1]["start"])
+        if hook_t - prev_start <= max_hook_delay:
+            lo -= 1
+            start = prev_start
+        else:
+            break
 
-    # Keep extending forward a bit to land on a finished sentence / target length.
+    # Keep extending forward to land on a finished sentence / target length.
     while hi < len(segments) - 1 and dur() < target_seconds:
         next_end = float(segments[hi + 1]["end"])
         if next_end - start > max_seconds:
@@ -439,34 +544,55 @@ def expand_highlight_to_context(
         if _segment_ends_thought(str(segments[hi].get("text") or "")) and dur() >= min_seconds:
             break
 
-    # Trim leading fragments that clearly continue a previous sentence
-    # (Whisper often starts a cue mid-thought with a lowercase word).
+    # Trim leading fragments that are clearly pre-hook setup shoved in by
+    # segment snap (lowercase continuation, or speech before hook_t).
+    while lo < hi and float(segments[lo]["end"]) <= hook_t + 0.05:
+        next_start = float(segments[lo + 1]["start"])
+        # Keep a segment that contains the hook.
+        if float(segments[lo]["start"]) <= hook_t < float(segments[lo]["end"]):
+            break
+        if hook_t - next_start > max_hook_delay:
+            break
+        # Drop pure pre-hook segments when we still have room after.
+        if next_start <= hook_t and dur() - (next_start - start) >= min_seconds * 0.85:
+            lo += 1
+            start = next_start
+        else:
+            break
+
     while lo < hi and dur() - (float(segments[lo]["end"]) - start) >= min_seconds:
         text = str(segments[lo].get("text") or "").lstrip()
         if text and text[0].islower() and not text[0].isdigit():
+            # Don't drop the segment that holds the hook.
+            if float(segments[lo]["start"]) <= hook_t < float(segments[lo]["end"]):
+                break
             lo += 1
             start = float(segments[lo]["start"])
         else:
             break
 
-    # Trim if we overshot the max by pulling the nearer edge inward.
+    # Cap max length by trimming the END — keep the hook at the front.
     if dur() > max_seconds:
-        # Keep the original hook roughly centered in the window.
-        hook_mid = (float(highlight["start_time"]) + float(highlight["end_time"])) / 2.0
-        half = max_seconds / 2.0
-        start = max(0.0, hook_mid - half)
         end = min(video_duration, start + max_seconds)
-        # Re-snap to segments.
         covering = [
             i
             for i, s in enumerate(segments)
             if float(s["end"]) > start and float(s["start"]) < end
         ]
         if covering:
-            start = float(segments[covering[0]]["start"])
-            end = float(segments[covering[-1]]["end"])
+            # Keep lo (hook side); pull hi inward.
+            hi = covering[-1]
+            end = float(segments[hi]["end"])
             if end - start > max_seconds:
                 end = start + max_seconds
+            # Prefer ending on a completed thought inside the cap.
+            while hi > lo:
+                if _segment_ends_thought(str(segments[hi].get("text") or "")):
+                    end = float(segments[hi]["end"])
+                    if end - start <= max_seconds and end - start >= min_seconds * 0.9:
+                        break
+                hi -= 1
+                end = float(segments[hi]["end"])
 
     speech_onset = start
     start = apply_start_lead_in(
@@ -477,6 +603,14 @@ def expand_highlight_to_context(
         video_duration,
         max_seconds=max_seconds,
     )
+    # Lead-in must not push the hook past the hard delay.
+    if hook_t - start > max_hook_delay:
+        start = max(0.0, hook_t - max_hook_delay)
+        start = _snap_start_off_mid_word(start, flat_words, speech_onset)
+        # If snap pulled us too early again, land at speech onset.
+        if hook_t - start > max_hook_delay:
+            start = max(speech_onset, hook_t - max_hook_delay)
+
     lead = speech_onset - start
     if lead > 0.15:
         print(
@@ -485,18 +619,33 @@ def expand_highlight_to_context(
             flush=True,
         )
 
+    # Final hard clamp: hook must stay in the opening window.
+    if hook_t - start > max_hook_delay:
+        old = start
+        start = max(0.0, hook_t - max_hook_delay)
+        print(
+            f"[highlights] hook-first realign {old:.2f}s → {start:.2f}s "
+            f"(hook at {hook_t:.2f}s, max delay {max_hook_delay:.1f}s)",
+            flush=True,
+        )
+
     start = max(0.0, min(start, video_duration))
     end = max(start + 0.5, min(end, video_duration))
+    # If clamping start ate duration, try to extend end.
+    if end - start < min_seconds and end < video_duration:
+        end = min(video_duration, start + max(min_seconds, target_seconds * 0.9))
 
     out = dict(highlight)
     out["start_time"] = round(start, 3)
     out["end_time"] = round(end, 3)
+    out["hook_start_time"] = round(hook_t, 3)
     return out
 
 
 def expand_highlights_to_context(
     highlights: List[Dict],
     transcript: Dict,
+    hook_in_first_seconds: float = DEFAULT_HOOK_IN_FIRST_SECONDS,
 ) -> List[Dict]:
     segments = transcript.get("segments") or []
     duration = float(transcript.get("duration") or (segments[-1]["end"] if segments else 0))
@@ -504,8 +653,15 @@ def expand_highlights_to_context(
     expanded: List[Dict] = []
     for h in highlights:
         before = float(h["end_time"]) - float(h["start_time"])
-        e = expand_highlight_to_context(h, segments, duration, words=words)
+        e = expand_highlight_to_context(
+            h,
+            segments,
+            duration,
+            words=words,
+            hook_in_first_seconds=hook_in_first_seconds,
+        )
         after = float(e["end_time"]) - float(e["start_time"])
+        hook_delay = float(e.get("hook_start_time", e["start_time"])) - float(e["start_time"])
         if after < MIN_CLIP_SECONDS - 0.5:
             print(
                 f"[highlights] drop too-short after expand: {before:.1f}s → {after:.1f}s "
@@ -516,7 +672,7 @@ def expand_highlights_to_context(
         if after - before > 1.0:
             print(
                 f"[highlights] expanded clip {before:.1f}s → {after:.1f}s "
-                f"({e.get('title', '')!r})",
+                f"hook+{hook_delay:.1f}s ({e.get('title', '')!r})",
                 flush=True,
             )
         expanded.append(e)
@@ -605,18 +761,22 @@ def call_highlight_api(
     llm_fn: LLMFn = call_muapi_llm,
     output_language: str = "Brazilian Portuguese (pt-BR)",
     cast_block: str = "",
+    virality_profile: Optional[Dict] = None,
 ) -> Dict:
+    profile = normalize_virality_profile(virality_profile)
     system = HIGHLIGHT_SYSTEM_PROMPT.format(
-        virality_criteria=VIRALITY_CRITERIA,
+        virality_criteria=build_virality_criteria(profile),
         content_type=content_info.get("content_type", "other"),
         density=content_info.get("density", "medium"),
         num_clips_instruction=_num_clips_instruction(num_clips, duration, is_chunk),
         output_language=output_language,
         cast_block=cast_block or "",
+        profile_block=build_profile_prompt_block(profile),
     )
     base_prompt = f"{system}\n\nTranscript:\n{transcript_text}"
     prompt = base_prompt
     last_error = "unknown"
+    hook_s = profile["hook_in_first_seconds"]
 
     for attempt in range(1, MAX_HIGHLIGHT_API_ATTEMPTS + 1):
         raw = llm_fn(prompt)
@@ -651,10 +811,11 @@ def call_highlight_api(
             prompt = (
                 base_prompt
                 + "\n\nIMPORTANT: Return ONLY valid JSON with a top-level 'highlights' array."
-                + " Each item must include: title, start_time, end_time, score, hook_sentence, virality_reason, attributed_to."
+                + " Each item must include: title, start_time, end_time, hook_start_time, score, hook_sentence, virality_reason, attributed_to."
                 + f" Timestamps must be relative to THIS transcript window (0 to {duration:.1f} seconds)."
                 + f" EVERY clip duration (end_time - start_time) MUST be {int(MIN_CLIP_SECONDS)}–90 seconds"
-                + " and cover setup + claim + payoff — never a single hook sentence."
+                + " and cover hook + claim + payoff — never a single hook sentence."
+                + f" hook_start_time - start_time MUST be ≤ {hook_s:.1f} seconds (hook opens the clip)."
                 + f" title, hook_sentence, and virality_reason MUST be written in {output_language}."
                 + " Titles must be viral Shorts titles (claim/curiosity), NEVER 'Name: generic topic'."
                 + " Put the speaker in attributed_to, not as a boring title prefix."
@@ -713,6 +874,7 @@ def get_highlights(
     llm_fn: Optional[LLMFn] = None,
     output_language: Optional[str] = None,
     speakers: Optional[List[Dict]] = None,
+    virality_profile: Optional[Dict] = None,
 ) -> Dict:
     """Main entry point — returns {highlights: [...]} sorted by score.
 
@@ -721,6 +883,7 @@ def get_highlights(
     `output_language` controls the language of title / hook / virality_reason.
     Pass ``num_clips=None`` to let the model decide how many topics to return.
     `speakers` — named cast roster for title attribution (from cast.py).
+    `virality_profile` — per-channel editor taste (see virality.py).
     """
     from .cast import cast_context_block
     from .config import language_label, resolve_content_language
@@ -731,12 +894,24 @@ def get_highlights(
     duration = transcript.get("duration", 0)
     cast_speakers = speakers or transcript.get("speakers") or []
     cast_block = cast_context_block(cast_speakers) if cast_speakers else ""
+    profile = normalize_virality_profile(virality_profile)
+    hook_s = float(profile["hook_in_first_seconds"])
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
     print(
         f"[highlights] content={content_info.get('content_type')} "
         f"density={content_info.get('density')} duration={duration:.0f}s "
-        f"output_lang={lang_code} speakers={len(cast_speakers)}",
+        f"output_lang={lang_code} speakers={len(cast_speakers)} "
+        f"hook_first≤{hook_s:.1f}s",
         flush=True,
+    )
+
+    api_kwargs = dict(
+        content_info=content_info,
+        num_clips=num_clips,
+        llm_fn=llm_fn,
+        output_language=lang_label,
+        cast_block=cast_block,
+        virality_profile=profile,
     )
 
     if duration >= LONG_VIDEO_THRESHOLD:
@@ -750,32 +925,32 @@ def get_highlights(
             print(f"[highlights] chunk {i + 1}/{len(chunks)} (offset {offset:.0f}s)", flush=True)
             result = call_highlight_api(
                 text,
-                content_info,
-                chunk["duration"],
-                num_clips=num_clips,
+                duration=chunk["duration"],
                 is_chunk=True,
-                llm_fn=llm_fn,
-                output_language=lang_label,
-                cast_block=cast_block,
+                **api_kwargs,
             )
             for h in result.get("highlights", []):
                 h["start_time"] = float(h["start_time"]) + offset
                 h["end_time"] = float(h["end_time"]) + offset
+                if "hook_start_time" in h:
+                    h["hook_start_time"] = float(h["hook_start_time"]) + offset
                 all_highlights.append(h)
-        highlights = expand_highlights_to_context(all_highlights, transcript)
+        highlights = expand_highlights_to_context(
+            all_highlights, transcript, hook_in_first_seconds=hook_s
+        )
         highlights = dedupe_highlights(highlights)
     else:
         text = build_transcript_text(transcript)
         result = call_highlight_api(
             text,
-            content_info,
-            duration,
-            num_clips=num_clips,
-            llm_fn=llm_fn,
-            output_language=lang_label,
-            cast_block=cast_block,
+            duration=duration,
+            **api_kwargs,
         )
-        highlights = expand_highlights_to_context(result.get("highlights", []), transcript)
+        highlights = expand_highlights_to_context(
+            result.get("highlights", []),
+            transcript,
+            hook_in_first_seconds=hook_s,
+        )
         highlights = dedupe_highlights(highlights)
 
     if not highlights:

@@ -9,6 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from shorts_generator.virality import (
+    VIRALITY_SIGNALS,
+    default_virality_profile,
+    normalize_virality_profile,
+    profile_is_customized,
+)
+
 _PLACEHOLDER_RE = re.compile(
     r"^(your[_-].*[_-]here|changeme|xxx+|replace.?me|<.*>|todo|fix)$",
     re.IGNORECASE,
@@ -87,16 +94,24 @@ class ProjectStore:
                 "client_id": "",
                 "client_secret": "",
                 "refresh_token": "",
-                "privacy_status": "private",
+                "privacy_status": "public",
                 "channel_title": "",
                 "channel_id": "",
             },
+            "virality_profile": default_virality_profile(),
         }
         with _lock:
             self._write(data)
         return self._public(data)
 
-    def update(self, project_id: str, *, name: Optional[str] = None, youtube: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def update(
+        self,
+        project_id: str,
+        *,
+        name: Optional[str] = None,
+        youtube: Optional[Dict[str, Any]] = None,
+        virality_profile: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         with _lock:
             data = self._read(project_id)
             if not data:
@@ -124,14 +139,22 @@ class ProjectStore:
                     if key in ("client_secret", "refresh_token") and not str(val).strip():
                         continue
                     yt[key] = str(val).strip()
-                privacy = (yt.get("privacy_status") or "private").lower()
+                privacy = (yt.get("privacy_status") or "public").lower()
                 if privacy not in ("private", "unlisted", "public"):
-                    privacy = "private"
+                    privacy = "public"
                 yt["privacy_status"] = privacy
                 data["youtube"] = yt
+            if virality_profile is not None:
+                data["virality_profile"] = normalize_virality_profile(virality_profile)
             data["updated_at"] = _now()
             self._write(data)
             return self._public(data)
+
+    def virality_profile(self, project_id: str) -> Dict[str, Any]:
+        data = self.get(project_id)
+        if not data:
+            return default_virality_profile()
+        return normalize_virality_profile(data.get("virality_profile"))
 
     def set_youtube_tokens(
         self,
@@ -181,7 +204,7 @@ class ProjectStore:
             "client_id": str(yt.get("client_id") or "").strip(),
             "client_secret": str(yt.get("client_secret") or "").strip(),
             "refresh_token": str(yt.get("refresh_token") or "").strip(),
-            "privacy_status": str(yt.get("privacy_status") or "private").strip().lower(),
+            "privacy_status": str(yt.get("privacy_status") or "public").strip().lower(),
         }
 
     def _read(self, project_id: str) -> Optional[Dict[str, Any]]:
@@ -194,6 +217,9 @@ class ProjectStore:
             return None
         data.setdefault("id", project_id)
         data.setdefault("youtube", {})
+        data["virality_profile"] = normalize_virality_profile(
+            data.get("virality_profile")
+        )
         return data
 
     def _write(self, data: Dict[str, Any]) -> None:
@@ -205,6 +231,7 @@ class ProjectStore:
         client_id = str(yt.get("client_id") or "")
         client_secret = str(yt.get("client_secret") or "")
         refresh = str(yt.get("refresh_token") or "")
+        profile = normalize_virality_profile(data.get("virality_profile"))
         return {
             "id": data.get("id"),
             "name": data.get("name") or "Sem nome",
@@ -216,9 +243,12 @@ class ProjectStore:
                 "client_secret_masked": _mask(client_secret) if _is_real(client_secret) else None,
                 "refresh_token_set": _is_real(refresh),
                 "refresh_token_masked": _mask(refresh) if _is_real(refresh) else None,
-                "privacy_status": (yt.get("privacy_status") or "private"),
+                "privacy_status": (yt.get("privacy_status") or "public"),
                 "channel_title": yt.get("channel_title") or "",
                 "channel_id": yt.get("channel_id") or "",
                 "configured": youtube_ready(yt),
             },
+            "virality_profile": profile,
+            "virality_customized": profile_is_customized(profile),
+            "virality_signals": VIRALITY_SIGNALS,
         }
