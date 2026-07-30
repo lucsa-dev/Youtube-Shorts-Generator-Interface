@@ -59,6 +59,89 @@ def _cut_subclip(source_path: str, start: float, end: float, out_path: str) -> s
     return out_path
 
 
+def _probe_video_size(path: str) -> Tuple[int, int]:
+    """Return (width, height) of the first video stream via ffprobe."""
+    import json
+
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height",
+        "-of", "json",
+        path,
+    ]
+    proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    streams = (json.loads(proc.stdout) or {}).get("streams") or []
+    if not streams:
+        raise RuntimeError(f"sem stream de vídeo em {path}")
+    w = int(streams[0].get("width") or 0)
+    h = int(streams[0].get("height") or 0)
+    if w < 2 or h < 2:
+        raise RuntimeError(f"dimensões inválidas em {path}: {w}x{h}")
+    return w - (w % 2), h - (h % 2)
+
+
+def inject_thumbnail_first_frame(video_path: str, image_path: str) -> bool:
+    """Overlay ``image_path`` onto frame 0 of ``video_path`` (in place).
+
+    Platforms that grab the first frame as a poster then show the custom
+    thumbnail. Duration/audio are unchanged — only frame 0 is replaced.
+    """
+    if not video_path or not image_path:
+        return False
+    if not os.path.isfile(video_path) or not os.path.isfile(image_path):
+        return False
+    if os.path.getsize(image_path) <= 0:
+        return False
+
+    try:
+        w, h = _probe_video_size(video_path)
+    except (subprocess.SubprocessError, OSError, RuntimeError, ValueError, TypeError) as exc:
+        print(f"[clip/local] thumb frame probe failed: {exc}", flush=True)
+        return False
+
+    tmp_out = video_path + ".thumbframe.mp4"
+    # scale+pad image to exact video size, overlay only on n==0
+    filter_complex = (
+        f"[1:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p[im];"
+        f"[0:v][im]overlay=0:0:enable='eq(n\\,0)'[v]"
+    )
+
+    def _run(audio_args: list) -> None:
+        cmd = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-i", video_path,
+            "-i", image_path,
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "0:a?",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            *audio_args,
+            tmp_out,
+        ]
+        subprocess.run(cmd, check=True)
+
+    try:
+        try:
+            _run(["-c:a", "copy"])
+        except subprocess.SubprocessError:
+            _run(["-c:a", "aac", "-b:a", "128k"])
+        if not os.path.isfile(tmp_out) or os.path.getsize(tmp_out) <= 0:
+            return False
+        os.replace(tmp_out, video_path)
+        return True
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"[clip/local] thumb frame inject failed: {exc}", flush=True)
+        try:
+            if os.path.exists(tmp_out):
+                os.remove(tmp_out)
+        except OSError:
+            pass
+        return False
+
+
 def _reframe_vertical(in_path: str, out_path: str, aspect_ratio: str) -> str:
     """Crop the cut clip to the target aspect ratio, tracking faces if possible."""
     try:
@@ -216,9 +299,29 @@ def crop_highlights_local(
                     style,
                     out_path=out_path,
                 )
+            # If a custom/AI thumbnail was prepared ahead of render, burn it
+            # into frame 0 so the vertical clip opens on that poster.
+            thumb_frame = (
+                h.get("thumbnail_frame")
+                or h.get("thumbnail_path")
+                or ""
+            )
+            injected = False
+            if thumb_frame and os.path.isfile(str(thumb_frame)):
+                injected = inject_thumbnail_first_frame(out_path, str(thumb_frame))
+                if injected:
+                    print(
+                        f"[clip/local] thumbnail → 1º frame: {thumb_frame}",
+                        flush=True,
+                    )
             short = {**h, "clip_url": out_path}
             if style:
                 short["caption_style"] = style
+            if injected:
+                short["thumbnail_frame_injected"] = True
+            # Don't persist internal path hints on the short payload
+            short.pop("thumbnail_frame", None)
+            short.pop("thumbnail_path", None)
         except Exception as e:
             print(f"[clip/local] {i} failed: {e}", flush=True)
             short = {**h, "clip_url": None, "error": str(e)}

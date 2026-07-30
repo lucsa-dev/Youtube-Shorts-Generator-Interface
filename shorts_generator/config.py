@@ -24,6 +24,33 @@ POLL_TIMEOUT_SECONDS = _env_float("MUAPI_POLL_TIMEOUT", 600.0)
 # Local-mode (--mode local) settings — only consulted when running offline.
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# Image thumbs: mini + medium quality is ~10× cheaper than legacy gpt-image-1 high.
+OPENAI_IMAGE_MODEL = (
+    os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1-mini").strip().strip("'\"")
+    or "gpt-image-1-mini"
+)
+_OPENAI_IMAGE_QUALITY = (
+    os.getenv("OPENAI_IMAGE_QUALITY", "medium").strip().strip("'\"").lower() or "medium"
+)
+OPENAI_IMAGE_QUALITY = (
+    _OPENAI_IMAGE_QUALITY if _OPENAI_IMAGE_QUALITY in ("low", "medium", "high") else "medium"
+)
+_OPENAI_IMAGE_FIDELITY = (
+    os.getenv("OPENAI_IMAGE_FIDELITY", "low").strip().strip("'\"").lower() or "low"
+)
+# low | high | none (omit param — cheapest when editing with face refs)
+OPENAI_IMAGE_FIDELITY = (
+    _OPENAI_IMAGE_FIDELITY
+    if _OPENAI_IMAGE_FIDELITY in ("low", "high", "none", "off")
+    else "low"
+)
+# hybrid = IA gera cena/rostos sem texto; tipografia + moldura em PIL (recomendado)
+THUMBNAIL_HYBRID = os.getenv("THUMBNAIL_HYBRID", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
