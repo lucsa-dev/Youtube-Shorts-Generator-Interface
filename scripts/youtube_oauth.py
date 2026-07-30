@@ -68,7 +68,7 @@ def main() -> int:
     print(f"Refresh Token:  {tokens['refresh_token']}")
     if tokens.get("channel_title"):
         print(f"Canal:          {tokens['channel_title']}")
-    print("\nPrivacidade sugerida: private")
+    print("\nPrivacidade sugerida: public")
     return 0
 
 

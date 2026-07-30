@@ -7,11 +7,15 @@ import unicodedata
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-# upload + thumbnails.set (force-ssl). Existing tokens with only .upload still
-# upload video; thumbnail needs re-auth with force-ssl.
+# OAuth consent scopes (new auth). force-ssl ≈ youtube and covers
+# videos.insert, videos.update, thumbnails.set and channels.list.
+# youtube.upload alone is NOT enough for update/thumbnail — reconnect
+# if the refresh token was minted with a narrower set.
+# Do NOT pass these into Credentials() used for refresh — Google returns
+# invalid_scope if the refresh token was minted with a narrower set.
 SCOPES = [
-    "https://www.googleapis.com/auth/youtube.upload",
     "https://www.googleapis.com/auth/youtube.force-ssl",
+    "https://www.googleapis.com/auth/youtube.upload",
 ]
 TOKEN_URI = "https://oauth2.googleapis.com/token"
 MAX_TITLE_LEN = 100
@@ -116,14 +120,14 @@ def _normalize_creds(credentials: Optional[Dict[str, Any]] = None) -> Dict[str, 
             "client_secret": str(credentials.get("client_secret") or "").strip(),
             "refresh_token": str(credentials.get("refresh_token") or "").strip(),
             "privacy_status": str(
-                credentials.get("privacy_status") or "private"
+                credentials.get("privacy_status") or "public"
             ).strip().lower(),
         }
     return {
         "client_id": _env("YOUTUBE_CLIENT_ID"),
         "client_secret": _env("YOUTUBE_CLIENT_SECRET"),
         "refresh_token": _env("YOUTUBE_REFRESH_TOKEN"),
-        "privacy_status": (_env("YOUTUBE_PRIVACY_STATUS") or "private").lower(),
+        "privacy_status": (_env("YOUTUBE_PRIVACY_STATUS") or "public").lower(),
     }
 
 
@@ -137,9 +141,9 @@ def credentials_configured(credentials: Optional[Dict[str, Any]] = None) -> bool
 
 
 def privacy_status(credentials: Optional[Dict[str, Any]] = None) -> str:
-    raw = _normalize_creds(credentials).get("privacy_status") or "private"
+    raw = _normalize_creds(credentials).get("privacy_status") or "public"
     if raw not in ("private", "unlisted", "public"):
-        return "private"
+        return "public"
     return raw
 
 
@@ -152,14 +156,40 @@ def _credentials(credentials: Optional[Dict[str, Any]] = None):
             "Credenciais YouTube ausentes. Configure o canal no projeto "
             "(Client ID, Client Secret e Refresh Token)."
         )
+    # scopes=None: refresh keeps the originally granted scopes on the token.
     return Credentials(
         token=None,
         refresh_token=creds["refresh_token"],
         token_uri=TOKEN_URI,
         client_id=creds["client_id"],
         client_secret=creds["client_secret"],
-        scopes=SCOPES,
+        scopes=None,
     )
+
+
+def _is_scope_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(
+        needle in msg
+        for needle in (
+            "invalid_scope",
+            "insufficient authentication scopes",
+            "insufficientpermissions",
+            "insufficient permission",
+            "access_denied",
+        )
+    )
+
+
+def _scope_reconnect_error(exc: BaseException) -> RuntimeError:
+    err = RuntimeError(
+        "Token YouTube sem permissão suficiente (escopos desatualizados). "
+        "Em Projetos → Canal → Config, clique em Conectar YouTube "
+        "(aceite todas as permissões). Se o Google não pedir de novo, "
+        "revogue o app em https://myaccount.google.com/permissions e reconecte."
+    )
+    err.__cause__ = exc
+    return err
 
 
 def _youtube_service(credentials: Optional[Dict[str, Any]] = None):
@@ -656,6 +686,80 @@ def set_thumbnail(
         return False
 
 
+def update_video_metadata(
+    video_id: str,
+    *,
+    title: str,
+    description: str = "",
+    tags: Optional[List[str]] = None,
+    privacy: Optional[str] = None,
+    category_id: str = "22",
+    default_language: Optional[str] = None,
+    default_audio_language: Optional[str] = None,
+    thumbnail_path: Optional[str | Path] = None,
+    credentials: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Update snippet/status (and optional thumbnail) on an existing YouTube video."""
+    vid = (video_id or "").strip()
+    if not vid:
+        raise ValueError("video_id YouTube ausente para atualização")
+
+    status = (privacy or privacy_status(credentials)).lower()
+    if status not in ("private", "unlisted", "public"):
+        status = "public"
+
+    tag_list = [t.strip() for t in (tags or ["Shorts"]) if t and str(t).strip()]
+    if "Shorts" not in tag_list:
+        tag_list.append("Shorts")
+
+    snippet: Dict[str, Any] = {
+        "title": _truncate_title(title),
+        "description": _truncate_description(description or "#Shorts"),
+        "tags": tag_list,
+        "categoryId": str(category_id or "22"),
+    }
+    lang = (default_language or "").strip()
+    audio_lang = (default_audio_language or "").strip() or lang
+    if lang:
+        snippet["defaultLanguage"] = lang
+    if audio_lang:
+        snippet["defaultAudioLanguage"] = audio_lang
+
+    body = {
+        "id": vid,
+        "snippet": snippet,
+        "status": {
+            "privacyStatus": status,
+            "selfDeclaredMadeForKids": False,
+        },
+    }
+
+    try:
+        youtube = _youtube_service(credentials)
+        youtube.videos().update(part="snippet,status", body=body).execute()
+    except Exception as exc:
+        if _is_scope_error(exc):
+            raise _scope_reconnect_error(exc)
+        raise
+
+    thumb_ok = False
+    if thumbnail_path:
+        thumb_ok = set_thumbnail(vid, thumbnail_path, credentials=credentials)
+
+    return {
+        "video_id": vid,
+        "url": f"https://youtu.be/{vid}",
+        "title": body["snippet"]["title"],
+        "description": body["snippet"]["description"],
+        "tags": tag_list,
+        "category_id": body["snippet"]["categoryId"],
+        "default_language": lang or "",
+        "privacy_status": status,
+        "thumbnail_set": thumb_ok,
+        "updated": True,
+    }
+
+
 def upload_video(
     file_path: str | Path,
     *,
@@ -678,7 +782,7 @@ def upload_video(
 
     status = (privacy or privacy_status(credentials)).lower()
     if status not in ("private", "unlisted", "public"):
-        status = "private"
+        status = "public"
 
     tag_list = [t.strip() for t in (tags or ["Shorts"]) if t and str(t).strip()]
     if "Shorts" not in tag_list:
@@ -705,13 +809,20 @@ def upload_video(
         },
     }
 
-    youtube = _youtube_service(credentials)
-    media = MediaFileUpload(str(path), mimetype="video/mp4", resumable=True, chunksize=8 * 1024 * 1024)
-    request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
+    try:
+        youtube = _youtube_service(credentials)
+        media = MediaFileUpload(
+            str(path), mimetype="video/mp4", resumable=True, chunksize=8 * 1024 * 1024
+        )
+        request = youtube.videos().insert(part="snippet,status", body=body, media_body=media)
 
-    response = None
-    while response is None:
-        _status, response = request.next_chunk()
+        response = None
+        while response is None:
+            _status, response = request.next_chunk()
+    except Exception as exc:
+        if _is_scope_error(exc):
+            raise _scope_reconnect_error(exc)
+        raise
 
     video_id = response.get("id")
     if not video_id:
