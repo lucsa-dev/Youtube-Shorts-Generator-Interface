@@ -1,11 +1,6 @@
 """Local LLM backend — OpenAI or Gemini, selected by LLM_PROVIDER."""
-from ..config import (
-    GEMINI_MODEL,
-    LLM_PROVIDER,
-    OPENAI_MODEL,
-    require_gemini_key,
-    require_openai_key,
-)
+from .. import config as cfg
+from ..config import require_gemini_key, require_openai_key
 
 
 def call_openai_llm(prompt: str) -> str:
@@ -19,17 +14,33 @@ def call_openai_llm(prompt: str) -> str:
         ) from e
 
     client = OpenAI(api_key=require_openai_key())
+    model = (cfg.OPENAI_MODEL or "gpt-4o-mini").strip().strip("'\"")
     kwargs = {
-        "model": OPENAI_MODEL,
-        "temperature": 0.4,
-        "max_tokens": 8192,
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
     }
     # Prefer JSON object mode when the prompt asks for JSON — reduces
     # markdown fences / commentary that break highlight parsing.
     if "JSON" in prompt or "json" in prompt:
         kwargs["response_format"] = {"type": "json_object"}
-    response = client.chat.completions.create(**kwargs)
+
+    # Newer OpenAI models (gpt-5 / o-series) reject max_tokens and often
+    # only accept the default temperature — fall back accordingly.
+    try:
+        response = client.chat.completions.create(
+            **kwargs, temperature=0.4, max_completion_tokens=8192
+        )
+    except Exception as first:
+        msg = str(first).lower()
+        if "temperature" in msg or "max_tokens" in msg or "max_completion_tokens" in msg:
+            try:
+                response = client.chat.completions.create(
+                    **kwargs, max_completion_tokens=8192
+                )
+            except Exception:
+                response = client.chat.completions.create(**kwargs)
+        else:
+            raise
     return response.choices[0].message.content or ""
 
 
@@ -45,7 +56,7 @@ def call_gemini_llm(prompt: str) -> str:
 
     client = genai.Client(api_key=require_gemini_key())
     response = client.models.generate_content(
-        model=GEMINI_MODEL,
+        model=cfg.GEMINI_MODEL,
         contents=prompt,
         config={
             "temperature": 0.2,
@@ -58,7 +69,7 @@ def call_gemini_llm(prompt: str) -> str:
 
 def call_local_llm(prompt: str) -> str:
     """Dispatch to the configured local LLM provider."""
-    provider = (LLM_PROVIDER or "openai").strip().lower()
+    provider = (cfg.LLM_PROVIDER or "openai").strip().lower()
     if provider == "openai":
         return call_openai_llm(prompt)
     if provider == "gemini":
