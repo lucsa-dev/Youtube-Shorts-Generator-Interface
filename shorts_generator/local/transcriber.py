@@ -133,6 +133,11 @@ def _segment_words(segment) -> List[Dict]:
     return words
 
 
+def _fmt_mmss(seconds: float) -> str:
+    total = max(0, int(seconds))
+    return f"{total // 60}:{total % 60:02d}"
+
+
 def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
     """Run faster-whisper on a local file path, caching the result as JSON."""
     json_cache = _transcript_cache_path(media_path)
@@ -177,11 +182,16 @@ def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
 
     device = _resolve_device()
     compute_type = "float16" if device == "cuda" else "int8"
-    print(f"[transcribe/local] faster-whisper model={LOCAL_WHISPER_MODEL} device={device}", flush=True)
+    print(
+        f"[transcribe/local] loading faster-whisper model={LOCAL_WHISPER_MODEL} "
+        f"device={device} compute={compute_type}…",
+        flush=True,
+    )
 
     from ..config import LOCAL_WHISPER_VAD_FILTER, LOCAL_WHISPER_VAD_PARAMETERS
 
     model = WhisperModel(LOCAL_WHISPER_MODEL, device=device, compute_type=compute_type)
+    print(f"[transcribe/local] model ready — starting transcription of {media_path}", flush=True)
 
     transcribe_kwargs = {
         "audio": media_path,
@@ -197,24 +207,51 @@ def transcribe_local(media_path: str, language: Optional[str] = None) -> Dict:
         transcribe_kwargs["vad_filter"] = False
 
     segments_iter, info = model.transcribe(**transcribe_kwargs)
+    total_duration = float(getattr(info, "duration", 0.0) or 0.0)
+    detected_lang = getattr(info, "language", None) or language or "auto"
+    lang_prob = getattr(info, "language_probability", None)
+    lang_extra = f" (p={lang_prob:.0%})" if isinstance(lang_prob, float) else ""
+    print(
+        f"[transcribe/local] audio={_fmt_mmss(total_duration)} "
+        f"({total_duration:.0f}s) language={detected_lang}{lang_extra}",
+        flush=True,
+    )
 
     segments = []
     all_words: List[Dict] = []
+    last_logged_pct = -1
     for s in segments_iter:
         words = _segment_words(s)
         all_words.extend(words)
+        text = (s.text or "").strip()
         seg = {
             "start": float(s.start),
             "end": float(s.end),
-            "text": (s.text or "").strip(),
+            "text": text,
         }
         if words:
             seg["words"] = words
         segments.append(seg)
 
-    duration = float(getattr(info, "duration", 0.0)) or (segments[-1]["end"] if segments else 0.0)
+        end = float(s.end)
+        pct = int((end / total_duration) * 100) if total_duration > 0 else 0
+        pct = min(pct, 100)
+        # Log on first segment and whenever progress advances by ≥1%.
+        if last_logged_pct < 0 or pct >= last_logged_pct + 1:
+            preview = text.replace("\n", " ")
+            if len(preview) > 90:
+                preview = preview[:89] + "…"
+            print(
+                f"[transcribe/local] {pct:3d}% "
+                f"({_fmt_mmss(end)}/{_fmt_mmss(total_duration)}) "
+                f"seg#{len(segments)} | {preview or '(silêncio)'}",
+                flush=True,
+            )
+            last_logged_pct = pct
+
+    duration = total_duration or (segments[-1]["end"] if segments else 0.0)
     print(
-        f"[transcribe/local] {len(segments)} segments, {len(all_words)} words, "
+        f"[transcribe/local] done — {len(segments)} segments, {len(all_words)} words, "
         f"{duration:.0f}s of audio",
         flush=True,
     )
