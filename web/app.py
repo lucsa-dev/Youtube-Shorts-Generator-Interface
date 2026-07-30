@@ -94,6 +94,7 @@ class ProjectYoutubeUpdate(BaseModel):
 class ProjectUpdate(BaseModel):
     name: Optional[str] = Field(default=None, max_length=120)
     youtube: Optional[ProjectYoutubeUpdate] = None
+    virality_profile: Optional[Dict[str, Any]] = None
 
 
 class YoutubeUploadBody(BaseModel):
@@ -273,6 +274,25 @@ def _write_config(updates: Dict[str, str]) -> None:
     cfg.POLL_TIMEOUT_SECONDS = _env_float("MUAPI_POLL_TIMEOUT", 600.0)
     cfg.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
     cfg.OPENAI_MODEL = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
+    cfg.OPENAI_IMAGE_MODEL = (
+        os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1-mini"
+    ).strip().strip("'\"") or "gpt-image-1-mini"
+    _q = (
+        os.getenv("OPENAI_IMAGE_QUALITY") or "medium"
+    ).strip().strip("'\"").lower() or "medium"
+    cfg.OPENAI_IMAGE_QUALITY = _q if _q in ("low", "medium", "high") else "medium"
+    _f = (
+        os.getenv("OPENAI_IMAGE_FIDELITY") or "low"
+    ).strip().strip("'\"").lower() or "low"
+    cfg.OPENAI_IMAGE_FIDELITY = (
+        _f if _f in ("low", "high", "none", "off") else "low"
+    )
+    cfg.THUMBNAIL_HYBRID = os.getenv("THUMBNAIL_HYBRID", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     cfg.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
     cfg.GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
     cfg.LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
@@ -301,7 +321,13 @@ def _public_short(job_id: str, short: Dict[str, Any], index: int) -> Dict[str, A
         out["local_path"] = clip
     thumb_path = JOBS_DIR / job_id / "short_thumbs" / f"{hid}.jpg"
     if thumb_path.exists():
-        out["thumbnail_url"] = f"/api/jobs/{job_id}/short-thumbs/{hid}?v=2"
+        ver = out.get("thumbnail_version")
+        if not ver:
+            try:
+                ver = int(thumb_path.stat().st_mtime)
+            except OSError:
+                ver = 2
+        out["thumbnail_url"] = f"/api/jobs/{job_id}/short-thumbs/{hid}?v={ver}"
     elif out.get("thumbnail_url"):
         pass
     return out
@@ -372,8 +398,17 @@ def _public_highlight(job_id: str, highlight: Dict[str, Any], index: int) -> Dic
     hid = int(out.get("id", index))
     preview = JOBS_DIR / job_id / "preview_thumbs" / f"{hid}.jpg"
     thumb_path = JOBS_DIR / job_id / "thumbs" / f"{hid}.jpg"
-    # Prefer hook+style poster for topic cards; fall back to raw frame
-    if preview.exists():
+    ai_thumb = JOBS_DIR / job_id / "short_thumbs" / f"{hid}.jpg"
+    # Prefer AI / custom short poster when present (even before render)
+    if out.get("thumbnail_ai") and ai_thumb.exists():
+        ver = out.get("thumbnail_version")
+        if not ver:
+            try:
+                ver = int(ai_thumb.stat().st_mtime)
+            except OSError:
+                ver = 2
+        out["thumbnail_url"] = f"/api/jobs/{job_id}/short-thumbs/{hid}?v={ver}"
+    elif preview.exists():
         out["thumbnail_url"] = f"/api/jobs/{job_id}/preview-thumbs/{hid}?v=2"
     elif thumb_path.exists():
         out["thumbnail_url"] = f"/api/jobs/{job_id}/thumbs/{hid}"
@@ -766,6 +801,7 @@ def _ensure_short_thumbnails(
     *,
     style: Optional[Dict[str, Any]] = None,
     force: bool = False,
+    highlights: Optional[List[Dict[str, Any]]] = None,
 ) -> None:
     for s in shorts:
         if not isinstance(s, dict):
@@ -773,10 +809,67 @@ def _ensure_short_thumbnails(
         if s.get("error") or not (s.get("clip_url") or s.get("local_path")):
             continue
         try:
-            _generate_short_thumbnail(job_id, s, style=style, force=force)
+            if highlights is not None and not force:
+                _attach_or_generate_short_thumbnail(
+                    job_id, s, highlights=highlights, style=style
+                )
+            else:
+                _generate_short_thumbnail(job_id, s, style=style, force=force)
         except Exception:
             # Best-effort — never break the render publish path
             continue
+
+
+def _highlight_by_id(
+    highlights: List[Dict[str, Any]], highlight_id: int
+) -> Optional[Dict[str, Any]]:
+    for i, h in enumerate(highlights or []):
+        if not isinstance(h, dict):
+            continue
+        try:
+            hid = int(h.get("id", i))
+        except (TypeError, ValueError):
+            hid = i
+        if hid == int(highlight_id):
+            return h
+    return None
+
+
+def _attach_or_generate_short_thumbnail(
+    job_id: str,
+    short: Dict[str, Any],
+    *,
+    highlights: List[Dict[str, Any]],
+    style: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Reuse a pre-generated AI thumbnail when present; otherwise build from clip."""
+    sid = _short_id(short)
+    if sid < 0:
+        return None
+    dest = JOBS_DIR / job_id / "short_thumbs" / f"{sid}.jpg"
+    hl = _highlight_by_id(highlights, sid)
+    ai_meta = None
+    if short.get("thumbnail_ai"):
+        ai_meta = short.get("thumbnail_ai_meta")
+    elif hl and hl.get("thumbnail_ai"):
+        ai_meta = hl.get("thumbnail_ai_meta")
+        short["thumbnail_ai"] = True
+        if ai_meta:
+            short["thumbnail_ai_meta"] = ai_meta
+
+    if (short.get("thumbnail_ai") or (hl and hl.get("thumbnail_ai"))) and dest.exists():
+        try:
+            version = int(dest.stat().st_mtime)
+        except OSError:
+            version = int(datetime.now(timezone.utc).timestamp())
+        short["thumbnail_url"] = f"/api/jobs/{job_id}/short-thumbs/{sid}?v={version}"
+        short["thumbnail_version"] = version
+        short["thumbnail_ai"] = True
+        if ai_meta and not short.get("thumbnail_ai_meta"):
+            short["thumbnail_ai_meta"] = ai_meta
+        return short["thumbnail_url"]
+
+    return _generate_short_thumbnail(job_id, short, style=style, force=True)
 
 
 # Face area vs frame: reject noise / giant LED-screen faces.
@@ -1472,6 +1565,14 @@ def _run_rank_highlights(
     capture = LogCapture(job_id, sys.stdout)
     err_capture = LogCapture(job_id, sys.stderr)
 
+    project_id = job.get("project_id")
+    virality_profile = None
+    if project_id:
+        try:
+            virality_profile = _projects.virality_profile(str(project_id))
+        except Exception:
+            virality_profile = None
+
     try:
         with redirect_stdout(capture), redirect_stderr(err_capture):
             result = finalize_analysis(
@@ -1480,6 +1581,7 @@ def _run_rank_highlights(
                 skip_cast=skip_cast,
                 num_clips=None,
                 language=params.get("language") or None,
+                virality_profile=virality_profile,
             )
         # Refine portraits using labeled speech turns (speaker_id on segments)
         if not skip_cast and (result.get("speakers") or []):
@@ -1550,6 +1652,7 @@ def _build_render_result(
         "highlights": analysis.get("highlights") or [],
         "selected_ids": list(selected_ids),
         "shorts": shorts,
+        "rendered_aspect_ratio": analysis.get("rendered_aspect_ratio"),
         "render_progress": {
             "total": len(selected_ids),
             "done": len(done_by_id),
@@ -1565,14 +1668,20 @@ def _run_render(
     selected_ids: List[int],
     *,
     force_all: bool = False,
+    force_ids: Optional[List[int]] = None,
+    preserve_others: bool = False,
 ) -> None:
     from shorts_generator import render_selected_shorts
 
+    force_set = {int(x) for x in (force_ids or [])}
     with _jobs_lock:
         job = _jobs[job_id]
         job["status"] = "rendering"
         job["updated_at"] = _now()
         params = dict(job["params"])
+        # Reattach mp4s wiped from JSON so resume can reuse them
+        if not force_all:
+            _ensure_shorts_recovered(job)
         analysis = dict(job.get("result") or {})
         job["params"]["selected_ids"] = selected_ids
         force = force_all or bool(params.get("force_rerender"))
@@ -1584,14 +1693,29 @@ def _run_render(
         _persist_job(job)
 
     existing = analysis.get("shorts") or []
+    if not force and not existing:
+        # Disk recovery outside the wipe path (analysis may still be empty)
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job:
+                disk = _discover_shorts_on_disk(job)
+                if disk:
+                    existing = list(disk.values())
     desired_style = params.get("caption_style")
     existing_by_id = {}
     for i, s in enumerate(existing):
         if not s.get("clip_url") or s.get("error"):
             continue
         sid = _short_id(s, i)
-        # Re-render when karaoke style no longer matches
-        if desired_style and s.get("caption_style") != desired_style:
+        if sid in force_set:
+            continue
+        # Bulk: karaoke style drift invalidates the clip.
+        # Append/single (preserve_others): keep siblings even if style differs.
+        if (
+            desired_style
+            and s.get("caption_style") != desired_style
+            and not preserve_others
+        ):
             continue
         existing_by_id[sid] = s
     if force:
@@ -1625,6 +1749,7 @@ def _run_render(
         result = _build_render_result(
             analysis, selected_ids, done_by_id, phase=phase, current_id=current_id
         )
+        result["rendered_aspect_ratio"] = params.get("aspect_ratio") or "9:16"
         with _jobs_lock:
             job = _jobs[job_id]
             job["result"] = result
@@ -1642,21 +1767,6 @@ def _run_render(
 
     capture = LogCapture(job_id, sys.stdout)
     err_capture = LogCapture(job_id, sys.stderr)
-    upload_threads: List[threading.Thread] = []
-    queued_upload_ids: set[int] = set()
-
-    def queue_auto_upload(sid: int) -> None:
-        if sid < 0 or sid in queued_upload_ids:
-            return
-        queued_upload_ids.add(sid)
-        thread = threading.Thread(
-            target=_auto_upload_short_after_render,
-            args=(job_id, sid),
-            daemon=True,
-            name=f"yt-upload-{job_id}-{sid}",
-        )
-        thread.start()
-        upload_threads.append(thread)
 
     try:
         new_shorts: List[Dict[str, Any]] = []
@@ -1666,8 +1776,11 @@ def _run_render(
             def on_short_done(short: Dict[str, Any], _i: int, _total: int) -> None:
                 sid = _short_id(short)
                 try:
-                    _generate_short_thumbnail(
-                        job_id, short, style=desired_style, force=True
+                    _attach_or_generate_short_thumbnail(
+                        job_id,
+                        short,
+                        highlights=analysis.get("highlights") or [],
+                        style=desired_style,
                     )
                 except Exception:
                     pass
@@ -1683,11 +1796,32 @@ def _run_render(
                 else:
                     _append_log(
                         job_id,
-                        f"Pronto {len(done_by_id)}/{len(selected_ids)}: {title}",
+                        f"Pronto {len(done_by_id)}/{len(selected_ids)}: {title}"
+                        + (
+                            " · thumbnail no 1º frame"
+                            if short.get("thumbnail_frame_injected")
+                            else ""
+                        ),
                     )
-                    queue_auto_upload(sid)
 
             with redirect_stdout(capture), redirect_stderr(err_capture):
+                # Stamp pre-existing short_thumbs onto highlights so the local
+                # clipper can burn them into frame 0 of the vertical mp4.
+                for i, h in enumerate(analysis.get("highlights") or []):
+                    if not isinstance(h, dict):
+                        continue
+                    try:
+                        hid = int(h.get("id", i))
+                    except (TypeError, ValueError):
+                        hid = i
+                    if hid not in set(render_ids):
+                        continue
+                    thumb = JOBS_DIR / job_id / "short_thumbs" / f"{hid}.jpg"
+                    if thumb.is_file() and thumb.stat().st_size > 0:
+                        h["thumbnail_frame"] = str(thumb)
+                    else:
+                        h.pop("thumbnail_frame", None)
+
                 partial = render_selected_shorts(
                     analysis,
                     render_ids,
@@ -1695,27 +1829,8 @@ def _run_render(
                     on_short_done=on_short_done,
                     caption_style=params.get("caption_style"),
                 )
-            # Ensure any shorts from the batch are present even if callback skipped
             for s in partial.get("shorts") or []:
-                sid = _short_id(s)
-                done_by_id[sid] = s
-                if (
-                    sid not in queued_upload_ids
-                    and not s.get("error")
-                    and (s.get("clip_url") or s.get("local_path"))
-                    and not s.get("youtube_url")
-                ):
-                    queue_auto_upload(sid)
-
-        # Reused clips without a YouTube URL (e.g. canal conectado depois) also upload
-        for sid in reuse_ids:
-            s = done_by_id.get(sid) or {}
-            if (
-                not s.get("error")
-                and (s.get("clip_url") or s.get("local_path"))
-                and not s.get("youtube_url")
-            ):
-                queue_auto_upload(sid)
+                done_by_id[_short_id(s)] = s
 
         # Backfill posters for reused/new shorts (hook + karaoke style)
         _ensure_short_thumbnails(
@@ -1723,15 +1838,8 @@ def _run_render(
             list(done_by_id.values()),
             style=desired_style,
             force=False,
+            highlights=analysis.get("highlights") or [],
         )
-
-        if upload_threads:
-            _append_log(
-                job_id,
-                f"Aguardando upload YouTube de {len(upload_threads)} short(s)…",
-            )
-            for thread in upload_threads:
-                thread.join()
 
         publish("completed", current_id=None)
         _append_log(
@@ -1761,6 +1869,10 @@ class SelectHighlights(BaseModel):
     ids: List[int] = Field(default_factory=list)
     force: bool = False
     caption_style: Optional[Dict[str, Any]] = None
+    # Render only `ids` but keep other already-done shorts in the result set.
+    append: bool = False
+    # Continue an interrupted batch — reuse disk clips; ignore stale force_rerender.
+    resume: bool = False
 
 
 class CastSpeakerName(BaseModel):
@@ -2036,7 +2148,12 @@ def update_project(project_id: str, body: ProjectUpdate):
     _require_project(project_id)
     youtube = body.youtube.model_dump(exclude_none=True) if body.youtube else None
     try:
-        return _projects.update(project_id, name=body.name, youtube=youtube)
+        return _projects.update(
+            project_id,
+            name=body.name,
+            youtube=youtube,
+            virality_profile=body.virality_profile,
+        )
     except KeyError:
         raise HTTPException(404, "Projeto não encontrado") from None
 
@@ -2272,6 +2389,8 @@ def get_job(job_id: str, include_logs: bool = True):
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "Job não encontrado")
+        if isinstance(job.get("result"), dict) and _ensure_shorts_recovered(job):
+            _persist_job(job)
         needs_portraits = (
             job.get("status") == "awaiting_cast"
             and isinstance(job.get("result"), dict)
@@ -2716,6 +2835,171 @@ def _done_shorts_by_id(result: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
     return done
 
 
+def _job_clips_dir(job: Dict[str, Any]) -> Optional[Path]:
+    """Directory where local mp4 shorts for this job are written."""
+    from shorts_generator.config import LOCAL_OUTPUT_DIR
+
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    for s in (result or {}).get("shorts") or []:
+        if not isinstance(s, dict):
+            continue
+        clip = str(s.get("clip_url") or s.get("local_path") or "").strip()
+        if not clip or clip.startswith("http"):
+            continue
+        parent = Path(clip).expanduser()
+        if not parent.is_absolute():
+            parent = (ROOT / parent).resolve()
+        parent = parent.parent
+        if parent.is_dir():
+            return parent
+
+    url = str(
+        (job.get("params") or {}).get("url")
+        or (result or {}).get("source_url")
+        or ((result or {}).get("metadata") or {}).get("url")
+        or ""
+    )
+    yt_id = _youtube_id_from_url(url)
+    if yt_id:
+        candidate = Path(LOCAL_OUTPUT_DIR).expanduser() / yt_id
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def _discover_shorts_on_disk(job: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
+    """Find rendered mp4s on disk for this job's highlights (even if result.shorts was wiped)."""
+    from shorts_generator.local.clipper import _short_out_path
+
+    result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    if not result:
+        return {}
+    clips_dir = _job_clips_dir(job)
+    if not clips_dir:
+        return {}
+
+    style = (job.get("params") or {}).get("caption_style")
+    found: Dict[int, Dict[str, Any]] = {}
+    for i, h in enumerate(result.get("highlights") or []):
+        if not isinstance(h, dict):
+            continue
+        sid = _short_id(h, i)
+        out_path = Path(_short_out_path(str(clips_dir), h, max(sid, 1)))
+        try:
+            if not out_path.is_file() or out_path.stat().st_size < 10_000:
+                continue
+        except OSError:
+            continue
+        short = {**h, "clip_url": str(out_path)}
+        if style:
+            short["caption_style"] = style
+        found[sid] = short
+    return found
+
+
+def _youtube_urls_from_logs(job: Dict[str, Any]) -> Dict[int, str]:
+    """Parse prior YouTube upload success lines so recovery can restore links."""
+    out: Dict[int, str] = {}
+    for entry in job.get("logs") or []:
+        msg = str((entry or {}).get("message") or "")
+        m = re.search(
+            r"Upload YouTube ok:\s*short\s*#(\d+)\s*→\s*(https://youtu\.be/[A-Za-z0-9_-]+)",
+            msg,
+        )
+        if not m:
+            continue
+        try:
+            out[int(m.group(1))] = m.group(2)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ensure_shorts_recovered(job: Dict[str, Any]) -> bool:
+    """Reattach on-disk clips when result.shorts was cleared (aspect toggle, crash, etc.)."""
+    result = job.get("result")
+    if not isinstance(result, dict):
+        return False
+
+    existing = _done_shorts_by_id(result)
+    discovered = _discover_shorts_on_disk(job)
+    if not discovered:
+        return False
+
+    yt_urls = _youtube_urls_from_logs(job)
+    merged: Dict[int, Dict[str, Any]] = dict(existing)
+    changed = False
+    for sid, short in discovered.items():
+        prev = merged.get(sid)
+        if prev and prev.get("clip_url"):
+            # Keep richer metadata (youtube upload) but ensure path still exists
+            clip = str(prev.get("clip_url") or "")
+            path = Path(clip) if clip and not clip.startswith("http") else None
+            if path and path.exists():
+                if sid in yt_urls and not prev.get("youtube_url"):
+                    prev = dict(prev)
+                    prev["youtube_url"] = yt_urls[sid]
+                    prev["youtube_video_id"] = yt_urls[sid].rsplit("/", 1)[-1]
+                    merged[sid] = prev
+                    changed = True
+                continue
+        short = dict(short)
+        if sid in yt_urls:
+            short["youtube_url"] = yt_urls[sid]
+            short["youtube_video_id"] = yt_urls[sid].rsplit("/", 1)[-1]
+        merged[sid] = short
+        changed = True
+
+    if not changed:
+        return False
+
+    selected = _job_selected_ids(job)
+    selected_done = {sid: merged[sid] for sid in selected if sid in merged}
+    extras = [merged[sid] for sid in sorted(merged.keys()) if sid not in selected_done]
+
+    status = job.get("status")
+    phase = result.get("phase")
+    if selected:
+        done_n = len(selected_done)
+        total_n = len(selected)
+        if done_n >= total_n and done_n > 0:
+            if status in ("awaiting_selection", "interrupted", "failed", "rendering"):
+                job["status"] = "completed"
+            phase = "completed"
+            current_id = None
+        else:
+            if status in ("awaiting_selection", "failed", "rendering"):
+                job["status"] = "interrupted"
+            phase = "interrupted"
+            pending = [sid for sid in selected if sid not in selected_done]
+            current_id = pending[0] if pending else None
+        job.setdefault("params", {})["ui_step"] = 5
+        rebuilt = _build_render_result(
+            result,
+            selected,
+            selected_done,
+            phase=phase or "interrupted",
+            current_id=current_id,
+        )
+        rebuilt["shorts"] = list(rebuilt.get("shorts") or []) + extras
+        job["result"] = rebuilt
+    else:
+        job["result"] = dict(result)
+        job["result"]["shorts"] = [merged[sid] for sid in sorted(merged.keys())]
+        job["result"]["phase"] = phase or "completed"
+        job.setdefault("params", {})["ui_step"] = 5
+        if status in ("awaiting_selection", "interrupted", "failed"):
+            job["status"] = "completed"
+
+    job["updated_at"] = _now()
+    # Clips on disk match the aspect they were rendered with (unknown → current)
+    if not job["result"].get("rendered_aspect_ratio"):
+        job["result"]["rendered_aspect_ratio"] = (
+            (job.get("params") or {}).get("aspect_ratio") or "9:16"
+        )
+    return True
+
+
 def _incomplete_render_snapshot(
     job: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
@@ -2725,9 +3009,17 @@ def _incomplete_render_snapshot(
         return None
     selected_ids = _job_selected_ids(job)
     done_by_id = _done_shorts_by_id(result)
+    # Prefer JSON shorts; fall back to mp4s still on disk
+    if selected_ids:
+        disk = _discover_shorts_on_disk(job)
+        for sid, short in disk.items():
+            if sid in selected_ids and sid not in done_by_id:
+                done_by_id[sid] = short
     progress = result.get("render_progress") or {}
     total = len(selected_ids) or int(progress.get("total") or 0)
-    done = len(done_by_id)
+    done = len(done_by_id) if not selected_ids else len(
+        {sid for sid in selected_ids if sid in done_by_id}
+    )
     if total <= 0:
         return None
     if done >= total:
@@ -2740,7 +3032,7 @@ def _incomplete_render_snapshot(
     current_id = pending[0] if pending else None
     return {
         "selected_ids": selected_ids,
-        "done_by_id": done_by_id,
+        "done_by_id": {sid: done_by_id[sid] for sid in selected_ids if sid in done_by_id},
         "done": done,
         "total": total,
         "current_id": current_id,
@@ -2939,7 +3231,28 @@ def select_highlights(job_id: str, body: SelectHighlights):
         prev_style = job["params"].get("caption_style")
         style_changed = prev_style != style
         job["params"]["caption_style"] = style
-        force = bool(body.force) or bool(job["params"].get("force_rerender")) or style_changed
+        append = bool(body.append)
+        resume = bool(body.resume)
+        if resume:
+            # Continue remaining clips; do not invalidate already-rendered ones
+            # because the user toggled aspect/style while interrupted.
+            force = bool(body.force)
+            job["params"]["force_rerender"] = False
+        else:
+            force = bool(body.force) or bool(job["params"].get("force_rerender")) or (
+                style_changed and not append
+            )
+        force_ids: List[int] = []
+        if append:
+            existing_done = set(_done_shorts_by_id(job.get("result") or {}).keys())
+            # Re-cut requested ids when forced or caption style changed
+            if bool(body.force) or style_changed:
+                force_ids = list(ids)
+            final_ids = _sorted_selection_ids(
+                highlights, list(existing_done | set(ids))
+            )
+        else:
+            final_ids = ids
         # Clear prior failure / interrupt so UI reflects a fresh render attempt
         if job["status"] in ("failed", "interrupted"):
             job["status"] = "awaiting_selection"
@@ -2949,16 +3262,23 @@ def select_highlights(job_id: str, body: SelectHighlights):
 
     thread = threading.Thread(
         target=_run_render,
-        args=(job_id, ids),
-        kwargs={"force_all": force},
+        args=(job_id, final_ids),
+        kwargs={
+            "force_all": force and not append and not resume,
+            "force_ids": force_ids,
+            "preserve_others": append or resume,
+        },
         daemon=True,
     )
     thread.start()
     return {
         "id": job_id,
         "status": "rendering",
-        "selected_ids": ids,
-        "force": force,
+        "selected_ids": final_ids,
+        "force": force and not append and not resume,
+        "force_ids": force_ids,
+        "append": append,
+        "resume": resume,
         "caption_style": style,
     }
 
@@ -3067,12 +3387,17 @@ def update_job_params(job_id: str, body: UpdateJobParams):
                         pass
         if changed or fmt_changed:
             if changed:
-                job["params"]["force_rerender"] = True
-                # Drop existing crops so UI doesn't show stale aspect until re-render
-                if job.get("result") and not should_render:
-                    job["result"] = dict(job["result"])
-                    job["result"]["shorts"] = []
-                    job["status"] = "awaiting_selection"
+                # Next full cut re-renders only if aspect differs from on-disk clips.
+                # Keep existing shorts + status so Results stays reachable.
+                result = job.get("result") if isinstance(job.get("result"), dict) else {}
+                rendered = (result or {}).get("rendered_aspect_ratio")
+                if not rendered:
+                    rendered = prev
+                    if result and _done_shorts_by_id(result):
+                        job["result"] = dict(result)
+                        job["result"]["rendered_aspect_ratio"] = prev
+                        rendered = prev
+                job["params"]["force_rerender"] = aspect != str(rendered)
             job["updated_at"] = _now()
             _persist_job(job)
             parts = []
@@ -3263,6 +3588,22 @@ def _find_job_short(
     return None, -1
 
 
+def _find_job_highlight(
+    job: Dict[str, Any], highlight_id: int
+) -> Tuple[Optional[Dict[str, Any]], int]:
+    highlights = (job.get("result") or {}).get("highlights") or []
+    for i, h in enumerate(highlights):
+        if not isinstance(h, dict):
+            continue
+        try:
+            hid = int(h.get("id", i))
+        except (TypeError, ValueError):
+            hid = i
+        if hid == int(highlight_id):
+            return h, i
+    return None, -1
+
+
 def _short_thumbnail_path(job_id: str, short: Dict[str, Any]) -> Optional[Path]:
     """Local custom thumbnail jpg for YouTube thumbnails.set, if present."""
     hid = _short_id(short)
@@ -3294,6 +3635,153 @@ def _infer_content_type(result: Dict[str, Any]) -> str:
     return "other"
 
 
+def _build_youtube_seo_for_short(
+    job: Dict[str, Any],
+    short: Dict[str, Any],
+    short_id: int,
+    *,
+    title: Optional[str] = None,
+    tags: Optional[List[str]] = None,
+    category_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Assemble the SEO payload that would be sent on YouTube upload."""
+    from shorts_generator import youtube_uploader as yt
+
+    result = job.get("result") or {}
+    params = job.get("params") or {}
+    meta = result.get("metadata") or {}
+    speakers = [
+        str(s.get("name") or "").strip()
+        for s in (result.get("speakers") or [])
+        if isinstance(s, dict) and (s.get("name") or "").strip()
+    ]
+    language = (
+        (params.get("language") or "").strip()
+        or (result.get("transcript") or {}).get("language")
+        or "pt"
+    )
+    content_type = _infer_content_type(result)
+    source_url = (
+        str(meta.get("url") or "").strip()
+        or str(result.get("source_url") or "").strip()
+        or str(params.get("url") or "").strip()
+    )
+    base_title = (title or short.get("title") or f"Short #{short_id + 1}").strip()
+    return yt.build_seo_metadata(
+        title=base_title,
+        hook=str(short.get("hook_sentence") or ""),
+        reason=str(short.get("virality_reason") or ""),
+        attributed_to=str(short.get("attributed_to") or ""),
+        source_title=str(meta.get("title") or ""),
+        source_url=source_url,
+        channel=str(meta.get("channel") or ""),
+        speakers=speakers,
+        content_type=content_type,
+        start_time=short.get("start_time"),
+        language=str(language or "pt"),
+        extra_tags=tags,
+        category_id=category_id,
+    )
+
+
+def _youtube_upload_preview(job_id: str, short_id: int) -> Dict[str, Any]:
+    """Return title/description/hashtags/tags/thumbnail for the upload modal."""
+    from shorts_generator import youtube_uploader as yt
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or not job.get("result"):
+            raise ValueError("Job/resultado não encontrado")
+        project_id = job.get("project_id")
+        target, target_index = _find_job_short(job, short_id)
+        if target is None:
+            raise ValueError("Short não encontrado")
+        if target.get("error"):
+            raise ValueError("Este short falhou na renderização")
+        if not (target.get("clip_url") or target.get("local_path")):
+            raise ValueError("Clip ainda não está pronto")
+        short_snapshot = dict(target)
+        job_snapshot = {
+            "result": dict(job.get("result") or {}),
+            "params": dict(job.get("params") or {}),
+            "project_id": project_id,
+        }
+
+    if not project_id:
+        raise ValueError(
+            "Este job não pertence a um projeto. Abra um canal e gere o short de novo."
+        )
+
+    project = _projects.get_public(project_id)
+    yt_cfg = (project or {}).get("youtube") or {}
+    configured = bool(yt_cfg.get("configured"))
+    if not configured:
+        creds = _projects.youtube_credentials(project_id)
+        configured = bool(creds and yt.credentials_configured(creds))
+
+    seo = _build_youtube_seo_for_short(job_snapshot, short_snapshot, short_id)
+    public = _public_short(job_id, short_snapshot, target_index if target_index >= 0 else 0)
+    thumb_path = _short_thumbnail_path(job_id, short_snapshot)
+    thumbnail_url = public.get("thumbnail_url") or ""
+    if not thumbnail_url and thumb_path:
+        hid = _short_id(short_snapshot)
+        thumbnail_url = f"/api/jobs/{job_id}/short-thumbs/{hid}?v=2"
+
+    already_uploaded = bool(
+        short_snapshot.get("youtube_video_id") or short_snapshot.get("youtube_url")
+    )
+    saved_privacy = str(short_snapshot.get("youtube_privacy") or "").strip().lower()
+    cfg_privacy = str(yt_cfg.get("privacy_status") or "public").strip().lower() or "public"
+    privacy = saved_privacy if saved_privacy in ("private", "unlisted", "public") else cfg_privacy
+    if privacy not in ("private", "unlisted", "public"):
+        privacy = "public"
+
+    title = (
+        str(short_snapshot.get("youtube_title") or "").strip()
+        or seo["title"]
+    )
+    description = (
+        str(short_snapshot.get("youtube_description") or "").strip()
+        or seo["description"]
+    )
+    tags = short_snapshot.get("youtube_tags") if already_uploaded else None
+    if not isinstance(tags, list) or not tags:
+        tags = seo.get("tags") or []
+    category_id = (
+        str(short_snapshot.get("youtube_category_id") or "").strip()
+        or seo.get("category_id")
+        or "22"
+    )
+
+    return {
+        "ok": True,
+        "short_id": short_id,
+        "configured": configured,
+        "channel_title": yt_cfg.get("channel_title") or "",
+        "already_uploaded": already_uploaded,
+        "youtube_video_id": short_snapshot.get("youtube_video_id") or "",
+        "youtube_url": short_snapshot.get("youtube_url") or "",
+        "title": title,
+        "description": description,
+        "hashtags": seo.get("hashtags") or [],
+        "tags": tags,
+        "category_id": category_id,
+        "default_language": (
+            str(short_snapshot.get("youtube_language") or "").strip()
+            or seo.get("default_language")
+            or "pt"
+        ),
+        "privacy": privacy,
+        "thumbnail_url": thumbnail_url,
+        "has_custom_thumbnail": bool(thumb_path),
+        "thumbnail_ai": bool(short_snapshot.get("thumbnail_ai")),
+        "openai_configured": _is_real_secret(os.getenv("OPENAI_API_KEY")),
+        "clip_url": public.get("clip_url") or "",
+        "hook_sentence": short_snapshot.get("hook_sentence") or "",
+        "attributed_to": short_snapshot.get("attributed_to") or "",
+    }
+
+
 def _perform_youtube_upload(
     job_id: str,
     short_id: int,
@@ -3305,6 +3793,9 @@ def _perform_youtube_upload(
     category_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Upload a rendered short to the project's YouTube channel.
+
+    If the short already has a youtube_video_id, updates metadata on that video
+    instead of uploading a duplicate.
 
     Mutates the short dict in the live job. Raises ValueError/RuntimeError on failure.
     Fills SEO fields: title, description, tags, hashtags, language, category, thumbnail.
@@ -3321,7 +3812,12 @@ def _perform_youtube_upload(
             raise ValueError("Short não encontrado")
         if target.get("error"):
             raise ValueError("Este short falhou na renderização")
-        if not (target.get("clip_url") or target.get("local_path")):
+        existing_id = str(target.get("youtube_video_id") or "").strip()
+        if not existing_id:
+            existing_id = yt.youtube_id_from_url(
+                str(target.get("youtube_url") or "")
+            ) or ""
+        if not existing_id and not (target.get("clip_url") or target.get("local_path")):
             raise ValueError("Clip ainda não está pronto")
         short_snapshot = dict(target)
         result_snapshot = dict(job.get("result") or {})
@@ -3342,39 +3838,15 @@ def _perform_youtube_upload(
             "informe Client ID, Secret e Refresh Token (ou use Conectar YouTube)."
         )
 
-    path = _resolve_short_upload_path(short_snapshot, job_id)
-    meta = result_snapshot.get("metadata") or {}
-    speakers = [
-        str(s.get("name") or "").strip()
-        for s in (result_snapshot.get("speakers") or [])
-        if isinstance(s, dict) and (s.get("name") or "").strip()
-    ]
-    language = (
-        (params_snapshot.get("language") or "").strip()
-        or (result_snapshot.get("transcript") or {}).get("language")
-        or "pt"
-    )
-    content_type = _infer_content_type(result_snapshot)
-    source_url = (
-        str(meta.get("url") or "").strip()
-        or str(result_snapshot.get("source_url") or "").strip()
-        or str(params_snapshot.get("url") or "").strip()
-    )
-    base_title = (title or short_snapshot.get("title") or f"Short #{short_id + 1}").strip()
+    existing_video_id = existing_id
+    is_update = bool(existing_video_id)
 
-    seo = yt.build_seo_metadata(
-        title=base_title,
-        hook=str(short_snapshot.get("hook_sentence") or ""),
-        reason=str(short_snapshot.get("virality_reason") or ""),
-        attributed_to=str(short_snapshot.get("attributed_to") or ""),
-        source_title=str(meta.get("title") or ""),
-        source_url=source_url,
-        channel=str(meta.get("channel") or ""),
-        speakers=speakers,
-        content_type=content_type,
-        start_time=short_snapshot.get("start_time"),
-        language=str(language or "pt"),
-        extra_tags=tags,
+    seo = _build_youtube_seo_for_short(
+        {"result": result_snapshot, "params": params_snapshot},
+        short_snapshot,
+        short_id,
+        title=title,
+        tags=tags,
         category_id=category_id,
     )
 
@@ -3386,38 +3858,73 @@ def _perform_youtube_upload(
     upload_privacy = (privacy or "").strip() or None
     thumb_path = _short_thumbnail_path(job_id, short_snapshot)
 
-    _append_log(
-        job_id,
-        f"Upload YouTube iniciado: short #{short_id} → {path.name} "
-        f"(SEO: {len(upload_tags)} tags, lang={seo['default_language']}, "
-        f"cat={upload_category}"
-        f"{', thumb' if thumb_path else ''})",
-    )
-    try:
-        uploaded = yt.upload_video(
-            path,
-            title=upload_title,
-            description=upload_description,
-            tags=upload_tags,
-            privacy=upload_privacy,
-            category_id=upload_category,
-            default_language=seo["default_language"],
-            default_audio_language=seo["default_audio_language"],
-            thumbnail_path=thumb_path,
-            credentials=creds,
+    if is_update:
+        _append_log(
+            job_id,
+            f"Atualização YouTube iniciada: short #{short_id} → {existing_video_id} "
+            f"(SEO: {len(upload_tags)} tags, lang={seo['default_language']}, "
+            f"cat={upload_category}"
+            f"{', thumb' if thumb_path else ''})",
         )
-    except Exception as exc:
-        with _jobs_lock:
-            job = _jobs.get(job_id)
-            if job and job.get("result"):
-                target, _ = _find_job_short(job, short_id)
-                if target is not None:
-                    target["youtube_upload_status"] = "failed"
-                    target["youtube_upload_error"] = str(exc)
-                    job["updated_at"] = _now()
-                    _persist_job(job)
-        _append_log(job_id, f"Upload YouTube falhou (short #{short_id}): {exc}")
-        raise
+        try:
+            uploaded = yt.update_video_metadata(
+                existing_video_id,
+                title=upload_title,
+                description=upload_description,
+                tags=upload_tags,
+                privacy=upload_privacy,
+                category_id=upload_category,
+                default_language=seo["default_language"],
+                default_audio_language=seo["default_audio_language"],
+                thumbnail_path=thumb_path,
+                credentials=creds,
+            )
+        except Exception as exc:
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+                if job and job.get("result"):
+                    target, _ = _find_job_short(job, short_id)
+                    if target is not None:
+                        target["youtube_upload_status"] = "failed"
+                        target["youtube_upload_error"] = str(exc)
+                        job["updated_at"] = _now()
+                        _persist_job(job)
+            _append_log(job_id, f"Atualização YouTube falhou (short #{short_id}): {exc}")
+            raise
+    else:
+        path = _resolve_short_upload_path(short_snapshot, job_id)
+        _append_log(
+            job_id,
+            f"Upload YouTube iniciado: short #{short_id} → {path.name} "
+            f"(SEO: {len(upload_tags)} tags, lang={seo['default_language']}, "
+            f"cat={upload_category}"
+            f"{', thumb' if thumb_path else ''})",
+        )
+        try:
+            uploaded = yt.upload_video(
+                path,
+                title=upload_title,
+                description=upload_description,
+                tags=upload_tags,
+                privacy=upload_privacy,
+                category_id=upload_category,
+                default_language=seo["default_language"],
+                default_audio_language=seo["default_audio_language"],
+                thumbnail_path=thumb_path,
+                credentials=creds,
+            )
+        except Exception as exc:
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+                if job and job.get("result"):
+                    target, _ = _find_job_short(job, short_id)
+                    if target is not None:
+                        target["youtube_upload_status"] = "failed"
+                        target["youtube_upload_error"] = str(exc)
+                        job["updated_at"] = _now()
+                        _persist_job(job)
+            _append_log(job_id, f"Upload YouTube falhou (short #{short_id}): {exc}")
+            raise
 
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -3434,7 +3941,9 @@ def _perform_youtube_upload(
         updated["youtube_video_id"] = uploaded["video_id"]
         updated["youtube_url"] = uploaded["url"]
         updated["youtube_privacy"] = uploaded["privacy_status"]
-        updated["youtube_uploaded_at"] = _now()
+        if not is_update:
+            updated["youtube_uploaded_at"] = _now()
+        updated["youtube_updated_at"] = _now()
         updated["youtube_upload_status"] = "uploaded"
         updated["youtube_title"] = uploaded.get("title") or upload_title
         updated["youtube_description"] = uploaded.get("description") or upload_description
@@ -3452,13 +3961,15 @@ def _perform_youtube_upload(
         if uploaded.get("thumbnail_set")
         else (" (thumbnail não aplicada — reconecte o YouTube)" if thumb_path else "")
     )
+    action_label = "Atualização YouTube ok" if is_update else "Upload YouTube ok"
     _append_log(
         job_id,
-        f"Upload YouTube ok: short #{short_id} → {uploaded['url']} "
+        f"{action_label}: short #{short_id} → {uploaded['url']} "
         f"({uploaded['privacy_status']}){thumb_note}",
     )
     return {
         "ok": True,
+        "updated": is_update,
         "video_id": uploaded["video_id"],
         "url": uploaded["url"],
         "privacy_status": uploaded["privacy_status"],
@@ -3473,57 +3984,268 @@ def _perform_youtube_upload(
     }
 
 
-def _auto_upload_short_after_render(job_id: str, short_id: int) -> None:
-    """Best-effort YouTube upload right after a clip finishes rendering."""
-    from shorts_generator import youtube_uploader as yt
+@app.get("/api/jobs/{job_id}/shorts/{short_id}/youtube/preview")
+def youtube_upload_preview(job_id: str, short_id: int):
+    """Preview title, description, hashtags and thumbnail before YouTube upload."""
+    try:
+        return _youtube_upload_preview(job_id, short_id)
+    except ValueError as exc:
+        msg = str(exc)
+        code = 404 if "não encontrado" in msg.lower() or "sumiu" in msg.lower() else 400
+        raise HTTPException(code, msg) from exc
+
+
+def _generate_ai_short_thumbnail(job_id: str, short_id: int) -> Dict[str, Any]:
+    """Build an OpenAI viral thumbnail for a topic/short id (clip optional).
+
+    Works before render by sampling a frame from the source video. Writes
+    ``short_thumbs/{id}.jpg`` and stamps ``thumbnail_ai`` on the highlight
+    (and short, if already rendered).
+    """
+    from shorts_generator.highlights import snippet_for_range
+    from shorts_generator.thumbnails_ai import generate_ai_thumbnail
 
     with _jobs_lock:
         job = _jobs.get(job_id)
-        if not job:
-            return
-        project_id = job.get("project_id")
-        target, _ = _find_job_short(job, short_id)
-        if target is None:
-            return
-        if target.get("error") or not (target.get("clip_url") or target.get("local_path")):
-            return
-        # Skip clips already on YouTube (reused renders)
-        if target.get("youtube_url") and target.get("youtube_upload_status") != "failed":
-            return
-        if target.get("youtube_upload_status") == "uploading":
-            return
-        skip_logged = bool((job.get("params") or {}).get("_yt_skip_logged"))
+        if not job or not job.get("result"):
+            raise ValueError("Job/resultado não encontrado")
+        highlight, _hl_index = _find_job_highlight(job, short_id)
+        short, short_index = _find_job_short(job, short_id)
+        if highlight is None and short is None:
+            raise ValueError("Tópico não encontrado")
+        if short is not None and short.get("error") and not highlight:
+            raise ValueError("Este short falhou na renderização")
 
-    if not project_id:
-        if not skip_logged:
-            _append_log(job_id, "Upload YouTube automático ignorado: job sem projeto.")
-            with _jobs_lock:
-                job = _jobs.get(job_id)
-                if job:
-                    job.setdefault("params", {})["_yt_skip_logged"] = True
-                    _persist_job(job)
-        return
+        # Prefer highlight fields; fall back to rendered short
+        base = dict(highlight or {})
+        if short:
+            for key in (
+                "title",
+                "hook_sentence",
+                "attributed_to",
+                "snippet",
+                "start_time",
+                "end_time",
+                "clip_url",
+                "local_path",
+            ):
+                if not base.get(key) and short.get(key) is not None:
+                    base[key] = short.get(key)
 
-    creds = _projects.youtube_credentials(project_id)
-    if not creds or not yt.credentials_configured(creds):
-        if not skip_logged:
-            _append_log(
-                job_id,
-                "Upload YouTube automático ignorado: canal não configurado no projeto.",
-            )
-            with _jobs_lock:
-                job = _jobs.get(job_id)
-                if job:
-                    job.setdefault("params", {})["_yt_skip_logged"] = True
-                    _persist_job(job)
-        return
+        result = job.get("result") or {}
+        speakers = list(result.get("speakers") or [])
+        transcript = result.get("transcript") if isinstance(result.get("transcript"), dict) else {}
+        params = dict(job.get("params") or {})
+        aspect = str(params.get("aspect_ratio") or "9:16")
+        language = (
+            (params.get("language") or "").strip()
+            or (transcript.get("language") if isinstance(transcript, dict) else None)
+            or "pt"
+        )
+        original_url = str(params.get("url") or result.get("source_url") or "")
+        ffmpeg_src, _yt = _resolve_job_source(result, original_url)
+        short_snapshot = dict(base)
+
+    # Prefer full transcript from disk if API response truncated segments
+    if not (transcript.get("segments") if isinstance(transcript, dict) else None):
+        result_path = JOBS_DIR / f"{job_id}_result.json"
+        if result_path.exists():
+            try:
+                full = json.loads(result_path.read_text(encoding="utf-8"))
+                if isinstance(full.get("transcript"), dict):
+                    transcript = full["transcript"]
+                if not speakers and isinstance(full.get("speakers"), list):
+                    speakers = full["speakers"]
+            except Exception:
+                pass
+
+    hid = int(short_id)
+    dest = JOBS_DIR / job_id / "short_thumbs" / f"{hid}.jpg"
+    cast_dir = JOBS_DIR / job_id / "cast"
+    wiki_dir = JOBS_DIR / job_id / "wiki"
 
     try:
-        _perform_youtube_upload(job_id, short_id)
+        start = float(short_snapshot.get("start_time") or 0)
+        end = float(short_snapshot.get("end_time") or start + 60)
+    except (TypeError, ValueError):
+        start, end = 0.0, 60.0
+
+    snippet = str(short_snapshot.get("snippet") or "").strip()
+    if not snippet and isinstance(transcript, dict):
+        snippet = snippet_for_range(transcript, start, end, max_chars=900)
+
+    # Reference frame: rendered clip → existing AI/raw thumbs → source video
+    ref_frame: Optional[Path] = None
+    tmp_frame = JOBS_DIR / job_id / "short_thumbs" / f".{hid}.ai_ref.jpg"
+    clip_path = _short_clip_path(short_snapshot) if short_snapshot.get("clip_url") or short_snapshot.get("local_path") else None
+    if clip_path is None and short is not None:
+        clip_path = _short_clip_path(short)
+    if clip_path is not None:
+        if _extract_frame(str(clip_path), 0.8, tmp_frame):
+            ref_frame = tmp_frame
+    if ref_frame is None:
+        for candidate in (
+            JOBS_DIR / job_id / "thumbs" / f"{hid}.jpg",
+            JOBS_DIR / job_id / "preview_thumbs" / f"{hid}.jpg",
+            dest if dest.exists() else None,
+        ):
+            if candidate is not None and candidate.exists() and candidate.stat().st_size > 0:
+                ref_frame = candidate
+                break
+    if ref_frame is None and ffmpeg_src:
+        ts = start + min(0.8, max(0.0, (end - start) * 0.15))
+        if _extract_frame(str(ffmpeg_src), ts, tmp_frame):
+            ref_frame = tmp_frame
+
+    _append_log(job_id, f"Gerando thumbnail IA para tópico #{hid}…")
+    full_hook = str(
+        short_snapshot.get("hook_sentence") or short_snapshot.get("title") or ""
+    ).strip()
+    try:
+        meta = generate_ai_thumbnail(
+            dest=dest,
+            hook=full_hook,
+            title=str(short_snapshot.get("title") or ""),
+            attributed_to=str(short_snapshot.get("attributed_to") or ""),
+            snippet=snippet,
+            speakers=speakers,
+            cast_dir=cast_dir if cast_dir.is_dir() else None,
+            wiki_dir=wiki_dir,
+            reference_frame=ref_frame,
+            aspect_ratio=aspect,
+            language=str(language or "pt"),
+        )
+        # Hybrid: PIL burns hook + frame. Full mode: model paints typography.
+        if full_hook and not meta.get("hook"):
+            meta["hook"] = full_hook
+        meta["hook_burned"] = bool(meta.get("hook_burned"))
+    finally:
+        try:
+            if tmp_frame.exists() and tmp_frame != dest and tmp_frame != ref_frame:
+                tmp_frame.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    if not dest.exists() or dest.stat().st_size <= 0:
+        raise RuntimeError("Thumbnail IA não foi gravada")
+
+    try:
+        version = int(dest.stat().st_mtime)
+    except OSError:
+        version = int(datetime.now(timezone.utc).timestamp())
+
+    thumb_url = f"/api/jobs/{job_id}/short-thumbs/{hid}?v={version}"
+    ai_meta = {
+        "model": meta.get("model"),
+        "size": meta.get("size"),
+        "quality": meta.get("quality"),
+        "fidelity": meta.get("fidelity"),
+        "hybrid": meta.get("hybrid"),
+        "hook": meta.get("hook"),
+        "hook_burned": bool(meta.get("hook_burned")),
+        "faces": meta.get("faces") or [],
+        "cited_people": meta.get("cited_people") or [],
+    }
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or not job.get("result"):
+            raise ValueError("Job sumiu durante a geração")
+
+        public_short = None
+        updated_short, idx = _find_job_short(job, short_id)
+        if updated_short is None and short_index >= 0:
+            shorts = job["result"].get("shorts") or []
+            if short_index < len(shorts):
+                updated_short = shorts[short_index]
+                idx = short_index
+        if updated_short is not None:
+            updated_short["thumbnail_url"] = thumb_url
+            updated_short["thumbnail_version"] = version
+            updated_short["thumbnail_ai"] = True
+            updated_short["thumbnail_ai_meta"] = ai_meta
+            public_short = _public_short(job_id, updated_short, idx if idx >= 0 else 0)
+
+        updated_hl, _ = _find_job_highlight(job, short_id)
+        if updated_hl is not None:
+            updated_hl["thumbnail_url"] = thumb_url
+            updated_hl["thumbnail_version"] = version
+            updated_hl["thumbnail_ai"] = True
+            updated_hl["thumbnail_ai_meta"] = ai_meta
+
+        job["updated_at"] = _now()
+        _persist_job(job)
+        public_hl = (
+            _public_highlight(job_id, updated_hl, short_id)
+            if updated_hl is not None
+            else None
+        )
+
+    face_note = ", ".join(
+        f"{f.get('kind')}:{f.get('name')}" for f in (meta.get("faces") or []) if f.get("name")
+    )
+    _append_log(
+        job_id,
+        f"Thumbnail IA pronta: tópico #{hid}"
+        + (f" ({face_note})" if face_note else ""),
+    )
+    return {
+        "ok": True,
+        "short_id": short_id,
+        "highlight_id": short_id,
+        "thumbnail_url": (
+            (public_short or {}).get("thumbnail_url")
+            or (public_hl or {}).get("thumbnail_url")
+            or thumb_url
+        ),
+        "has_custom_thumbnail": True,
+        "thumbnail_ai": True,
+        "faces": meta.get("faces") or [],
+        "cited_people": meta.get("cited_people") or [],
+        "short": public_short,
+        "highlight": public_hl,
+        "openai_configured": True,
+    }
+
+
+@app.post("/api/jobs/{job_id}/shorts/{short_id}/generate-thumbnail")
+def generate_short_ai_thumbnail(job_id: str, short_id: int):
+    """Generate a viral AI thumbnail (OpenAI) and replace the short poster."""
+    try:
+        return _generate_ai_short_thumbnail(job_id, short_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ValueError as exc:
+        msg = str(exc)
+        code = 404 if "não encontrado" in msg.lower() or "sumiu" in msg.lower() else 400
+        raise HTTPException(code, msg) from exc
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
-        # Already logged + status set inside _perform_youtube_upload when possible
-        if "Upload YouTube falhou" not in str(exc):
-            _append_log(job_id, f"Upload YouTube falhou (short #{short_id}): {exc}")
+        tb = traceback.format_exc()
+        _append_log(job_id, f"Thumbnail IA falhou (short #{short_id}): {exc}")
+        _append_log(job_id, tb)
+        raise HTTPException(500, f"Falha ao gerar thumbnail: {exc}") from exc
+
+
+@app.post("/api/jobs/{job_id}/highlights/{highlight_id}/generate-thumbnail")
+def generate_highlight_ai_thumbnail(job_id: str, highlight_id: int):
+    """Generate a viral AI thumbnail for a topic before (or after) render."""
+    try:
+        return _generate_ai_short_thumbnail(job_id, highlight_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ValueError as exc:
+        msg = str(exc)
+        code = 404 if "não encontrado" in msg.lower() or "sumiu" in msg.lower() else 400
+        raise HTTPException(code, msg) from exc
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        tb = traceback.format_exc()
+        _append_log(job_id, f"Thumbnail IA falhou (tópico #{highlight_id}): {exc}")
+        _append_log(job_id, tb)
+        raise HTTPException(500, f"Falha ao gerar thumbnail: {exc}") from exc
 
 
 @app.post("/api/jobs/{job_id}/shorts/{short_id}/youtube")
@@ -3617,6 +4339,8 @@ def _load_persisted_jobs() -> None:
                     _mark_render_interrupted(data, snap)
                     _persist_job(data)
             # awaiting_cast / completed / interrupted stay as-is
+            if isinstance(data.get("result"), dict) and _ensure_shorts_recovered(data):
+                _persist_job(data)
             _jobs[job_id] = data
         except Exception:
             continue
@@ -3632,7 +4356,7 @@ def _migrate_youtube_env_to_project() -> None:
     client_id = (os.getenv("YOUTUBE_CLIENT_ID") or "").strip().strip("'\"")
     client_secret = (os.getenv("YOUTUBE_CLIENT_SECRET") or "").strip().strip("'\"")
     refresh = (os.getenv("YOUTUBE_REFRESH_TOKEN") or "").strip().strip("'\"")
-    privacy = (os.getenv("YOUTUBE_PRIVACY_STATUS") or "private").strip().lower()
+    privacy = (os.getenv("YOUTUBE_PRIVACY_STATUS") or "public").strip().lower()
     if not (
         _is_real_secret(client_id)
         and _is_real_secret(client_secret)
@@ -3640,7 +4364,7 @@ def _migrate_youtube_env_to_project() -> None:
     ):
         return
     if privacy not in ("private", "unlisted", "public"):
-        privacy = "private"
+        privacy = "public"
     created = _projects.create("Canal padrão")
     _projects.update(
         created["id"],

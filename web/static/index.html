@@ -79,32 +79,6 @@
         </p>
       </div>
 
-      <div class="project-library" id="project-library">
-        <div class="library-section">
-          <div class="section-head">
-            <div>
-              <h2 style="font-size:1.15rem">Pendentes de render</h2>
-              <p class="hint">Selecionados e ainda sem clip pronto</p>
-            </div>
-            <button type="button" class="btn ghost btn-tiny" id="refresh-library">Atualizar</button>
-          </div>
-          <div class="library-list" id="library-pending">
-            <p class="empty">Nenhum pendente.</p>
-          </div>
-        </div>
-        <div class="library-section">
-          <div class="section-head">
-            <div>
-              <h2 style="font-size:1.15rem">Shorts gerados</h2>
-              <p class="hint">Clips já renderizados neste canal</p>
-            </div>
-          </div>
-          <div class="library-list" id="library-rendered">
-            <p class="empty">Nenhum short gerado ainda.</p>
-          </div>
-        </div>
-      </div>
-
       <form id="generate-form" class="workbench" autocomplete="off">
         <div class="step-rail" role="navigation" aria-label="Etapas do job">
           <button type="button" class="step-dot is-active" data-step="1" aria-current="step">1</button>
@@ -121,11 +95,9 @@
 
         <div id="step1-fields">
           <div class="recent-block" id="recent-block" hidden>
-            <div class="recent-head">
-              <span class="label">Recentes</span>
-              <button type="button" class="btn ghost btn-tiny" id="refresh-sources">Atualizar</button>
-            </div>
-            <div class="recent-list" id="recent-sources"></div>
+            <button type="button" class="btn ghost" id="open-sources-btn">
+              Escolher vídeo baixado anteriormente
+            </button>
           </div>
 
           <label class="field field-grow">
@@ -158,13 +130,14 @@
               <span>Analisar vídeo</span>
               <span class="btn-arrow" aria-hidden="true">→</span>
             </button>
-            <p class="hint" id="form-hint">Confirme os locutores, escolha tópicos e corte os shorts</p>
+            <p class="hint" id="form-hint">Confirme os locutores, ajuste legendas e escolha tópicos</p>
           </div>
           <div class="actions" id="edit-job-actions" hidden>
-            <button type="button" class="btn ghost" id="goto-format-btn">Ir para formato</button>
             <button type="button" class="btn ghost" id="goto-topics-btn">Ir para tópicos</button>
-            <p class="hint" id="edit-form-hint">Formato vem antes da escolha dos tópicos</p>
+            <p class="hint" id="edit-form-hint">Volte aos tópicos ou legendas do job</p>
           </div>
+          <input type="hidden" name="aspect_ratio" id="aspect_ratio" value="9:16" />
+          <input type="hidden" name="download_format" id="download_format" value="720" />
         </div>
       </form>
 
@@ -191,44 +164,6 @@
           </div>
         </div>
 
-        <div class="format-area" id="format-area" hidden>
-          <div class="section-head">
-            <div>
-              <h2 style="font-size:1.2rem">Formato do short</h2>
-              <p class="hint" id="format-hint">
-                Escolha a proporção do corte. A resolução vale para novos downloads (análise).
-              </p>
-            </div>
-            <div class="pick-actions">
-              <button type="button" class="btn ghost" id="format-back">← Fonte</button>
-              <button type="button" class="btn primary" id="format-continue">
-                <span>Continuar para legendas</span>
-                <span class="btn-arrow" aria-hidden="true">→</span>
-              </button>
-            </div>
-          </div>
-          <div class="field-row format-fields">
-            <label class="field">
-              <span class="label">Proporção</span>
-              <select name="aspect_ratio" id="aspect_ratio">
-                <option value="9:16">9:16 Shorts / TikTok / Reels</option>
-                <option value="1:1">1:1 Quadrado</option>
-                <option value="4:5">4:5 Feed</option>
-                <option value="16:9">16:9 Landscape</option>
-              </select>
-            </label>
-            <label class="field">
-              <span class="label">Resolução</span>
-              <select name="download_format" id="download_format">
-                <option value="360">360p</option>
-                <option value="480">480p</option>
-                <option value="720" selected>720p</option>
-                <option value="1080">1080p</option>
-              </select>
-            </label>
-          </div>
-        </div>
-
         <div class="caption-area" id="caption-area" hidden>
           <div class="section-head">
             <div>
@@ -236,7 +171,7 @@
               <p class="hint" id="caption-hint">Escolha o tema e ajuste tipografia — as palavras destacam no ritmo da fala</p>
             </div>
             <div class="pick-actions">
-              <button type="button" class="btn ghost" id="caption-back">← Formato</button>
+              <button type="button" class="btn ghost" id="caption-back">← Fonte</button>
               <button type="button" class="btn primary" id="caption-continue">
                 <span id="caption-continue-label">Continuar para tópicos</span>
                 <span class="btn-arrow" aria-hidden="true">→</span>
@@ -294,6 +229,30 @@
               </label>
             </div>
 
+            <div class="field-row caption-position-row">
+              <label class="field caption-position-field">
+                <span class="label">
+                  Posição vertical
+                  <span class="caption-position-val" id="caption-margin-v-val">160</span>
+                </span>
+                <input
+                  type="range"
+                  id="caption-margin-v"
+                  min="40"
+                  max="720"
+                  step="10"
+                  value="160"
+                  aria-valuemin="40"
+                  aria-valuemax="720"
+                  aria-valuenow="160"
+                />
+                <span class="caption-position-ends" aria-hidden="true">
+                  <span>Mais baixo</span>
+                  <span>Mais alto</span>
+                </span>
+              </label>
+            </div>
+
             <div class="caption-preview-wrap">
               <div class="caption-preview-frame" id="caption-preview-frame" data-ratio="9:16">
                 <video id="caption-preview-video" class="caption-preview-video" playsinline preload="metadata"></video>
@@ -304,6 +263,10 @@
                 <span class="caption-preview-badge" id="caption-preview-badge">9:16</span>
               </div>
               <div class="caption-preview-bar">
+                <div class="aspect-toggle" id="aspect-toggle" role="group" aria-label="Proporção do short">
+                  <button type="button" class="aspect-toggle-btn is-active" data-ratio="9:16" aria-pressed="true">9:16</button>
+                  <button type="button" class="aspect-toggle-btn" data-ratio="16:9" aria-pressed="false">16:9</button>
+                </div>
                 <button type="button" class="btn ghost" id="caption-preview-toggle">▶ Pré-visualizar</button>
                 <p class="hint caption-preview-meta" id="caption-preview-meta">Preview com o primeiro tópico selecionado</p>
               </div>
@@ -315,7 +278,7 @@
           <div class="section-head">
             <div>
               <h2 style="font-size:1.2rem">Tópicos encontrados</h2>
-              <p class="hint" id="pick-hint">Selecione os momentos e ajuste o início/fim de cada corte</p>
+              <p class="hint" id="pick-hint">Selecione os momentos, renderize um a um ou gere em lote</p>
             </div>
             <div class="pick-actions">
               <button type="button" class="btn ghost" id="pick-back">← Legendas</button>
@@ -334,6 +297,32 @@
       </div>
 
       <pre class="log" id="job-log" aria-live="polite" hidden></pre>
+
+      <div class="project-library" id="project-library">
+        <div class="library-section">
+          <div class="section-head">
+            <div>
+              <h2 style="font-size:1.15rem">Pendentes de render</h2>
+              <p class="hint">Selecionados e ainda sem clip pronto</p>
+            </div>
+            <button type="button" class="btn ghost btn-tiny" id="refresh-library">Atualizar</button>
+          </div>
+          <div class="library-list" id="library-pending">
+            <p class="empty">Nenhum pendente.</p>
+          </div>
+        </div>
+        <div class="library-section">
+          <div class="section-head">
+            <div>
+              <h2 style="font-size:1.15rem">Shorts gerados</h2>
+              <p class="hint">Clips já renderizados neste canal</p>
+            </div>
+          </div>
+          <div class="library-list" id="library-rendered">
+            <p class="empty">Nenhum short gerado ainda.</p>
+          </div>
+        </div>
+      </div>
     </section>
 
     <!-- JOBS -->
@@ -378,9 +367,9 @@
         <label class="field config-item">
           <span class="label">Privacidade padrão</span>
           <select name="privacy_status" id="yt-privacy">
-            <option value="private">private</option>
+            <option value="public" selected>public</option>
             <option value="unlisted">unlisted</option>
-            <option value="public">public</option>
+            <option value="private">private</option>
           </select>
         </label>
         <div class="field config-item yt-status-box">
@@ -392,6 +381,80 @@
         <button type="submit" form="youtube-form" class="btn primary">Salvar canal</button>
         <button type="button" class="btn ghost" id="yt-oauth-btn">Conectar YouTube</button>
         <p class="hint" id="youtube-hint"></p>
+      </div>
+
+      <div class="section-head config-section-gap">
+        <h2>Perfil de viralidade</h2>
+        <p class="lede small">
+          Critérios deste canal para o LLM escolher e cortar shorts.
+          O hook falado precisa cair nos primeiros segundos do corte.
+        </p>
+      </div>
+      <form id="virality-form" class="config-grid virality-config">
+        <label class="field config-item">
+          <span class="label">Nicho / tom do canal</span>
+          <input
+            type="text"
+            name="niche"
+            id="virality-niche"
+            maxlength="200"
+            placeholder="ex.: debate político ácido, humor, negócios…"
+            autocomplete="off"
+          />
+        </label>
+        <label class="field config-item">
+          <span class="label">Hook nos primeiros (segundos)</span>
+          <input
+            type="number"
+            name="hook_in_first_seconds"
+            id="virality-hook-seconds"
+            min="1"
+            max="5"
+            step="0.5"
+            value="2.5"
+          />
+          <span class="secret-note">A fala crítica deve começar até este instante no short</span>
+        </label>
+        <fieldset class="field config-item virality-signals">
+          <legend class="label">Priorizar sinais</legend>
+          <div class="virality-check-grid" id="virality-prefer"></div>
+        </fieldset>
+        <fieldset class="field config-item virality-signals">
+          <legend class="label">Depriorizar</legend>
+          <div class="virality-check-grid" id="virality-deprioritize"></div>
+        </fieldset>
+        <label class="field config-item">
+          <span class="label">Aberturas proibidas <em>— uma por linha</em></span>
+          <textarea
+            name="forbidden_openings"
+            id="virality-forbidden"
+            rows="3"
+            placeholder="então&#10;tipo&#10;vamos falar sobre"
+          ></textarea>
+        </label>
+        <label class="field config-item">
+          <span class="label">Regras extras do editor</span>
+          <textarea
+            name="custom_rules"
+            id="virality-rules"
+            rows="4"
+            placeholder="ex.: Começar sempre com a frase mais polêmica. Contexto só depois do segundo 4."
+          ></textarea>
+        </label>
+        <label class="field config-item">
+          <span class="label">Hooks que funcionam neste canal <em>— uma por linha (few-shot)</em></span>
+          <textarea
+            name="few_shot_hooks"
+            id="virality-fewshot"
+            rows="4"
+            placeholder="Liberdade total? Tem coisa que não pode&#10;Proibir falar de vacina é pior que mentir"
+          ></textarea>
+        </label>
+      </form>
+      <div class="actions">
+        <button type="submit" form="virality-form" class="btn primary">Salvar perfil</button>
+        <button type="button" class="btn ghost" id="virality-reset">Restaurar padrão</button>
+        <p class="hint" id="virality-hint"></p>
       </div>
 
       <div class="section-head config-section-gap">
@@ -407,8 +470,32 @@
   </main>
 
   <footer class="foot">
-    <span>Projetos = canais YouTube · dentro: análise → formato → tópicos → legendas → corte</span>
+    <span>Projetos = canais YouTube · dentro: análise → legendas → tópicos → corte</span>
   </footer>
+
+  <div class="sources-modal" id="sources-modal" hidden>
+    <div class="sources-modal-backdrop" data-sources-dismiss tabindex="-1" aria-hidden="true"></div>
+    <div
+      class="sources-modal-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="sources-modal-title"
+    >
+      <div class="sources-modal-head">
+        <div>
+          <h3 class="sources-modal-title" id="sources-modal-title">Vídeos baixados</h3>
+          <p class="hint">Escolha uma fonte em cache para reaproveitar download e transcrição</p>
+        </div>
+        <div class="sources-modal-actions">
+          <button type="button" class="btn ghost btn-tiny" id="refresh-sources">Atualizar</button>
+          <button type="button" class="btn ghost" id="sources-modal-close">Fechar</button>
+        </div>
+      </div>
+      <div class="recent-list sources-modal-list" id="recent-sources">
+        <p class="empty">Carregando…</p>
+      </div>
+    </div>
+  </div>
 
   <div class="trim-modal" id="trim-editor" hidden>
     <div class="trim-modal-backdrop" data-trim-dismiss tabindex="-1" aria-hidden="true"></div>
@@ -498,6 +585,36 @@
               <span>Salvar ajustes</span>
             </button>
           </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="yt-upload-modal" id="yt-upload-modal" hidden>
+    <div class="yt-upload-modal-backdrop" data-yt-upload-dismiss tabindex="-1" aria-hidden="true"></div>
+    <div
+      class="yt-upload-modal-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="yt-upload-modal-title"
+    >
+      <div class="yt-upload-modal-head">
+        <div>
+          <h3 class="yt-upload-modal-title" id="yt-upload-modal-title">Enviar ao YouTube</h3>
+          <p class="hint" id="yt-upload-modal-hint">Revise título, descrição, hashtags e thumbnail antes do upload</p>
+        </div>
+        <button type="button" class="btn ghost" id="yt-upload-modal-close">Fechar</button>
+      </div>
+      <div class="yt-upload-modal-body" id="yt-upload-modal-body">
+        <p class="empty">Carregando…</p>
+      </div>
+      <div class="yt-upload-modal-foot">
+        <p class="hint yt-upload-modal-status" id="yt-upload-modal-status" hidden></p>
+        <div class="yt-upload-modal-actions">
+          <button type="button" class="btn ghost" id="yt-upload-modal-cancel">Cancelar</button>
+          <button type="button" class="btn primary" id="yt-upload-modal-confirm" disabled>
+            Fazer upload
+          </button>
         </div>
       </div>
     </div>

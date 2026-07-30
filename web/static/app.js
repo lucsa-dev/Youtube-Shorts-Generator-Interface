@@ -237,8 +237,6 @@
     setProjectLibraryVisible(true);
     $("#run-area").hidden = true;
     $("#pick-area").hidden = true;
-    const formatArea = $("#format-area");
-    if (formatArea) formatArea.hidden = true;
     const castArea = $("#cast-area");
     if (castArea) castArea.hidden = true;
     $("#results").innerHTML = "";
@@ -274,7 +272,7 @@
 
   function statusToStep(status) {
     if (status === "awaiting_cast" || status === "ranking") return 2;
-    if (status === "awaiting_selection") return 2;
+    if (status === "awaiting_selection") return 3;
     if (status === "rendering" || status === "completed" || status === "interrupted")
       return 5;
     return 1;
@@ -303,14 +301,16 @@
 
   function selectionResumeStep(job) {
     let saved = Number(job?.params?.ui_step);
-    if (!Number.isFinite(saved)) return 2;
+    if (!Number.isFinite(saved)) return 3;
     // flow_version < 2: step 3 was topics and 4 was captions — swap on resume
     if (Number(job?.params?.flow_version) !== 2) {
       if (saved === 3) saved = 4;
       else if (saved === 4) saved = 3;
     }
-    if (saved >= 2 && saved <= 4) return saved;
-    return 2;
+    // Format step removed: old ui_step 2 (formato) → legendas
+    if (saved === 2) saved = 3;
+    if (saved >= 2 && saved <= 5) return saved;
+    return 3;
   }
 
   async function persistUiStep(step) {
@@ -407,12 +407,9 @@
       if (n === step) dot.setAttribute("aria-current", "step");
       else dot.removeAttribute("aria-current");
     });
-    const castGate =
-      step === 2 &&
-      (state.jobStatus === "awaiting_cast" || state.jobStatus === "ranking");
     const labels = {
       1: "1 · Configurar fonte",
-      2: castGate ? "2 · Identificar locutores" : "2 · Formato",
+      2: "2 · Identificar locutores",
       3: "3 · Legendas karaoke",
       4: "4 · Escolher tópicos",
       5: "5 · Cortar shorts",
@@ -456,7 +453,6 @@
 
     const cast = $("#cast-area");
     const pick = $("#pick-area");
-    const format = $("#format-area");
     const captions = $("#caption-area");
     const results = $("#results");
     const run = $("#run-area");
@@ -471,7 +467,6 @@
 
     const canPick = hasTopics && selectableStatus;
     const showCast = step === 2 && state.jobStatus === "awaiting_cast";
-    const showFormat = step === 2 && canPick;
     const showCaptions = step === 3 && canPick;
     const showPick = step === 4 && canPick;
     const showResults = step === 5;
@@ -483,9 +478,6 @@
     if (pick) {
       pick.hidden = !showPick;
       if (!showPick) closeTrimEditor({ silent: true });
-    }
-    if (format) {
-      format.hidden = !showFormat;
     }
     if (captions) {
       captions.hidden = !showCaptions;
@@ -508,7 +500,7 @@
         renderResults(state.lastJob);
       }
     }
-    if (run) run.hidden = !(showCast || showPick || showFormat || showCaptions || showResults);
+    if (run) run.hidden = !(showCast || showPick || showCaptions || showResults);
 
     syncPickContinueLabel();
   }
@@ -545,8 +537,13 @@
       modeEl.value = params.mode;
       syncUploadState();
     }
-    if (params.aspect_ratio) $("#aspect_ratio").value = params.aspect_ratio;
+    if (params.aspect_ratio) {
+      const aspect = params.aspect_ratio === "16:9" ? "16:9" : "9:16";
+      $("#aspect_ratio").value = aspect;
+      syncAspectToggle(aspect);
+    }
     if (params.download_format) $("#download_format").value = params.download_format;
+    else if ($("#download_format")) $("#download_format").value = "720";
     if (params.caption_style) {
       state.captionStyle = { ...state.captionStyle, ...params.caption_style };
     }
@@ -613,6 +610,9 @@
   syncUploadState();
 
   /* ---------- Recent sources ---------- */
+  let cachedSources = [];
+  let sourcesModalOpen = false;
+
   async function loadSources() {
     const block = $("#recent-block");
     const list = $("#recent-sources");
@@ -620,43 +620,68 @@
       const res = await fetch("/api/sources");
       const data = await res.json();
       const sources = data.sources || [];
+      cachedSources = sources;
       if (!sources.length) {
         block.hidden = true;
-        list.innerHTML = "";
+        list.innerHTML = `<p class="empty">Nenhum vídeo baixado ainda.</p>`;
+        if (sourcesModalOpen) closeSourcesModal();
         return;
       }
       block.hidden = false;
-      list.innerHTML = "";
-      for (const s of sources) {
-        const btn = document.createElement("button");
-        btn.type = "button";
-        btn.className = "recent-chip";
-        btn.title = s.title || s.url || "";
-        const thumb = s.thumbnail
-          ? `<img class="recent-chip-thumb" src="${escapeAttr(s.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
-          : `<span class="recent-chip-thumb is-placeholder">mp4</span>`;
-        const bits = [];
-        if (s.size_label) bits.push(s.size_label);
-        if (s.has_transcript_cache) bits.push("srt");
-        const titleLabel = truncate(s.title || s.url || s.id || "fonte", 42);
-        btn.innerHTML = `
-          ${thumb}
-          <span class="recent-chip-text">
-            <span class="recent-chip-id">${escapeHtml(titleLabel)}</span>
-            <span class="recent-chip-meta">${escapeHtml(bits.join(" · ") || (s.mode || "local"))}</span>
-          </span>
-        `;
-        btn.addEventListener("click", () => selectSource(s, btn));
-        list.appendChild(btn);
-      }
+      renderSourcesList(sources);
     } catch {
       block.hidden = true;
+      cachedSources = [];
+      list.innerHTML = `<p class="empty">Não foi possível carregar as fontes.</p>`;
+      if (sourcesModalOpen) closeSourcesModal();
     }
   }
 
-  function selectSource(source, cardEl) {
-    $$(".recent-chip").forEach((c) => c.classList.remove("is-selected"));
-    cardEl.classList.add("is-selected");
+  function renderSourcesList(sources) {
+    const list = $("#recent-sources");
+    list.innerHTML = "";
+    for (const s of sources) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "recent-chip";
+      btn.title = s.title || s.url || "";
+      const thumb = s.thumbnail
+        ? `<img class="recent-chip-thumb" src="${escapeAttr(s.thumbnail)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+        : `<span class="recent-chip-thumb is-placeholder">mp4</span>`;
+      const bits = [];
+      if (s.size_label) bits.push(s.size_label);
+      if (s.has_transcript_cache) bits.push("srt");
+      const titleLabel = truncate(s.title || s.url || s.id || "fonte", 72);
+      btn.innerHTML = `
+        ${thumb}
+        <span class="recent-chip-text">
+          <span class="recent-chip-id">${escapeHtml(titleLabel)}</span>
+          <span class="recent-chip-meta">${escapeHtml(bits.join(" · ") || (s.mode || "local"))}</span>
+        </span>
+      `;
+      btn.addEventListener("click", () => selectSource(s));
+      list.appendChild(btn);
+    }
+  }
+
+  function openSourcesModal() {
+    const modal = $("#sources-modal");
+    if (!modal) return;
+    if (cachedSources.length) renderSourcesList(cachedSources);
+    else loadSources();
+    modal.hidden = false;
+    sourcesModalOpen = true;
+    document.body.classList.add("sources-modal-open");
+  }
+
+  function closeSourcesModal() {
+    const modal = $("#sources-modal");
+    if (modal) modal.hidden = true;
+    sourcesModalOpen = false;
+    document.body.classList.remove("sources-modal-open");
+  }
+
+  function selectSource(source) {
     $("#url").value = source.url;
     if (source.kind === "cache" || source.kind === "upload") {
       if ([...modeEl.options].some((o) => o.value === "local")) {
@@ -671,10 +696,21 @@
     $("#form-hint").textContent = source.has_transcript_cache
       ? "fonte em cache — download/transcrição serão reaproveitados"
       : "fonte selecionada — pronta para gerar";
+    closeSourcesModal();
     $("#url").focus();
   }
 
-  $("#refresh-sources").addEventListener("click", loadSources);
+  $("#open-sources-btn")?.addEventListener("click", () => openSourcesModal());
+  $("#refresh-sources")?.addEventListener("click", loadSources);
+  $("#sources-modal-close")?.addEventListener("click", () => closeSourcesModal());
+  $("#sources-modal")?.addEventListener("click", (ev) => {
+    if (ev.target.closest("[data-sources-dismiss]")) closeSourcesModal();
+  });
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    if ($("#sources-modal")?.hidden) return;
+    closeSourcesModal();
+  });
 
   fileInput.addEventListener("change", () => {
     fileHint.textContent = fileInput.files?.[0]?.name || "Arraste um mp4 ou clique para escolher";
@@ -977,7 +1013,7 @@
       $("#yt-client-id").value = yt.client_id || "";
       $("#yt-client-secret").value = "";
       $("#yt-refresh-token").value = "";
-      $("#yt-privacy").value = yt.privacy_status || "private";
+      $("#yt-privacy").value = yt.privacy_status || "public";
       const secretNote = $("#yt-secret-note");
       const tokenNote = $("#yt-token-note");
       if (secretNote) {
@@ -1000,10 +1036,157 @@
         status.textContent = bits.join(" · ");
       }
       if (hint) hint.textContent = "";
+      fillViralityForm(project);
     } catch (err) {
       if (hint) hint.textContent = `erro: ${err.message}`;
     }
   }
+
+  const DEFAULT_VIRALITY_SIGNALS = [
+    { id: "hook", label: "Hook moments", desc: "curiosidade imediata" },
+    { id: "emotional", label: "Emotional peaks", desc: "surpresa, raiva, vulnerabilidade" },
+    { id: "opinion", label: "Opinion bombs", desc: "takes polarizantes" },
+    { id: "revelation", label: "Revelation moments", desc: "fatos / confissões" },
+    { id: "conflict", label: "Conflict / tension", desc: "embate, pushback" },
+    { id: "quotable", label: "Quotable one-liners", desc: "frase de quote card" },
+    { id: "story", label: "Story peaks", desc: "clímax de história" },
+    { id: "practical", label: "Practical value", desc: "dica acionável" },
+  ];
+
+  function viralitySignals(project) {
+    const list = project?.virality_signals;
+    return Array.isArray(list) && list.length ? list : DEFAULT_VIRALITY_SIGNALS;
+  }
+
+  function renderViralityChecks(containerId, name, signals, selected) {
+    const el = $(containerId);
+    if (!el) return;
+    const selectedSet = new Set(selected || []);
+    el.innerHTML = signals
+      .map((sig) => {
+        const id = escapeAttr(sig.id);
+        const checked = selectedSet.has(sig.id) ? "checked" : "";
+        return `<label class="virality-check">
+          <input type="checkbox" name="${name}" value="${id}" ${checked} />
+          <span><strong>${escapeHtml(sig.label)}</strong>${escapeHtml(sig.desc || "")}</span>
+        </label>`;
+      })
+      .join("");
+  }
+
+  function fillViralityForm(project) {
+    const profile = project?.virality_profile || {};
+    const signals = viralitySignals(project);
+    const niche = $("#virality-niche");
+    const hookSec = $("#virality-hook-seconds");
+    const forbidden = $("#virality-forbidden");
+    const rules = $("#virality-rules");
+    const fewshot = $("#virality-fewshot");
+    if (niche) niche.value = profile.niche || "";
+    if (hookSec) hookSec.value = profile.hook_in_first_seconds ?? 2.5;
+    if (forbidden) {
+      forbidden.value = (profile.forbidden_openings || []).join("\n");
+    }
+    if (rules) rules.value = profile.custom_rules || "";
+    if (fewshot) fewshot.value = (profile.few_shot_hooks || []).join("\n");
+    renderViralityChecks("#virality-prefer", "prefer", signals, profile.prefer || []);
+    renderViralityChecks(
+      "#virality-deprioritize",
+      "deprioritize",
+      signals,
+      profile.deprioritize || []
+    );
+    const hint = $("#virality-hint");
+    if (hint) {
+      hint.textContent = project?.virality_customized
+        ? "perfil personalizado ativo neste canal"
+        : "usando critérios padrão (hook-first)";
+    }
+  }
+
+  function readViralityForm() {
+    const prefer = [...document.querySelectorAll('#virality-prefer input[name="prefer"]:checked')].map(
+      (el) => el.value
+    );
+    const deprioritize = [
+      ...document.querySelectorAll('#virality-deprioritize input[name="deprioritize"]:checked'),
+    ].map((el) => el.value);
+    const lines = (el) =>
+      String(el?.value || "")
+        .split("\n")
+        .map((s) => s.trim())
+        .filter(Boolean);
+    const hookRaw = parseFloat($("#virality-hook-seconds")?.value || "2.5");
+    return {
+      niche: String($("#virality-niche")?.value || "").trim(),
+      hook_in_first_seconds: Number.isFinite(hookRaw) ? hookRaw : 2.5,
+      prefer,
+      deprioritize,
+      forbidden_openings: lines($("#virality-forbidden")),
+      custom_rules: String($("#virality-rules")?.value || "").trim(),
+      few_shot_hooks: lines($("#virality-fewshot")),
+    };
+  }
+
+  $("#virality-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    if (!state.projectId) return;
+    const hint = $("#virality-hint");
+    if (hint) hint.textContent = "salvando…";
+    try {
+      const res = await fetch(`/api/projects/${state.projectId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ virality_profile: readViralityForm() }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(
+          typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`
+        );
+      }
+      state.project = data;
+      fillViralityForm(data);
+      if (hint) hint.textContent = "perfil de viralidade salvo";
+    } catch (err) {
+      if (hint) hint.textContent = `erro: ${err.message}`;
+    }
+  });
+
+  $("#virality-reset")?.addEventListener("click", async () => {
+    if (!state.projectId) return;
+    if (!confirm("Restaurar o perfil de viralidade para o padrão?")) return;
+    const hint = $("#virality-hint");
+    if (hint) hint.textContent = "restaurando…";
+    try {
+      const res = await fetch(`/api/projects/${state.projectId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          virality_profile: {
+            niche: "",
+            hook_in_first_seconds: 2.5,
+            prefer: [],
+            deprioritize: [],
+            forbidden_openings: [],
+            custom_rules: "",
+            few_shot_hooks: [],
+          },
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        throw new Error(
+          typeof data.detail === "string" ? data.detail : `HTTP ${res.status}`
+        );
+      }
+      state.project = data;
+      fillViralityForm(data);
+      if (hint) hint.textContent = "perfil restaurado ao padrão";
+    } catch (err) {
+      if (hint) hint.textContent = `erro: ${err.message}`;
+    }
+  });
 
   async function loadConfig() {
     const form = $("#config-form");
@@ -1064,7 +1247,7 @@
     const name = String(fd.get("name") || "").trim();
     const youtube = {
       client_id: String(fd.get("client_id") || "").trim(),
-      privacy_status: String(fd.get("privacy_status") || "private"),
+      privacy_status: String(fd.get("privacy_status") || "public"),
     };
     const secret = String(fd.get("client_secret") || "").trim();
     const token = String(fd.get("refresh_token") || "").trim();
@@ -1102,7 +1285,7 @@
       const fd = new FormData(form);
       const youtube = {
         client_id: String(fd.get("client_id") || "").trim(),
-        privacy_status: String(fd.get("privacy_status") || "private"),
+        privacy_status: String(fd.get("privacy_status") || "public"),
       };
       const secret = String(fd.get("client_secret") || "").trim();
       if (secret) youtube.client_secret = secret;
@@ -1175,7 +1358,7 @@
 
     const fd = new FormData(e.target);
     if (!fileInput.files?.length) fd.delete("file");
-    // Formato fica no passo 2 — envia defaults atuais dos selects
+    // Defaults: 9:16 + 720p (proporção ajustável no preview de legendas)
     fd.set("aspect_ratio", $("#aspect_ratio")?.value || "9:16");
     fd.set("download_format", $("#download_format")?.value || "720");
     fd.set("project_id", state.projectId);
@@ -1210,8 +1393,6 @@
     setProjectLibraryVisible(false);
     $("#run-area").hidden = true;
     $("#pick-area").hidden = true;
-    const formatArea = $("#format-area");
-    if (formatArea) formatArea.hidden = true;
     const castArea = $("#cast-area");
     if (castArea) castArea.hidden = true;
     $("#topic-list").innerHTML = "";
@@ -1286,10 +1467,24 @@
         if (state.selectedIds.size > 0) {
           state.maxStep = Math.max(state.maxStep, 4);
         }
-        if (state.followJobStep) setFlowStep(resume);
-        else showFlowView(state.viewStep);
+        const readyShorts = (job.result?.shorts || []).filter(
+          (s) => s.clip_url && !s.error
+        );
+        const incomplete = incompleteRenderInfo(job);
+        if (readyShorts.length || incomplete) {
+          state.maxStep = Math.max(state.maxStep, 5);
+          state.renderedIds = new Set(
+            readyShorts
+              .map((s, i) => Number(s.id ?? i))
+              .filter((n) => !Number.isNaN(n))
+          );
+        }
+        if (state.followJobStep) {
+          setFlowStep(incomplete || (resume >= 5 && readyShorts.length) ? 5 : resume);
+        } else showFlowView(state.viewStep);
         if (state.viewStep === 3) syncCaptionForm();
         if (state.viewStep === 4) renderTopicPicker(job);
+        if (state.viewStep === 5) renderResults(job);
         if (state.pollTimer) {
           clearInterval(state.pollTimer);
           state.pollTimer = null;
@@ -1302,15 +1497,19 @@
             .map((s, i) => Number(s.id ?? i))
             .filter((n) => !Number.isNaN(n))
         );
-        if (job.params?.selected_ids?.length) {
-          state.selectedIds = new Set(job.params.selected_ids.map(Number));
-        } else if (job.result?.selected_ids?.length) {
-          state.selectedIds = new Set(job.result.selected_ids.map(Number));
+        // Keep checkbox selection on the topics step; only sync when following results
+        if (state.followJobStep || state.viewStep === 5) {
+          if (job.params?.selected_ids?.length) {
+            state.selectedIds = new Set(job.params.selected_ids.map(Number));
+          } else if (job.result?.selected_ids?.length) {
+            state.selectedIds = new Set(job.result.selected_ids.map(Number));
+          }
         }
         state.highlights = job.result?.highlights || state.highlights;
         state.maxStep = Math.max(state.maxStep, 5);
         if (state.followJobStep) setFlowStep(5);
-        else showFlowView(state.viewStep);
+        else if (state.viewStep !== 4) showFlowView(state.viewStep);
+        if (state.viewStep === 4) syncTopicPicker(job);
         if (state.viewStep === 5) renderResults(job);
       } else if (job.status === "interrupted") {
         const shorts = job.result?.shorts || [];
@@ -1329,7 +1528,6 @@
         if (state.followJobStep) setFlowStep(5);
         else showFlowView(state.viewStep);
         if (state.viewStep === 3) syncCaptionForm();
-        if (state.viewStep === 4) renderTopicPicker(job);
         if (state.viewStep === 5) renderResults(job);
         const capBtn = $("#caption-continue");
         if (capBtn) capBtn.disabled = false;
@@ -1350,9 +1548,9 @@
           renderResults(job);
         } else {
           state.maxStep = Math.max(state.maxStep, 5);
-          showFlowView(state.viewStep);
+          if (state.viewStep !== 4) showFlowView(state.viewStep);
           if (state.viewStep === 3) syncCaptionForm();
-          if (state.viewStep === 4) renderTopicPicker(job);
+          // prepareSelection already synced step 4 cards
           if (state.viewStep === 5) renderResults(job);
         }
         const capBtn = $("#caption-continue");
@@ -1414,7 +1612,7 @@
     if (state.selectedIds.size === 0) {
       state.selectedIds = selectedIdsFromJob(job, highlights);
     }
-    if (state.viewStep === 4) renderTopicPicker(job);
+    if (state.viewStep === 4) syncTopicPicker(job);
   }
 
   function syncCastNamesFromDom() {
@@ -1729,12 +1927,54 @@
   $("#cast-add")?.addEventListener("click", () => addCastSpeaker());
 
   function currentAspectRatio() {
-    return (
+    const raw =
       $("#aspect_ratio")?.value ||
       state.jobParams?.aspect_ratio ||
       state.lastJob?.params?.aspect_ratio ||
-      "9:16"
-    );
+      "9:16";
+    return raw === "16:9" ? "16:9" : "9:16";
+  }
+
+  function syncAspectToggle(aspect) {
+    const ratio = aspect || currentAspectRatio();
+    const input = $("#aspect_ratio");
+    if (input) input.value = ratio;
+    $$("#aspect-toggle .aspect-toggle-btn").forEach((btn) => {
+      const on = btn.dataset.ratio === ratio;
+      btn.classList.toggle("is-active", on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+  }
+
+  async function setAspectRatio(aspect, { persist = true } = {}) {
+    const ratio = aspect === "16:9" ? "16:9" : "9:16";
+    const input = $("#aspect_ratio");
+    if (input) input.value = ratio;
+    syncAspectToggle(ratio);
+    applyPreviewAspect(ratio);
+    if (state.viewStep === 3) updateCaptionPreview();
+    if (!persist || !state.activeJobId) return;
+    const fmt =
+      $("#download_format")?.value ||
+      state.jobParams?.download_format ||
+      state.lastJob?.params?.download_format ||
+      "720";
+    try {
+      const res = await fetch(`/api/jobs/${state.activeJobId}/params`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          aspect_ratio: ratio,
+          download_format: fmt,
+          regenerate: false,
+        }),
+      });
+      if (!res.ok) return;
+      if (state.lastJob?.params) state.lastJob.params.aspect_ratio = ratio;
+      state.jobParams = { ...(state.jobParams || {}), aspect_ratio: ratio };
+    } catch (_) {
+      /* best-effort */
+    }
   }
 
   const captionWordsCache = new Map();
@@ -1778,14 +2018,20 @@
     const bold = style.bold !== false;
     const font = style.font_name || "Arial Black";
     const border = Number(style.outline || 4);
+    const marginV = Math.max(0, Number(style.margin_v ?? 160));
     const frameW = frameEl?.clientWidth || el.parentElement?.clientWidth || 280;
+    const frameH = frameEl?.clientHeight || el.parentElement?.clientHeight || 500;
     const scale = frameW / 1080;
     const strokePx = border > 0 ? border * scale * 2 : 0;
+    // ASS Alignment=2 MarginV is px from bottom of PlayResY (1920).
+    const bottomPx = marginV * (frameH / 1920);
     el.style.fontFamily = `"${font}", Impact, sans-serif`;
     el.style.fontSize = `${Math.max(12, Math.round(size * scale))}px`;
     el.style.fontWeight = bold ? "900" : "600";
     el.style.webkitTextStroke = strokePx > 0 ? `${strokePx}px ${outline}` : "0";
     el.style.paintOrder = "stroke fill";
+    el.style.top = "auto";
+    el.style.bottom = `${Math.max(0, Math.round(bottomPx))}px`;
     el.dataset.primary = primary;
     el.dataset.secondary = secondary;
   }
@@ -1876,6 +2122,11 @@
     });
     const trimFrame = $("#trim-player-frame");
     if (trimFrame) trimFrame.dataset.ratio = ratio;
+    const capFrame = $("#caption-preview-frame");
+    if (capFrame) capFrame.dataset.ratio = ratio;
+    const badge = $("#caption-preview-badge");
+    if (badge) badge.textContent = ratio;
+    syncAspectToggle(ratio);
   }
 
   function pauseAllTopicVideos({ except = null } = {}) {
@@ -1974,6 +2225,16 @@
   function bindTopicMedia(media) {
     const video = $(".topic-video", media);
     if (!video) return;
+    if (media.classList.contains("is-rendered")) {
+      // Final short: native controls only — no source-range preview loop
+      video.addEventListener("play", () => {
+        pauseAllTopicVideos({ except: media });
+        media.classList.add("is-playing", "has-frame");
+      });
+      video.addEventListener("pause", () => media.classList.remove("is-playing"));
+      video.addEventListener("ended", () => media.classList.remove("is-playing"));
+      return;
+    }
 
     video.addEventListener("timeupdate", () => {
       const end = float(media.dataset.end);
@@ -2006,7 +2267,407 @@
     });
   }
 
+  function topicRenderSkeletonHtml(thumbUrl) {
+    const thumbImg = thumbUrl
+      ? `<img class="short-skeleton-thumb" src="${escapeAttr(
+          thumbUrl
+        )}" alt="" loading="lazy" onerror="this.remove()" />`
+      : "";
+    return `<div class="short-skeleton is-rendering" aria-busy="true">
+      ${thumbImg}
+      <div class="short-skeleton-shine"></div>
+      <span class="short-skeleton-label">Renderizando…</span>
+    </div>`;
+  }
+
+  function topicPreviewThumbUrl(h, id, short = null) {
+    // Prefer AI / custom short poster (available even before render)
+    if (short?.thumbnail_url && (short.thumbnail_ai || short.clip_url)) {
+      return short.thumbnail_url;
+    }
+    if (h?.thumbnail_ai && h?.thumbnail_url) {
+      return h.thumbnail_url;
+    }
+    if (short?.thumbnail_url) {
+      return short.thumbnail_url;
+    }
+    return (
+      h?.preview_thumbnail_url ||
+      h?.thumbnail_url ||
+      (state.activeJobId
+        ? `/api/jobs/${state.activeJobId}/preview-thumbs/${id}?v=2`
+        : "")
+    );
+  }
+
+  async function generateTopicAiThumbnail(id, btn) {
+    if (!state.activeJobId) return;
+    const hint = $("#pick-hint");
+    const label = btn?.textContent || "Gerar thumbnail IA";
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Gerando…";
+      btn.classList.add("is-busy");
+    }
+    if (hint) hint.textContent = `Gerando thumbnail IA do tópico #${id} (pode levar ~30–90s)…`;
+    try {
+      const res = await fetch(
+        `/api/jobs/${state.activeJobId}/highlights/${encodeURIComponent(id)}/generate-thumbnail`,
+        { method: "POST" }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail;
+        throw new Error(
+          typeof detail === "string"
+            ? detail
+            : detail
+              ? JSON.stringify(detail)
+              : res.statusText || "Falha ao gerar thumbnail"
+        );
+      }
+      const url = data.thumbnail_url || data.highlight?.thumbnail_url || data.short?.thumbnail_url || "";
+      applyTopicThumbnail(id, url, { ai: true });
+      if (btn) {
+        btn.textContent = "Regenerar thumbnail IA";
+        btn.disabled = false;
+        btn.classList.remove("is-busy");
+      }
+      if (hint) {
+        const faces = Array.isArray(data.faces) ? data.faces : [];
+        const names = faces.map((f) => f?.name).filter(Boolean).slice(0, 2);
+        hint.textContent = names.length
+          ? `Thumbnail IA pronta (#${id}) · ${names.join(", ")}`
+          : `Thumbnail IA pronta (#${id})`;
+      }
+    } catch (err) {
+      if (btn) {
+        btn.textContent = label;
+        btn.disabled = false;
+        btn.classList.remove("is-busy");
+      }
+      if (hint) hint.textContent = `Thumbnail IA: ${err.message}`;
+    }
+  }
+
+  function applyTopicThumbnail(topicId, thumbnailUrl, { ai = false } = {}) {
+    if (!thumbnailUrl) return;
+    if (state.lastJob?.result?.highlights) {
+      const highlights = state.lastJob.result.highlights;
+      for (let i = 0; i < highlights.length; i++) {
+        const hid = Number(highlights[i].id ?? i);
+        if (hid === Number(topicId)) {
+          highlights[i].thumbnail_url = thumbnailUrl;
+          if (ai) highlights[i].thumbnail_ai = true;
+          break;
+        }
+      }
+    }
+    applyShortThumbnail(topicId, thumbnailUrl);
+  }
+
+  async function renderSingleTopic(id) {
+    if (!state.activeJobId) return;
+    if (state.jobStatus === "rendering") {
+      $("#pick-hint").textContent = "Aguarde o render em andamento terminar";
+      return;
+    }
+    if (state.trim.highlightId != null && state.trim.dirty) {
+      await saveTrimEditor();
+      if (state.trim.dirty) return;
+    }
+    closeTrimEditor({ silent: true });
+
+    state.captionStyle = {
+      ...state.captionStyle,
+      ...(state.jobParams?.caption_style || {}),
+    };
+    applyThemeToForm({ ...state.captionStyle, id: state.captionStyle.theme });
+    const style = readCaptionForm();
+    state.captionStyle = style;
+    const force = state.renderedIds.has(id);
+    const hint = $("#pick-hint");
+    if (hint) {
+      hint.textContent = force
+        ? `Re-renderizando tópico #${id}…`
+        : `Renderizando tópico #${id}…`;
+    }
+
+    try {
+      const res = await fetch(`/api/jobs/${state.activeJobId}/select`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ids: [id],
+          append: true,
+          force,
+          caption_style: style,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
+      state.jobStatus = "rendering";
+      state.followJobStep = false;
+      state.maxStep = Math.max(state.maxStep, 5);
+      setFlowStep(4);
+      persistUiStep(4);
+      if (state.lastJob) {
+        const ready = [...state.renderedIds].filter((x) => Number(x) !== Number(id));
+        state.lastJob = {
+          ...state.lastJob,
+          status: "rendering",
+          params: {
+            ...state.lastJob.params,
+            selected_ids: data.selected_ids || [...ready, id],
+            caption_style: style,
+          },
+          result: {
+            ...(state.lastJob.result || {}),
+            selected_ids: data.selected_ids || [...ready, id],
+            shorts: (state.lastJob.result?.shorts || []).filter((s, i) =>
+              ready.includes(Number(s.id ?? i))
+            ),
+            render_progress: {
+              total: (data.selected_ids || [...ready, id]).length,
+              done: ready.length,
+              current_id: id,
+              pending_ids: [],
+              done_ids: ready,
+            },
+          },
+        };
+        syncTopicPicker(state.lastJob);
+      }
+      if (state.pollTimer) clearInterval(state.pollTimer);
+      pollJob();
+      state.pollTimer = setInterval(pollJob, 1500);
+    } catch (err) {
+      if (hint) hint.textContent = `erro: ${err.message}`;
+    }
+  }
+
+  function topicPickerProgressSig(job) {
+    const shorts = job?.result?.shorts || [];
+    const ready = shorts
+      .filter((s) => s.clip_url && !s.error)
+      .map((s, i) => Number(s.id ?? i))
+      .filter((n) => !Number.isNaN(n))
+      .sort((a, b) => a - b)
+      .join(",");
+    const progress = job?.result?.render_progress || null;
+    const current =
+      progress?.current_id != null ? Number(progress.current_id) : "";
+    return `${job?.status || ""}|${current}|${ready}`;
+  }
+
+  function syncTopicPicker(job, { force = false } = {}) {
+    const list = $("#topic-list");
+    const highlights = job?.result?.highlights || [];
+    if (!list || !highlights.length) {
+      renderTopicPicker(job);
+      return;
+    }
+    const cards = $$(".topic-card", list);
+    const idsMatch =
+      cards.length === highlights.length &&
+      highlights.every(
+        (h, i) => Number(cards[i]?.dataset.id) === Number(h.id ?? i)
+      );
+    if (force || !idsMatch) {
+      state.topicPickerSig = topicPickerProgressSig(job);
+      renderTopicPicker(job);
+      return;
+    }
+    const sig = topicPickerProgressSig(job);
+    if (!force && sig === state.topicPickerSig) {
+      // Still refresh hint while busy so the user sees progress text once
+      return;
+    }
+    state.topicPickerSig = sig;
+    patchTopicPicker(job);
+  }
+
+  function patchTopicPicker(job) {
+    const highlights = job.result?.highlights || [];
+    const shorts = job.result?.shorts || [];
+    const shortsById = new Map(
+      shorts.map((s, i) => [Number(s.id ?? i), s])
+    );
+    const progress = job.result?.render_progress || null;
+    const jobStatus = job.status || state.jobStatus;
+    const busy = jobStatus === "rendering";
+    const currentRenderId =
+      progress?.current_id != null ? Number(progress.current_id) : null;
+    const previewSrc = sourcePreviewUrl(job);
+    const aspect = currentAspectRatio();
+
+    highlights.forEach((h, i) => {
+      const id = Number(h.id ?? i);
+      const card = document.querySelector(
+        `#topic-list .topic-card[data-id="${id}"]`
+      );
+      if (!card) return;
+      const short = shortsById.get(id);
+      const already = Boolean(short?.clip_url && !short.error);
+      if (already) state.renderedIds.add(id);
+      const isRendering = busy && currentRenderId === id;
+      const media = $(".topic-media", card);
+      const wasRendered = Boolean(media?.classList.contains("is-rendered"));
+      const hadSkeleton = Boolean(media && $(".short-skeleton", media));
+
+      card.classList.toggle("is-ready", already);
+      card.classList.toggle("is-rendering", isRendering);
+
+      const h3 = $("h3", card);
+      if (h3) {
+        $$(".topic-ready", h3).forEach((el) => el.remove());
+        if (already) {
+          const badge = document.createElement("span");
+          badge.className = "topic-ready";
+          badge.textContent = "pronto";
+          h3.appendChild(document.createTextNode(" "));
+          h3.appendChild(badge);
+        } else if (isRendering) {
+          const badge = document.createElement("span");
+          badge.className = "topic-ready is-busy";
+          badge.textContent = "renderizando";
+          h3.appendChild(document.createTextNode(" "));
+          h3.appendChild(badge);
+        }
+      }
+
+      const renderBtn = $(".topic-render", card);
+      if (renderBtn) {
+        if (isRendering) {
+          renderBtn.textContent = "Renderizando…";
+          renderBtn.disabled = true;
+        } else if (busy) {
+          renderBtn.textContent = "Aguarde…";
+          renderBtn.disabled = true;
+        } else if (already) {
+          renderBtn.textContent = "Re-renderizar";
+          renderBtn.disabled = false;
+        } else {
+          renderBtn.textContent = "Renderizar";
+          renderBtn.disabled = false;
+        }
+      }
+
+      if (!media) return;
+
+      const rebindCheck = () => {
+        const newCheck = $(".topic-check", media);
+        newCheck?.addEventListener("click", (ev) => ev.stopPropagation());
+        newCheck?.addEventListener("change", () => {
+          if (newCheck.checked) {
+            state.selectedIds.add(id);
+            card.classList.add("is-selected");
+          } else {
+            state.selectedIds.delete(id);
+            card.classList.remove("is-selected");
+          }
+          syncPickContinue();
+          persistSelectedIds();
+        });
+      };
+
+      if (already && short?.clip_url && !wasRendered) {
+        const thumbUrl = topicPreviewThumbUrl(h, id, short);
+        media.className = "topic-media is-rendered has-frame is-static";
+        media.dataset.src = "";
+        media.dataset.ratio = aspect;
+        const check = $(".topic-check", media);
+        const checked = Boolean(check?.checked);
+        const posterAttr = thumbUrl ? ` poster="${escapeAttr(thumbUrl)}"` : "";
+        const thumbLayer = thumbUrl
+          ? `<img class="topic-thumb" src="${escapeAttr(thumbUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+          : `<span class="topic-thumb is-placeholder">frame</span>`;
+        media.innerHTML = `
+          <input class="topic-check" type="checkbox" ${
+            checked ? "checked" : ""
+          } aria-label="Selecionar tópico" />
+          <div class="topic-media-frame">
+            ${thumbLayer}<video class="topic-video" controls playsinline preload="metadata" src="${escapeAttr(
+              short.clip_url
+            )}"${posterAttr}></video>
+          </div>
+        `;
+        rebindCheck();
+        bindTopicMedia(media);
+      } else if (isRendering && (!hadSkeleton || wasRendered)) {
+        const thumbUrl = topicPreviewThumbUrl(h, id, short);
+        media.className = "topic-media is-static is-busy-render";
+        media.dataset.src = "";
+        media.dataset.ratio = aspect;
+        const check = $(".topic-check", media);
+        const checked = Boolean(check?.checked);
+        media.innerHTML = `
+          <input class="topic-check" type="checkbox" ${
+            checked ? "checked" : ""
+          } aria-label="Selecionar tópico" />
+          <div class="topic-media-frame">
+            ${topicRenderSkeletonHtml(thumbUrl)}
+          </div>
+        `;
+        rebindCheck();
+      } else if (!isRendering && !already && hadSkeleton) {
+        const thumbUrl = topicPreviewThumbUrl(h, id);
+        const check = $(".topic-check", media);
+        const checked = Boolean(check?.checked);
+        const thumbLayer = thumbUrl
+          ? `<img class="topic-thumb" src="${escapeAttr(thumbUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
+          : `<span class="topic-thumb is-placeholder">frame</span>`;
+        media.className = `topic-media${previewSrc ? "" : " is-static"}`;
+        media.dataset.src = previewSrc || "";
+        media.dataset.ratio = aspect;
+        media.innerHTML = `
+          <input class="topic-check" type="checkbox" ${
+            checked ? "checked" : ""
+          } aria-label="Selecionar tópico" />
+          <div class="topic-media-frame">
+            ${
+              previewSrc
+                ? `${thumbLayer}<video class="topic-video" playsinline preload="none"${
+                    thumbUrl ? ` poster="${escapeAttr(thumbUrl)}"` : ""
+                  }></video>
+                <div class="live-caption" aria-hidden="true"></div>
+                <div class="topic-media-overlay" aria-hidden="true"><span class="topic-play-icon" aria-label="Reproduzir"></span></div>`
+                : thumbLayer
+            }
+          </div>
+        `;
+        rebindCheck();
+        if (previewSrc) bindTopicMedia(media);
+      }
+
+      const actions = $(".topic-card-actions", card);
+      if (actions) {
+        let dl = $(".topic-download", actions);
+        if (already && short?.clip_url) {
+          if (!dl) {
+            dl = document.createElement("a");
+            dl.className = "topic-download";
+            dl.textContent = "Baixar";
+            dl.download = `short_${id}.mp4`;
+            actions.appendChild(dl);
+          }
+          dl.href = short.clip_url;
+        } else if (dl) {
+          dl.remove();
+        }
+      }
+    });
+
+    if (busy && currentRenderId != null) {
+      $("#pick-hint").textContent = `Renderizando tópico #${currentRenderId}…`;
+    } else if (state.renderedIds.size > 0) {
+      $("#pick-hint").textContent = `${state.renderedIds.size} short(s) pronto(s) — assista no card ou gere em lote`;
+    }
+    syncPickContinue();
+  }
+
   function renderTopicPicker(job) {
+    state.topicPickerSig = topicPickerProgressSig(job);
     const highlights = job.result?.highlights || [];
     state.highlights = highlights;
     const list = $("#topic-list");
@@ -2030,38 +2691,76 @@
     const previewSrc = sourcePreviewUrl(job);
     const aspect = currentAspectRatio();
     const editingId = state.trim.highlightId;
+    const shorts = job.result?.shorts || [];
+    const shortsById = new Map(
+      shorts.map((s, i) => [Number(s.id ?? i), s])
+    );
+    const progress = job.result?.render_progress || null;
+    const jobStatus = job.status || state.jobStatus;
+    const busy = jobStatus === "rendering";
+    const currentRenderId =
+      progress?.current_id != null ? Number(progress.current_id) : null;
+
     highlights.forEach((h, i) => {
       const id = Number(h.id ?? i);
       const selected = state.selectedIds.has(id);
-      const already = state.renderedIds.has(id);
+      const short = shortsById.get(id);
+      const already = Boolean(short?.clip_url && !short.error);
+      if (already) state.renderedIds.add(id);
       const editing = editingId != null && Number(editingId) === id;
+      const isRendering = busy && currentRenderId === id;
       const card = document.createElement("div");
       card.className = `topic-card${selected ? " is-selected" : ""}${
         editing ? " is-editing" : ""
-      }`;
+      }${already ? " is-ready" : ""}${isRendering ? " is-rendering" : ""}`;
       card.dataset.id = String(id);
       card.style.animationDelay = `${i * 0.04}s`;
-      const thumbUrl =
-        h.preview_thumbnail_url ||
-        h.thumbnail_url ||
-        (state.activeJobId
-          ? `/api/jobs/${state.activeJobId}/preview-thumbs/${id}?v=2`
-          : "");
+      const thumbUrl = already
+        ? topicPreviewThumbUrl(h, id, short)
+        : topicPreviewThumbUrl(h, id);
       const thumbLayer = thumbUrl
         ? `<img class="topic-thumb" src="${escapeAttr(thumbUrl)}" alt="" loading="lazy" referrerpolicy="no-referrer" />`
         : `<span class="topic-thumb is-placeholder">frame</span>`;
-      const mediaInner = previewSrc
-        ? `${thumbLayer}<video class="topic-video" playsinline preload="none"${
-            thumbUrl ? ` poster="${escapeAttr(thumbUrl)}"` : ""
-          }></video>`
-        : thumbLayer;
+
+      let mediaInner;
+      let mediaClass = "topic-media";
+      if (already && short?.clip_url) {
+        mediaClass += " is-rendered has-frame is-static";
+        const posterAttr = thumbUrl ? ` poster="${escapeAttr(thumbUrl)}"` : "";
+        mediaInner = `${thumbLayer}<video class="topic-video" controls playsinline preload="metadata" src="${escapeAttr(
+          short.clip_url
+        )}"${posterAttr}></video>`;
+      } else if (isRendering) {
+        mediaClass += " is-static is-busy-render";
+        mediaInner = topicRenderSkeletonHtml(thumbUrl);
+      } else {
+        mediaClass += previewSrc ? "" : " is-static";
+        mediaInner = previewSrc
+          ? `${thumbLayer}<video class="topic-video" playsinline preload="none"${
+              thumbUrl ? ` poster="${escapeAttr(thumbUrl)}"` : ""
+            }></video>`
+          : thumbLayer;
+      }
+
+      let renderLabel = "Renderizar";
+      let renderDisabled = false;
+      if (isRendering) {
+        renderLabel = "Renderizando…";
+        renderDisabled = true;
+      } else if (busy) {
+        renderLabel = "Aguarde…";
+        renderDisabled = true;
+      } else if (already) {
+        renderLabel = "Re-renderizar";
+      }
+
       card.innerHTML = `
         <div
-          class="topic-media${previewSrc ? "" : " is-static"}"
+          class="${mediaClass}"
           data-ratio="${escapeAttr(aspect)}"
           data-start="${escapeAttr(String(h.start_time ?? 0))}"
           data-end="${escapeAttr(String(h.end_time ?? 0))}"
-          data-src="${escapeAttr(previewSrc)}"
+          data-src="${escapeAttr(already ? "" : previewSrc)}"
         >
           <input
             class="topic-check"
@@ -2072,7 +2771,7 @@
           <div class="topic-media-frame">
             ${mediaInner}
             ${
-              previewSrc
+              !already && !isRendering && previewSrc
                 ? `<div class="live-caption" aria-hidden="true"></div><div class="topic-media-overlay" aria-hidden="true"><span class="topic-play-icon" aria-label="Reproduzir"></span></div>`
                 : ""
             }
@@ -2082,24 +2781,45 @@
           <div class="score"><strong>${h.score ?? "—"}</strong> / 100</div>
           <h3>${escapeHtml(h.title || `Tópico #${i + 1}`)}${
             already ? ` <span class="topic-ready">pronto</span>` : ""
-          }</h3>
+          }${isRendering ? ` <span class="topic-ready is-busy">renderizando</span>` : ""}</h3>
           ${
             h.attributed_to
               ? `<p class="meta-row"><strong>Locutor:</strong> ${escapeHtml(h.attributed_to)}</p>`
               : ""
           }
-          <p class="meta-row topic-time"><strong>Tempo:</strong> ${fmtTime(h.start_time)} → ${fmtTime(h.end_time)}</p>
+          <p class="meta-row topic-time"><strong>Tempo:</strong> ${fmtTime(h.start_time)} → ${fmtTime(h.end_time)}${
+            h.hook_start_time != null
+              ? ` · hook +${Math.max(0, Number(h.hook_start_time) - Number(h.start_time || 0)).toFixed(1)}s`
+              : ""
+          }</p>
           <p class="meta-row"><strong>Hook:</strong> ${escapeHtml(h.hook_sentence || "—")}</p>
           <p class="topic-snippet">${escapeHtml(h.snippet || h.virality_reason || "")}</p>
           <div class="topic-card-actions">
+            <button type="button" class="topic-render" data-render-id="${id}" ${
+              renderDisabled ? "disabled" : ""
+            }>${renderLabel}</button>
             <button type="button" class="topic-edit" data-edit-id="${id}">
               ${editing ? "Editando corte…" : "Ajustar corte"}
             </button>
+            <button type="button" class="topic-ai-thumb" data-ai-thumb-id="${id}">
+              ${
+                short?.thumbnail_ai || h.thumbnail_ai
+                  ? "Regenerar thumbnail IA"
+                  : "Gerar thumbnail IA"
+              }
+            </button>
+            ${
+              already
+                ? `<a class="topic-download" href="${escapeAttr(
+                    short.clip_url
+                  )}" download="short_${id}.mp4">Baixar</a>`
+                : ""
+            }
           </div>
         </div>
       `;
       const media = $(".topic-media", card);
-      if (previewSrc && media) bindTopicMedia(media);
+      if (media && (previewSrc || already)) bindTopicMedia(media);
       const check = $(".topic-check", card);
       check?.addEventListener("click", (ev) => ev.stopPropagation());
       check?.addEventListener("change", () => {
@@ -2113,16 +2833,31 @@
         syncPickContinue();
         persistSelectedIds();
       });
+      $(".topic-render", card)?.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        renderSingleTopic(id);
+      });
       $(".topic-edit", card)?.addEventListener("click", (ev) => {
         ev.preventDefault();
         ev.stopPropagation();
         openTrimEditor(id);
+      });
+      $(".topic-ai-thumb", card)?.addEventListener("click", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        generateTopicAiThumbnail(id, ev.currentTarget);
       });
       list.appendChild(card);
     });
 
     applyPreviewAspect(aspect);
     syncPickContinue();
+    if (busy && currentRenderId != null) {
+      $("#pick-hint").textContent = `Renderizando tópico #${currentRenderId}…`;
+    } else if (state.renderedIds.size > 0 && !busy) {
+      $("#pick-hint").textContent = `${state.renderedIds.size} short(s) pronto(s) — assista no card ou gere em lote`;
+    }
   }
 
   function toggleTopic(id, card) {
@@ -2882,6 +3617,7 @@
           ids,
           caption_style: style || undefined,
           force: false,
+          resume: true,
         }),
       });
       const data = await res.json();
@@ -2986,74 +3722,6 @@
     syncCaptionForm();
   });
 
-  $("#format-back")?.addEventListener("click", () => {
-    state.followJobStep = false;
-    setFlowStep(1);
-  });
-
-  $("#format-continue")?.addEventListener("click", async () => {
-    if (!state.activeJobId) return;
-    const btn = $("#format-continue");
-    const hint = $("#format-hint");
-    const aspect = $("#aspect_ratio")?.value || "9:16";
-    const fmt = $("#download_format")?.value || "720";
-    if (btn) btn.disabled = true;
-    if (hint) hint.textContent = "salvando formato…";
-    try {
-      if (state.selectedIds.size === 0 && state.lastJob) {
-        state.selectedIds = selectedIdsFromJob(
-          state.lastJob,
-          state.lastJob.result?.highlights || state.highlights
-        );
-      }
-      const selected = [...state.selectedIds]
-        .map(Number)
-        .filter((n) => !Number.isNaN(n));
-      const res = await fetch(`/api/jobs/${state.activeJobId}/params`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          aspect_ratio: aspect,
-          download_format: fmt,
-          ui_step: 3,
-          selected_ids: selected,
-          regenerate: false,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
-      if (state.lastJob) {
-        state.lastJob.params = {
-          ...state.lastJob.params,
-          aspect_ratio: aspect,
-          download_format: fmt,
-          ui_step: 3,
-          flow_version: 2,
-          selected_ids: selected,
-        };
-      }
-      state.jobParams = {
-        ...(state.jobParams || {}),
-        aspect_ratio: aspect,
-        download_format: fmt,
-        ui_step: 3,
-        flow_version: 2,
-        selected_ids: selected,
-      };
-      if (hint) {
-        hint.textContent =
-          "Escolha a proporção do corte. A resolução vale para novos downloads (análise).";
-      }
-      state.followJobStep = false;
-      setFlowStep(3, { maxStep: 3 });
-      syncCaptionForm();
-    } catch (err) {
-      if (hint) hint.textContent = `erro: ${err.message}`;
-    } finally {
-      if (btn) btn.disabled = false;
-    }
-  });
-
   /* ---------- Caption karaoke UI ---------- */
   function assToHex(ass) {
     // &HAABBGGRR → #RRGGBB
@@ -3075,8 +3743,25 @@
     return `&H${alpha}${bb}${gg}${rr}`.toUpperCase();
   }
 
+  function syncCaptionMarginLabel(value) {
+    const n = Math.max(40, Math.min(720, Number(value) || 160));
+    const val = $("#caption-margin-v-val");
+    const input = $("#caption-margin-v");
+    if (val) val.textContent = String(n);
+    if (input) {
+      input.value = String(n);
+      input.setAttribute("aria-valuenow", String(n));
+    }
+    return n;
+  }
+
   function readCaptionForm() {
     const themeBtn = $(".theme-chip.is-selected");
+    const marginRaw = $("#caption-margin-v")?.value;
+    const margin_v =
+      marginRaw != null && marginRaw !== ""
+        ? Number(marginRaw)
+        : state.captionStyle.margin_v ?? 160;
     return {
       theme: themeBtn?.dataset.theme || state.captionStyle.theme || "bold-white",
       enabled: true,
@@ -3089,7 +3774,7 @@
       outline_colour: hexToAss($("#caption-outline-color")?.value || "#000000"),
       bold: $("#caption-bold")?.checked ?? true,
       shadow: state.captionStyle.shadow ?? 0,
-      margin_v: state.captionStyle.margin_v ?? 160,
+      margin_v: Number.isFinite(margin_v) ? margin_v : 160,
       back_colour: state.captionStyle.back_colour || "&H80000000",
       uppercase: state.captionStyle.uppercase !== false,
     };
@@ -3123,6 +3808,7 @@
       $("#caption-outline-color").value = assToHex(theme.outline_colour);
     }
     if ($("#caption-bold") && theme.bold != null) $("#caption-bold").checked = !!theme.bold;
+    if (theme.margin_v != null) syncCaptionMarginLabel(theme.margin_v);
     updateCaptionPreview();
   }
 
@@ -3262,6 +3948,7 @@
     const aspect = currentAspectRatio();
     frame.dataset.ratio = aspect;
     if (badge) badge.textContent = aspect;
+    syncAspectToggle(aspect);
 
     const highlight = previewHighlight();
     const start = float(highlight?.start_time);
@@ -3378,20 +4065,26 @@
     }
   }
 
-  ["caption-font", "caption-size", "caption-outline", "caption-words", "caption-primary", "caption-secondary", "caption-outline-color", "caption-bold"].forEach((id) => {
-    $(`#${id}`)?.addEventListener("input", updateCaptionPreview);
-    $(`#${id}`)?.addEventListener("change", updateCaptionPreview);
+  ["caption-font", "caption-size", "caption-outline", "caption-words", "caption-primary", "caption-secondary", "caption-outline-color", "caption-bold", "caption-margin-v"].forEach((id) => {
+    $(`#${id}`)?.addEventListener("input", (ev) => {
+      if (id === "caption-margin-v") syncCaptionMarginLabel(ev.target?.value);
+      updateCaptionPreview();
+    });
+    $(`#${id}`)?.addEventListener("change", (ev) => {
+      if (id === "caption-margin-v") syncCaptionMarginLabel(ev.target?.value);
+      updateCaptionPreview();
+    });
   });
 
-  $("#aspect_ratio")?.addEventListener("change", () => {
-    applyPreviewAspect();
-    if (state.viewStep === 3) updateCaptionPreview();
+  $("#aspect-toggle")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".aspect-toggle-btn");
+    if (!btn || !btn.dataset.ratio) return;
+    setAspectRatio(btn.dataset.ratio);
   });
 
   $("#caption-back")?.addEventListener("click", () => {
     state.followJobStep = false;
-    setFlowStep(2);
-    persistUiStep(2);
+    setFlowStep(1);
   });
 
   $("#caption-continue")?.addEventListener("click", async () => {
@@ -3460,13 +4153,6 @@
       state.followJobStep = false;
       setFlowStep(2);
       if (state.lastJob) renderCastForm(state.lastJob);
-    }
-  });
-
-  $("#goto-format-btn")?.addEventListener("click", () => {
-    if (state.maxStep >= 2 && state.jobStatus !== "awaiting_cast") {
-      state.followJobStep = false;
-      setFlowStep(2);
     }
   });
 
@@ -3566,7 +4252,7 @@
             )}" target="_blank" rel="noopener">Ver no YouTube</a>
             <button type="button" class="btn ghost btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
               String(id)
-            )}">Reenviar</button>
+            )}">Editar informações</button>
             <p class="hint yt-upload-hint">${escapeHtml(
               short?.youtube_privacy
                 ? `Publicado como ${short.youtube_privacy}`
@@ -3584,7 +4270,7 @@
               ytStatus === "failed" ? "" : " hidden"
             }>${
               ytStatus === "failed"
-                ? escapeHtml(ytError || "Falha no upload automático")
+                ? escapeHtml(ytError || "Falha no upload")
                 : ""
             }</p>
           </div>`;
@@ -3642,16 +4328,10 @@
     }
     head.style.order = "-1";
 
-    const uploadingCount = shorts.filter(
-      (s) => s.youtube_upload_status === "uploading"
-    ).length;
     const remaining = Math.max(0, total - done);
     let titleText;
     if (jobStatus === "rendering") {
-      titleText =
-        uploadingCount && done >= total
-          ? `${done} de ${total} shorts prontos · enviando ao YouTube…`
-          : `${done} de ${total} shorts prontos · renderizando…`;
+      titleText = `${done} de ${total} shorts prontos · renderizando…`;
     } else if (jobStatus === "interrupted") {
       titleText =
         remaining > 0
@@ -3772,23 +4452,528 @@
     });
   }
 
-  async function uploadShortToYoutube(shortId, btn) {
-    const jobId = state.activeJobId || state.lastJob?.id;
-    if (!jobId) return;
-    const actions = btn.closest(".short-actions");
-    const hint = actions?.querySelector(".yt-upload-hint");
-    const prevLabel = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = "Enviando…";
-    if (hint) {
-      hint.hidden = false;
-      hint.textContent = "Upload em andamento (pode levar alguns minutos)…";
+  const ytUploadState = {
+    shortId: null,
+    tags: [],
+    categoryId: "",
+    loading: false,
+    uploading: false,
+    generatingThumb: false,
+    configured: false,
+    alreadyUploaded: false,
+  };
+
+  function closeYtUploadModal() {
+    const modal = $("#yt-upload-modal");
+    if (modal) modal.hidden = true;
+    document.body.classList.remove("yt-upload-modal-open");
+    ytUploadState.shortId = null;
+    ytUploadState.tags = [];
+    ytUploadState.categoryId = "";
+    ytUploadState.loading = false;
+    ytUploadState.uploading = false;
+    ytUploadState.generatingThumb = false;
+    ytUploadState.configured = false;
+    ytUploadState.alreadyUploaded = false;
+    const confirmBtn = $("#yt-upload-modal-confirm");
+    if (confirmBtn) {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = "Fazer upload";
     }
+    const titleEl = $("#yt-upload-modal-title");
+    if (titleEl) titleEl.textContent = "Enviar ao YouTube";
+    const status = $("#yt-upload-modal-status");
+    if (status) {
+      status.hidden = true;
+      status.textContent = "";
+    }
+  }
+
+  function setYtUploadStatus(message, { error = false } = {}) {
+    const status = $("#yt-upload-modal-status");
+    if (!status) return;
+    if (!message) {
+      status.hidden = true;
+      status.textContent = "";
+      return;
+    }
+    status.hidden = false;
+    status.textContent = message;
+    status.classList.toggle("is-error", !!error);
+  }
+
+  function applyShortThumbnail(shortId, thumbnailUrl) {
+    if (!thumbnailUrl) return;
+    if (state.lastJob?.result?.shorts) {
+      const shorts = state.lastJob.result.shorts;
+      for (let i = 0; i < shorts.length; i++) {
+        const sid = Number(shorts[i].id ?? i);
+        if (sid === Number(shortId)) {
+          shorts[i].thumbnail_url = thumbnailUrl;
+          shorts[i].thumbnail_ai = true;
+          break;
+        }
+      }
+    }
+    if (state.lastJob?.result?.highlights) {
+      const highlights = state.lastJob.result.highlights;
+      for (let i = 0; i < highlights.length; i++) {
+        const hid = Number(highlights[i].id ?? i);
+        if (hid === Number(shortId)) {
+          highlights[i].thumbnail_url = thumbnailUrl;
+          highlights[i].thumbnail_ai = true;
+          break;
+        }
+      }
+    }
+    const card = $(
+      `#results .short-card[data-id="${CSS.escape(String(shortId))}"]`
+    );
+    if (card) {
+      const video = card.querySelector("video");
+      if (video) {
+        video.setAttribute("poster", thumbnailUrl);
+        // Force poster refresh in some browsers
+        const src = video.getAttribute("src");
+        if (src) {
+          video.removeAttribute("src");
+          video.setAttribute("src", src);
+          video.load();
+        }
+      }
+      const skel = card.querySelector(".short-skeleton-thumb");
+      if (skel) skel.src = thumbnailUrl;
+    }
+    // Topic cards that already show the rendered short
+    $$(`.topic-card[data-id="${CSS.escape(String(shortId))}"]`).forEach((topic) => {
+      const img = topic.querySelector("img.topic-thumb");
+      if (img) img.src = thumbnailUrl;
+      const video = topic.querySelector("video");
+      if (video) video.setAttribute("poster", thumbnailUrl);
+      const aiBtn = topic.querySelector(".topic-ai-thumb");
+      if (aiBtn && !aiBtn.classList.contains("is-busy")) {
+        aiBtn.textContent = "Regenerar thumbnail IA";
+      }
+    });
+  }
+
+  function renderYtUploadPreview(data) {
+    const body = $("#yt-upload-modal-body");
+    const confirmBtn = $("#yt-upload-modal-confirm");
+    if (!body) return;
+
+    const hashtags = Array.isArray(data.hashtags) ? data.hashtags : [];
+    const tags = Array.isArray(data.tags) ? data.tags : [];
+    ytUploadState.tags = tags;
+    ytUploadState.categoryId = data.category_id || "";
+    ytUploadState.configured = !!data.configured;
+    ytUploadState.alreadyUploaded = !!data.already_uploaded;
+
+    const thumb = data.thumbnail_url
+      ? `<img class="yt-upload-thumb" id="yt-upload-thumb-img" src="${escapeAttr(
+          data.thumbnail_url
+        )}" alt="Thumbnail do short" />`
+      : `<div class="yt-upload-thumb is-empty" id="yt-upload-thumb-img">Sem thumbnail</div>`;
+
+    const hashtagChips = hashtags.length
+      ? hashtags
+          .map((t) => `<span class="yt-upload-chip">${escapeHtml(t)}</span>`)
+          .join("")
+      : `<span class="hint">Nenhuma hashtag</span>`;
+
+    const tagChips = tags.length
+      ? tags
+          .slice(0, 18)
+          .map((t) => `<span class="yt-upload-chip">${escapeHtml(t)}</span>`)
+          .join("")
+      : `<span class="hint">Nenhuma tag</span>`;
+
+    const privacy = String(data.privacy || "public").toLowerCase();
+    const channel = data.channel_title
+      ? `Canal: ${data.channel_title}`
+      : data.configured
+        ? "Canal conectado"
+        : "YouTube não configurado neste projeto";
+
+    const titleEl = $("#yt-upload-modal-title");
+    if (titleEl) {
+      titleEl.textContent = ytUploadState.alreadyUploaded
+        ? "Atualizar no YouTube"
+        : "Enviar ao YouTube";
+    }
+    const hint = $("#yt-upload-modal-hint");
+    if (hint) {
+      hint.textContent = ytUploadState.alreadyUploaded
+        ? `${channel} · altere e salve para atualizar o vídeo já publicado`
+        : channel;
+    }
+
+    const thumbNote = data.thumbnail_ai
+      ? "Thumbnail gerada por IA"
+      : data.has_custom_thumbnail
+        ? "Thumbnail customizada"
+        : "Preview do short";
+
+    const canGenerate = data.openai_configured !== false;
+    const genLabel = data.thumbnail_ai ? "Regenerar thumbnail IA" : "Gerar thumbnail IA";
+    const confirmLabel = ytUploadState.alreadyUploaded
+      ? "Atualizar no YouTube"
+      : "Fazer upload";
+
+    body.innerHTML = `
+      <div class="yt-upload-layout">
+        <div class="yt-upload-thumb-wrap">
+          ${thumb}
+          <button type="button" class="btn ghost btn-tiny yt-upload-gen-thumb" id="yt-upload-generate-thumb"${
+            canGenerate ? "" : " disabled"
+          }>${genLabel}</button>
+          <p class="yt-upload-thumb-note">${thumbNote}${
+            canGenerate
+              ? ""
+              : " · Configure OPENAI_API_KEY no .env"
+          }</p>
+        </div>
+        <div class="yt-upload-fields">
+          <label class="field">
+            <span class="label">Título</span>
+            <input type="text" id="yt-upload-title" maxlength="100" autocomplete="off"
+              value="${escapeAttr(data.title || "")}" />
+          </label>
+          <label class="field">
+            <span class="label">Descrição</span>
+            <textarea id="yt-upload-description" maxlength="5000">${escapeHtml(
+              data.description || ""
+            )}</textarea>
+          </label>
+          <div>
+            <span class="label">Hashtags</span>
+            <div class="yt-upload-hashtags" id="yt-upload-hashtags">${hashtagChips}</div>
+          </div>
+          <div>
+            <span class="label">Tags</span>
+            <div class="yt-upload-tags" id="yt-upload-tags">${tagChips}</div>
+          </div>
+          <div class="yt-upload-meta-row">
+            <label class="field">
+              <span class="label">Visibilidade</span>
+              <select id="yt-upload-privacy">
+                <option value="public"${
+                  privacy === "public" ? " selected" : ""
+                }>Público</option>
+                <option value="unlisted"${
+                  privacy === "unlisted" ? " selected" : ""
+                }>Não listado</option>
+                <option value="private"${
+                  privacy === "private" ? " selected" : ""
+                }>Privado</option>
+              </select>
+            </label>
+            <label class="field">
+              <span class="label">Idioma</span>
+              <input type="text" value="${escapeAttr(
+                data.default_language || "pt"
+              )}" disabled />
+            </label>
+          </div>
+        </div>
+      </div>
+    `;
+
+    if (confirmBtn) {
+      confirmBtn.disabled = !data.configured || ytUploadState.generatingThumb;
+      confirmBtn.textContent = confirmLabel;
+    }
+    if (!data.configured) {
+      setYtUploadStatus(
+        "Configure o YouTube em Config do canal antes de enviar.",
+        { error: true }
+      );
+    } else {
+      setYtUploadStatus("");
+    }
+
+    $("#yt-upload-generate-thumb")?.addEventListener("click", () => {
+      generateYtThumbnail();
+    });
+  }
+
+  async function generateYtThumbnail() {
+    const jobId = state.activeJobId || state.lastJob?.id;
+    const shortId = ytUploadState.shortId;
+    const btn = $("#yt-upload-generate-thumb");
+    const confirmBtn = $("#yt-upload-modal-confirm");
+    if (!jobId || !shortId || ytUploadState.generatingThumb || ytUploadState.uploading) {
+      return;
+    }
+
+    ytUploadState.generatingThumb = true;
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "Gerando…";
+    }
+    if (confirmBtn) confirmBtn.disabled = true;
+    setYtUploadStatus("Gerando thumbnail com IA (pode levar ~30–90s)…");
+
+    try {
+      const res = await fetch(
+        `/api/jobs/${jobId}/shorts/${encodeURIComponent(shortId)}/generate-thumbnail`,
+        { method: "POST" }
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail;
+        const msg =
+          typeof detail === "string"
+            ? detail
+            : Array.isArray(detail)
+              ? detail.map((d) => d.msg || JSON.stringify(d)).join("; ")
+              : data.message || `HTTP ${res.status}`;
+        throw new Error(msg);
+      }
+      if (ytUploadState.shortId !== String(shortId)) return;
+
+      const url = data.thumbnail_url || data.short?.thumbnail_url || "";
+      applyShortThumbnail(shortId, url);
+
+      const img = $("#yt-upload-thumb-img");
+      if (url && img) {
+        if (img.tagName === "IMG") {
+          img.src = url;
+        } else {
+          const next = document.createElement("img");
+          next.className = "yt-upload-thumb";
+          next.id = "yt-upload-thumb-img";
+          next.alt = "Thumbnail do short";
+          next.src = url;
+          img.replaceWith(next);
+        }
+      }
+      const note = $(".yt-upload-thumb-note");
+      if (note) note.textContent = "Thumbnail gerada por IA";
+      if (btn) btn.textContent = "Regenerar thumbnail IA";
+
+      const faces = Array.isArray(data.faces) ? data.faces : [];
+      const cited = faces.filter((f) => f.kind === "cited").map((f) => f.name);
+      const faceHint = cited.length
+        ? ` · Wiki: ${cited.join(", ")}`
+        : faces.length
+          ? ` · ${faces.length} rosto(s)`
+          : "";
+      setYtUploadStatus(`Thumbnail atualizada${faceHint}`);
+    } catch (err) {
+      setYtUploadStatus(String(err.message || err), { error: true });
+      if (btn) btn.textContent = "Gerar thumbnail IA";
+    } finally {
+      ytUploadState.generatingThumb = false;
+      if (btn) btn.disabled = false;
+      if (confirmBtn) {
+        confirmBtn.disabled = !ytUploadState.configured;
+        confirmBtn.textContent = ytUploadState.alreadyUploaded
+          ? "Atualizar no YouTube"
+          : "Fazer upload";
+      }
+    }
+  }
+
+  async function openYtUploadModal(shortId) {
+    const jobId = state.activeJobId || state.lastJob?.id;
+    if (!jobId || shortId == null) return;
+
+    const modal = $("#yt-upload-modal");
+    const body = $("#yt-upload-modal-body");
+    const confirmBtn = $("#yt-upload-modal-confirm");
+    if (!modal || !body) return;
+
+    ytUploadState.shortId = String(shortId);
+    ytUploadState.loading = true;
+    ytUploadState.uploading = false;
+    const knownShort = (state.lastJob?.result?.shorts || []).find(
+      (s, i) => Number(s.id ?? i) === Number(shortId)
+    );
+    ytUploadState.alreadyUploaded = !!(
+      knownShort?.youtube_video_id || knownShort?.youtube_url
+    );
+    modal.hidden = false;
+    document.body.classList.add("yt-upload-modal-open");
+    body.innerHTML = `<p class="empty">Carregando preview…</p>`;
+    const titleEl = $("#yt-upload-modal-title");
+    if (titleEl) {
+      titleEl.textContent = ytUploadState.alreadyUploaded
+        ? "Atualizar no YouTube"
+        : "Enviar ao YouTube";
+    }
+    if (confirmBtn) {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = ytUploadState.alreadyUploaded
+        ? "Atualizar no YouTube"
+        : "Fazer upload";
+    }
+    setYtUploadStatus("");
+
+    try {
+      const res = await fetch(
+        `/api/jobs/${jobId}/shorts/${encodeURIComponent(shortId)}/youtube/preview`
+      );
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const detail = data.detail;
+        const msg =
+          typeof detail === "string"
+            ? detail
+            : Array.isArray(detail)
+              ? detail.map((d) => d.msg || JSON.stringify(d)).join("; ")
+              : data.message || `HTTP ${res.status}`;
+        throw new Error(msg);
+      }
+      if (ytUploadState.shortId !== String(shortId)) return;
+      renderYtUploadPreview(data);
+    } catch (err) {
+      body.innerHTML = `<p class="empty">Não foi possível carregar o preview.</p>`;
+      setYtUploadStatus(String(err.message || err), { error: true });
+      if (confirmBtn) confirmBtn.disabled = true;
+    } finally {
+      ytUploadState.loading = false;
+    }
+  }
+
+  function markShortYtUploading(shortId) {
+    const card = $(`#results .short-card[data-id="${CSS.escape(String(shortId))}"]`);
+    const actions = card?.querySelector(".short-actions");
+    if (!actions) return;
+    const wasUploaded = actions.dataset.ytState === "uploaded" || ytUploadState.alreadyUploaded;
+    actions.dataset.ytState = "uploading";
+    actions.innerHTML = `<p class="hint yt-upload-hint">${
+      wasUploaded ? "Atualizando no YouTube…" : "Enviando ao YouTube…"
+    }</p>`;
+  }
+
+  function markShortYtUploaded(shortId, data) {
+    if (state.lastJob?.result?.shorts) {
+      const shorts = state.lastJob.result.shorts;
+      for (let i = 0; i < shorts.length; i++) {
+        const sid = Number(shorts[i].id ?? i);
+        if (sid === Number(shortId)) {
+          shorts[i].youtube_url = data.url;
+          shorts[i].youtube_video_id = data.video_id;
+          shorts[i].youtube_privacy = data.privacy_status;
+          shorts[i].youtube_upload_status = "uploaded";
+          shorts[i].youtube_title = data.title;
+          shorts[i].youtube_description = data.description;
+          break;
+        }
+      }
+    }
+    const card = $(`#results .short-card[data-id="${CSS.escape(String(shortId))}"]`);
+    const actions = card?.querySelector(".short-actions");
+    if (!actions) return;
+    actions.dataset.ytState = "uploaded";
+    actions.dataset.ytUrl = data.url || "";
+    actions.innerHTML = `
+      <a class="btn ghost btn-tiny" href="${escapeAttr(
+        data.url
+      )}" target="_blank" rel="noopener">Ver no YouTube</a>
+      <button type="button" class="btn ghost btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
+        String(shortId)
+      )}">Editar informações</button>
+      <p class="hint yt-upload-hint">${escapeHtml(
+        data.privacy_status
+          ? `Publicado como ${data.privacy_status}`
+          : "Enviado"
+      )}</p>
+    `;
+  }
+
+  function markShortYtFailed(shortId, message) {
+    const hadUrl =
+      (state.lastJob?.result?.shorts || []).find((s, i) => {
+        return Number(s.id ?? i) === Number(shortId) && s.youtube_url;
+      })?.youtube_url || "";
+    if (state.lastJob?.result?.shorts) {
+      const shorts = state.lastJob.result.shorts;
+      for (let i = 0; i < shorts.length; i++) {
+        const sid = Number(shorts[i].id ?? i);
+        if (sid === Number(shortId)) {
+          shorts[i].youtube_upload_status = "failed";
+          shorts[i].youtube_upload_error = message;
+          break;
+        }
+      }
+    }
+    const card = $(`#results .short-card[data-id="${CSS.escape(String(shortId))}"]`);
+    const actions = card?.querySelector(".short-actions");
+    if (!actions) return;
+    if (hadUrl || ytUploadState.alreadyUploaded) {
+      const url =
+        hadUrl ||
+        actions.dataset.ytUrl ||
+        "";
+      actions.dataset.ytState = "uploaded";
+      if (url) actions.dataset.ytUrl = url;
+      actions.innerHTML = `
+        ${
+          url
+            ? `<a class="btn ghost btn-tiny" href="${escapeAttr(
+                url
+              )}" target="_blank" rel="noopener">Ver no YouTube</a>`
+            : ""
+        }
+        <button type="button" class="btn ghost btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
+          String(shortId)
+        )}">Editar informações</button>
+        <p class="hint yt-upload-hint">${escapeHtml(message || "Falha ao atualizar")}</p>
+      `;
+      return;
+    }
+    actions.dataset.ytState = "failed";
+    actions.innerHTML = `
+      <button type="button" class="btn primary btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
+        String(shortId)
+      )}">Enviar ao YouTube</button>
+      <p class="hint yt-upload-hint">${escapeHtml(message || "Falha no upload")}</p>
+    `;
+  }
+
+  async function confirmYtUpload() {
+    const jobId = state.activeJobId || state.lastJob?.id;
+    const shortId = ytUploadState.shortId;
+    const confirmBtn = $("#yt-upload-modal-confirm");
+    if (
+      !jobId ||
+      !shortId ||
+      ytUploadState.uploading ||
+      ytUploadState.generatingThumb
+    ) {
+      return;
+    }
+
+    const title = ($("#yt-upload-title")?.value || "").trim();
+    const description = ($("#yt-upload-description")?.value || "").trim();
+    const privacy = ($("#yt-upload-privacy")?.value || "").trim();
+    const isUpdate = ytUploadState.alreadyUploaded;
+
+    ytUploadState.uploading = true;
+    if (confirmBtn) {
+      confirmBtn.disabled = true;
+      confirmBtn.textContent = isUpdate ? "Atualizando…" : "Enviando…";
+    }
+    setYtUploadStatus(
+      isUpdate
+        ? "Atualizando metadados no YouTube…"
+        : "Upload em andamento (pode levar alguns minutos)…"
+    );
+    markShortYtUploading(shortId);
+
     try {
       const res = await fetch(`/api/jobs/${jobId}/shorts/${shortId}/youtube`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify({
+          title: title || null,
+          description: description || null,
+          privacy: privacy || null,
+          tags: ytUploadState.tags.length ? ytUploadState.tags : null,
+          category_id: ytUploadState.categoryId || null,
+        }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -3801,48 +4986,63 @@
               : data.message || `HTTP ${res.status}`;
         throw new Error(msg);
       }
-      if (state.lastJob?.result?.shorts) {
-        const shorts = state.lastJob.result.shorts;
-        for (let i = 0; i < shorts.length; i++) {
-          const sid = Number(shorts[i].id ?? i);
-          if (sid === Number(shortId)) {
-            shorts[i].youtube_url = data.url;
-            shorts[i].youtube_video_id = data.video_id;
-            shorts[i].youtube_privacy = data.privacy_status;
-            break;
-          }
-        }
-      }
-      if (actions) {
-        actions.innerHTML = `
-          <a class="btn ghost btn-tiny" href="${escapeAttr(
-            data.url
-          )}" target="_blank" rel="noopener">Ver no YouTube</a>
-          <button type="button" class="btn ghost btn-tiny yt-upload-btn" data-yt-upload="${escapeAttr(
-            String(shortId)
-          )}">Reenviar</button>
-          <p class="hint yt-upload-hint">${escapeHtml(
-            data.privacy_status
-              ? `Publicado como ${data.privacy_status}`
-              : "Enviado"
-          )}</p>
-        `;
-      }
+      ytUploadState.alreadyUploaded = true;
+      markShortYtUploaded(shortId, data);
+      const didUpdate = data.updated || isUpdate;
+      setYtUploadStatus(
+        didUpdate
+          ? data.privacy_status
+            ? `Atualizado como ${data.privacy_status}`
+            : "Atualizado com sucesso"
+          : data.privacy_status
+            ? `Enviado como ${data.privacy_status}`
+            : "Enviado com sucesso"
+      );
+      if (confirmBtn) confirmBtn.textContent = didUpdate ? "Atualizado" : "Enviado";
+      setTimeout(() => closeYtUploadModal(), 700);
     } catch (err) {
-      btn.disabled = false;
-      btn.textContent = prevLabel;
-      if (hint) {
-        hint.hidden = false;
-        hint.textContent = String(err.message || err);
+      const msg = String(err.message || err);
+      markShortYtFailed(shortId, msg);
+      setYtUploadStatus(msg, { error: true });
+      if (confirmBtn) {
+        confirmBtn.disabled = false;
+        confirmBtn.textContent = isUpdate
+          ? "Atualizar no YouTube"
+          : "Fazer upload";
       }
+    } finally {
+      ytUploadState.uploading = false;
     }
   }
+
+  $("#yt-upload-modal-close")?.addEventListener("click", () => {
+    if (!ytUploadState.uploading && !ytUploadState.generatingThumb) closeYtUploadModal();
+  });
+  $("#yt-upload-modal-cancel")?.addEventListener("click", () => {
+    if (!ytUploadState.uploading && !ytUploadState.generatingThumb) closeYtUploadModal();
+  });
+  $("#yt-upload-modal")?.addEventListener("click", (ev) => {
+    if (
+      ev.target?.matches?.("[data-yt-upload-dismiss]") &&
+      !ytUploadState.uploading &&
+      !ytUploadState.generatingThumb
+    ) {
+      closeYtUploadModal();
+    }
+  });
+  $("#yt-upload-modal-confirm")?.addEventListener("click", () => confirmYtUpload());
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    if ($("#yt-upload-modal")?.hidden) return;
+    if (ytUploadState.uploading || ytUploadState.generatingThumb) return;
+    closeYtUploadModal();
+  });
 
   $("#results")?.addEventListener("click", (ev) => {
     const btn = ev.target.closest?.("[data-yt-upload]");
     if (!btn || btn.disabled) return;
     ev.preventDefault();
-    uploadShortToYoutube(btn.getAttribute("data-yt-upload"), btn);
+    openYtUploadModal(btn.getAttribute("data-yt-upload"));
   });
 
   /* ---------- Jobs list ---------- */
