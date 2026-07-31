@@ -48,12 +48,17 @@ _jobs: Dict[str, Dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 _projects = ProjectStore(PROJECTS_DIR)
 
+# Async AI thumbnail tasks: key = f"{job_id}:{highlight_id}"
+_thumb_tasks: Dict[str, Dict[str, Any]] = {}
+_thumb_tasks_lock = threading.Lock()
+
 # Editable from the web Config UI. API keys, Whisper, LLM providers stay in .env only.
 # YouTube channel credentials live per-project (see /api/projects).
 CONFIG_KEYS = [
     "CONTENT_LANGUAGE",
     "LOCAL_OUTPUT_DIR",
     "LOCAL_FACE_SMOOTHING",
+    "THUMBNAIL_PALETTE",
 ]
 
 SECRET_KEYS = {"MUAPI_API_KEY", "OPENAI_API_KEY", "GEMINI_API_KEY"}
@@ -104,6 +109,233 @@ class YoutubeUploadBody(BaseModel):
     tags: Optional[List[str]] = None
     category_id: Optional[str] = None
 
+
+class GenerateThumbnailBody(BaseModel):
+    """Optional face plate + overlay text for frame-based thumbnails."""
+
+    face_candidate_id: Optional[str] = Field(default=None, max_length=64)
+    mode: Optional[str] = Field(default=None, max_length=16)
+    overlay_text: Optional[str] = Field(default=None, max_length=120)
+    text_color_mode: Optional[str] = Field(default=None, max_length=16)
+    margin_v: Optional[int] = Field(default=None, ge=0, le=900)
+    font_size: Optional[int] = Field(default=None, ge=40, le=140)
+    border_pct: Optional[float] = Field(default=None, ge=1, le=8)
+    # sync=True keeps the old blocking behaviour (tests / debugging)
+    sync: bool = False
+
+
+def _normalize_thumb_color_mode(raw: Optional[str]) -> str:
+    mode = (raw or "caption").strip().lower()
+    return "palette" if mode == "palette" else "caption"
+
+
+def _normalize_thumb_margin_v(raw: Optional[int]) -> Optional[int]:
+    if raw is None:
+        return None
+    try:
+        return max(40, min(720, int(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_thumb_font_size(raw: Optional[int]) -> Optional[int]:
+    if raw is None:
+        return None
+    try:
+        return max(40, min(140, int(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_thumb_border_pct(raw: Optional[float]) -> Optional[float]:
+    if raw is None:
+        return None
+    try:
+        return max(1.0, min(8.0, float(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _thumb_task_key(job_id: str, highlight_id: int) -> str:
+    return f"{job_id}:{int(highlight_id)}"
+
+
+def _public_thumb_task(task: Dict[str, Any]) -> Dict[str, Any]:
+    out = {
+        "ok": True,
+        "task_id": task.get("task_id"),
+        "job_id": task.get("job_id"),
+        "highlight_id": task.get("highlight_id"),
+        "short_id": task.get("highlight_id"),
+        "status": task.get("status"),
+        "error": task.get("error"),
+        "started_at": task.get("started_at"),
+        "finished_at": task.get("finished_at"),
+        "face_candidate_id": task.get("face_candidate_id"),
+        "mode": task.get("mode"),
+        "overlay_text": task.get("overlay_text"),
+        "text_color_mode": task.get("text_color_mode"),
+        "margin_v": task.get("margin_v"),
+        "font_size": task.get("font_size"),
+        "border_pct": task.get("border_pct"),
+    }
+    result = task.get("result")
+    if isinstance(result, dict):
+        out.update(
+            {
+                "thumbnail_url": result.get("thumbnail_url"),
+                "thumbnail_ai": result.get("thumbnail_ai"),
+                "has_custom_thumbnail": result.get("has_custom_thumbnail"),
+                "faces": result.get("faces") or [],
+                "cited_people": result.get("cited_people") or [],
+                "wiki_hits": result.get("wiki_hits") or [],
+                "wiki_skip_reason": result.get("wiki_skip_reason"),
+                "refs_sent_to_ai": result.get("refs_sent_to_ai") or [],
+                "refs_sent_count": result.get("refs_sent_count") or 0,
+                "short": result.get("short"),
+                "highlight": result.get("highlight"),
+                "mode": result.get("mode") or out.get("mode"),
+                "overlay_text": result.get("overlay_text"),
+                "text_color_mode": result.get("text_color_mode"),
+                "margin_v": result.get("margin_v"),
+                "font_size": result.get("font_size"),
+                "border_pct": result.get("border_pct"),
+            }
+        )
+    return out
+
+
+def _run_thumb_task(task_key: str) -> None:
+    """Background worker for AI / cutout thumbnail generation."""
+    from shorts_generator.thumbnails_ai import ImageBillingError
+
+    with _thumb_tasks_lock:
+        task = _thumb_tasks.get(task_key)
+        if not task:
+            return
+        task["status"] = "running"
+        job_id = task["job_id"]
+        highlight_id = int(task["highlight_id"])
+        face_candidate_id = task.get("face_candidate_id")
+        mode = task.get("mode")
+        overlay_text = task.get("overlay_text")
+        text_color_mode = task.get("text_color_mode")
+        margin_v = task.get("margin_v")
+        font_size = task.get("font_size")
+        border_pct = task.get("border_pct")
+
+    try:
+        result = _generate_ai_short_thumbnail(
+            job_id,
+            highlight_id,
+            face_candidate_id=face_candidate_id,
+            mode=mode,
+            overlay_text=overlay_text,
+            text_color_mode=text_color_mode,
+            margin_v=margin_v,
+            font_size=font_size,
+            border_pct=border_pct,
+        )
+        with _thumb_tasks_lock:
+            task = _thumb_tasks.get(task_key)
+            if not task:
+                return
+            task["status"] = "ready"
+            task["result"] = result
+            task["error"] = None
+            task["finished_at"] = _now()
+    except ImageBillingError as exc:
+        _append_log(job_id, f"Thumbnail IA billing (tópico #{highlight_id}): {exc}")
+        with _thumb_tasks_lock:
+            task = _thumb_tasks.get(task_key)
+            if task:
+                task["status"] = "failed"
+                task["error"] = str(exc)
+                task["http_status"] = 402
+                task["finished_at"] = _now()
+    except Exception as exc:
+        tb = traceback.format_exc()
+        _append_log(job_id, f"Thumbnail IA falhou (tópico #{highlight_id}): {exc}")
+        _append_log(job_id, tb)
+        with _thumb_tasks_lock:
+            task = _thumb_tasks.get(task_key)
+            if task:
+                task["status"] = "failed"
+                task["error"] = str(exc)
+                task["http_status"] = 500
+                task["finished_at"] = _now()
+
+
+def _enqueue_ai_thumbnail(
+    job_id: str,
+    highlight_id: int,
+    *,
+    face_candidate_id: Optional[str] = None,
+    mode: Optional[str] = None,
+    overlay_text: Optional[str] = None,
+    text_color_mode: Optional[str] = None,
+    margin_v: Optional[int] = None,
+    font_size: Optional[int] = None,
+    border_pct: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Start thumbnail generation in a daemon thread; return immediately."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or not job.get("result"):
+            raise ValueError("Job/resultado não encontrado")
+        highlight, _ = _find_job_highlight(job, highlight_id)
+        short, _ = _find_job_short(job, highlight_id)
+        if highlight is None and short is None:
+            raise ValueError("Tópico não encontrado")
+
+    color_mode = _normalize_thumb_color_mode(text_color_mode)
+    margin = _normalize_thumb_margin_v(margin_v)
+    size = _normalize_thumb_font_size(font_size)
+    border = _normalize_thumb_border_pct(border_pct)
+
+    task_key = _thumb_task_key(job_id, highlight_id)
+    with _thumb_tasks_lock:
+        existing = _thumb_tasks.get(task_key)
+        if existing and existing.get("status") in ("queued", "running"):
+            return _public_thumb_task(existing)
+
+        task = {
+            "task_id": task_key,
+            "job_id": job_id,
+            "highlight_id": int(highlight_id),
+            "status": "queued",
+            "error": None,
+            "result": None,
+            "face_candidate_id": face_candidate_id,
+            "mode": mode,
+            "overlay_text": (overlay_text or "").strip() or None,
+            "text_color_mode": color_mode,
+            "margin_v": margin,
+            "font_size": size,
+            "border_pct": border,
+            "started_at": _now(),
+            "finished_at": None,
+            "http_status": None,
+        }
+        _thumb_tasks[task_key] = task
+
+    _append_log(
+        job_id,
+        f"Thumbnail enfileirada: tópico #{int(highlight_id)}"
+        + (f" · frame={face_candidate_id}" if face_candidate_id else "")
+        + (f" · texto={task.get('overlay_text')!r}" if task.get("overlay_text") else "")
+        + f" · cor={color_mode}"
+        + (f" · margin_v={margin}" if margin is not None else "")
+        + (f" · font_size={size}" if size is not None else "")
+        + (f" · border_pct={border}" if border is not None else ""),
+    )
+    threading.Thread(
+        target=_run_thumb_task,
+        args=(task_key,),
+        daemon=True,
+        name=f"thumb-{task_key}",
+    ).start()
+    return _public_thumb_task(task)
 
 class LogCapture(io.TextIOBase):
     """Capture print() output into a job's log list."""
@@ -178,7 +410,12 @@ def _mask(value: str) -> str:
 
 
 def _read_config() -> Dict[str, Any]:
-    from shorts_generator.config import LANGUAGE_OPTIONS
+    from shorts_generator.config import (
+        DEFAULT_THUMBNAIL_PALETTE,
+        LANGUAGE_OPTIONS,
+        format_thumbnail_palette,
+        parse_thumbnail_palette,
+    )
 
     raw = dotenv_values(ENV_PATH) if ENV_PATH.exists() else {}
     # Fall back to process env for keys present in os.environ
@@ -197,6 +434,10 @@ def _read_config() -> Dict[str, Any]:
             val = "output"
         if key == "LOCAL_FACE_SMOOTHING" and not val:
             val = "0.15"
+        if key == "THUMBNAIL_PALETTE":
+            val = format_thumbnail_palette(parse_thumbnail_palette(val or None))
+            if not val:
+                val = DEFAULT_THUMBNAIL_PALETTE
         secret = key in SECRET_KEYS
         is_set = _is_real_secret(val) if secret else bool(val)
         item: Dict[str, Any] = {
@@ -205,10 +446,20 @@ def _read_config() -> Dict[str, Any]:
             "masked": _mask(val) if secret and is_set else None,
             "is_secret": secret,
             "is_set": is_set,
-            "input_type": "language" if key == "CONTENT_LANGUAGE" else "text",
+            "input_type": (
+                "language"
+                if key == "CONTENT_LANGUAGE"
+                else "palette"
+                if key == "THUMBNAIL_PALETTE"
+                else "text"
+            ),
         }
         if key == "LOCAL_OUTPUT_DIR":
             item["resolved_path"] = str(Path(val).expanduser().resolve())
+        if key == "THUMBNAIL_PALETTE":
+            item["colors"] = [
+                f"#{r:02X}{g:02X}{b:02X}" for r, g, b in parse_thumbnail_palette(val)
+            ]
         items.append(item)
     muapi = _is_real_secret(raw.get("MUAPI_API_KEY"))
     openai = _is_real_secret(raw.get("OPENAI_API_KEY"))
@@ -253,6 +504,8 @@ def _env_float(key: str, default: float) -> float:
 def _write_config(updates: Dict[str, str]) -> None:
     if not ENV_PATH.exists():
         ENV_PATH.write_text("", encoding="utf-8")
+    from shorts_generator.config import format_thumbnail_palette, parse_thumbnail_palette
+
     for key, value in updates.items():
         if key not in CONFIG_KEYS:
             continue
@@ -260,8 +513,11 @@ def _write_config(updates: Dict[str, str]) -> None:
         # and breaking float() reload with empty strings).
         if not str(value).strip():
             continue
-        set_key(str(ENV_PATH), key, str(value).strip())
-        os.environ[key] = str(value).strip()
+        cleaned = str(value).strip()
+        if key == "THUMBNAIL_PALETTE":
+            cleaned = format_thumbnail_palette(parse_thumbnail_palette(cleaned))
+        set_key(str(ENV_PATH), key, cleaned)
+        os.environ[key] = cleaned
     # Reload config module globals used by the pipeline
     load_dotenv(ENV_PATH, override=True)
     import shorts_generator.config as cfg
@@ -293,8 +549,19 @@ def _write_config(updates: Dict[str, str]) -> None:
         "yes",
         "on",
     )
-    cfg.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+    _tm = (
+        os.getenv("THUMBNAIL_MODE") or "frame"
+    ).strip().strip("'\"").lower() or "frame"
+    cfg.THUMBNAIL_MODE = _tm if _tm in ("cutout", "ai", "frame") else "frame"
+    _ip = (
+        os.getenv("IMAGE_PROVIDER") or "auto"
+    ).strip().strip("'\"").lower() or "auto"
+    cfg.IMAGE_PROVIDER = _ip if _ip in ("openai", "gemini", "auto") else "auto"
+    cfg.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip().strip("'\"")
     cfg.GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
+    cfg.GEMINI_IMAGE_MODEL = (
+        os.getenv("GEMINI_IMAGE_MODEL") or "gemini-2.5-flash-image"
+    ).strip().strip("'\"") or "gemini-2.5-flash-image"
     cfg.LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
     cfg.LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL") or "base"
     cfg.LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE") or "auto"
@@ -309,6 +576,13 @@ def _write_config(updates: Dict[str, str]) -> None:
     except (TypeError, ValueError):
         cfg.LOCAL_FACE_SMOOTHING = 0.15
     cfg.CONTENT_LANGUAGE = os.getenv("CONTENT_LANGUAGE", "pt").strip().lower() or "pt"
+    from shorts_generator.config import DEFAULT_THUMBNAIL_PALETTE
+
+    cfg.THUMBNAIL_PALETTE = format_thumbnail_palette(
+        parse_thumbnail_palette(
+            os.getenv("THUMBNAIL_PALETTE") or DEFAULT_THUMBNAIL_PALETTE
+        )
+    )
 
 
 def _public_short(job_id: str, short: Dict[str, Any], index: int) -> Dict[str, Any]:
@@ -752,6 +1026,43 @@ def _short_clip_path(short: Dict[str, Any]) -> Optional[Path]:
     return path if path.exists() else None
 
 
+def _heal_injected_short_thumbnail(job_id: str, short: Dict[str, Any]) -> bool:
+    """Restore ``short_thumbs/{id}.jpg`` from frame 0 when a custom poster was
+    burned into the clip but the JPG was overwritten right after render.
+
+    Heuristic: only rewrite when the JPG mtime is within ~3 minutes of the
+    clip (the old attach bug). Later regenerations keep the newer JPG.
+    """
+    if not short.get("thumbnail_frame_injected"):
+        return False
+    if not (short.get("thumbnail_ai") or short.get("thumbnail_ai_meta")):
+        return False
+    sid = _short_id(short)
+    if sid < 0:
+        return False
+    dest = JOBS_DIR / job_id / "short_thumbs" / f"{sid}.jpg"
+    clip_path = _short_clip_path(short)
+    if clip_path is None:
+        return False
+    try:
+        if dest.is_file() and dest.stat().st_size > 0:
+            delta = dest.stat().st_mtime - clip_path.stat().st_mtime
+            if delta < 0 or delta > 180:
+                return False
+    except OSError:
+        return False
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if not _extract_frame(str(clip_path), 0.0, dest):
+        return False
+    try:
+        version = int(dest.stat().st_mtime)
+    except OSError:
+        version = int(datetime.now(timezone.utc).timestamp())
+    short["thumbnail_url"] = f"/api/jobs/{job_id}/short-thumbs/{sid}?v={version}"
+    short["thumbnail_version"] = version
+    return True
+
+
 def _generate_short_thumbnail(
     job_id: str,
     short: Dict[str, Any],
@@ -773,6 +1084,21 @@ def _generate_short_thumbnail(
     clip_path = _short_clip_path(short)
     if clip_path is None:
         return None
+
+    # Custom poster was burned into frame 0 — restore it instead of inventing
+    # a new frame+hook composite on top of the video.
+    if short.get("thumbnail_frame_injected"):
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if _extract_frame(str(clip_path), 0.0, dest):
+            try:
+                version = int(dest.stat().st_mtime)
+            except OSError:
+                version = int(datetime.now(timezone.utc).timestamp())
+            short["thumbnail_url"] = (
+                f"/api/jobs/{job_id}/short-thumbs/{hid}?v={version}"
+            )
+            short["thumbnail_version"] = version
+            return short["thumbnail_url"]
 
     hook = str(short.get("hook_sentence") or short.get("title") or "").strip()
     tmp = JOBS_DIR / job_id / "short_thumbs" / f".{hid}.frame.jpg"
@@ -842,7 +1168,12 @@ def _attach_or_generate_short_thumbnail(
     highlights: List[Dict[str, Any]],
     style: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Reuse a pre-generated AI thumbnail when present; otherwise build from clip."""
+    """Reuse a pre-generated custom/AI thumbnail when present; otherwise build from clip.
+
+    Any non-empty ``short_thumbs/{id}.jpg`` is treated as authoritative — including
+    frame/cutout posters from step 4. Never overwrite those with a lazy
+    frame+hook composite (that used to wipe the thumb burned into the MP4).
+    """
     sid = _short_id(short)
     if sid < 0:
         return None
@@ -857,16 +1188,26 @@ def _attach_or_generate_short_thumbnail(
         if ai_meta:
             short["thumbnail_ai_meta"] = ai_meta
 
-    if (short.get("thumbnail_ai") or (hl and hl.get("thumbnail_ai"))) and dest.exists():
+    try:
+        has_custom = dest.is_file() and dest.stat().st_size > 0
+    except OSError:
+        has_custom = False
+
+    if has_custom:
+        _heal_injected_short_thumbnail(job_id, short)
         try:
             version = int(dest.stat().st_mtime)
         except OSError:
             version = int(datetime.now(timezone.utc).timestamp())
         short["thumbnail_url"] = f"/api/jobs/{job_id}/short-thumbs/{sid}?v={version}"
         short["thumbnail_version"] = version
-        short["thumbnail_ai"] = True
+        # File on disk is the custom poster (AI, cutout, or frame+overlay).
+        if short.get("thumbnail_ai") or (hl and hl.get("thumbnail_ai")) or ai_meta:
+            short["thumbnail_ai"] = True
         if ai_meta and not short.get("thumbnail_ai_meta"):
             short["thumbnail_ai_meta"] = ai_meta
+        elif hl and hl.get("thumbnail_ai_meta") and not short.get("thumbnail_ai_meta"):
+            short["thumbnail_ai_meta"] = hl.get("thumbnail_ai_meta")
         return short["thumbnail_url"]
 
     return _generate_short_thumbnail(job_id, short, style=style, force=True)
@@ -1582,6 +1923,7 @@ def _run_rank_highlights(
                 num_clips=None,
                 language=params.get("language") or None,
                 virality_profile=virality_profile,
+                clip_length=params.get("clip_length") or "short",
             )
         # Refine portraits using labeled speech turns (speaker_id on segments)
         if not skip_cast and (result.get("speakers") or []):
@@ -1701,7 +2043,9 @@ def _run_render(
                 disk = _discover_shorts_on_disk(job)
                 if disk:
                     existing = list(disk.values())
-    desired_style = params.get("caption_style")
+    from shorts_generator.captions import resolve_style_for_aspect
+
+    desired_style = resolve_style_for_aspect(params)
     existing_by_id = {}
     for i, s in enumerate(existing):
         if not s.get("clip_url") or s.get("error"):
@@ -1827,7 +2171,7 @@ def _run_render(
                     render_ids,
                     aspect_ratio=params.get("aspect_ratio") or "9:16",
                     on_short_done=on_short_done,
-                    caption_style=params.get("caption_style"),
+                    caption_style=desired_style,
                 )
             for s in partial.get("shorts") or []:
                 done_by_id[_short_id(s)] = s
@@ -1869,6 +2213,8 @@ class SelectHighlights(BaseModel):
     ids: List[int] = Field(default_factory=list)
     force: bool = False
     caption_style: Optional[Dict[str, Any]] = None
+    # Per-aspect karaoke styles: {"9:16": {...}, "16:9": {...}}
+    caption_styles: Optional[Dict[str, Any]] = None
     # Render only `ids` but keep other already-done shorts in the result set.
     append: bool = False
     # Continue an interrupted batch — reuse disk clips; ignore stale force_rerender.
@@ -1894,6 +2240,8 @@ class UpdateJobParams(BaseModel):
     download_format: Optional[str] = None
     regenerate: bool = True
     caption_style: Optional[Dict[str, Any]] = None
+    # Per-aspect karaoke styles: {"9:16": {...}, "16:9": {...}}
+    caption_styles: Optional[Dict[str, Any]] = None
     ui_step: Optional[int] = None
     selected_ids: Optional[List[int]] = None
 
@@ -2656,7 +3004,9 @@ def get_preview_thumb(job_id: str, index: int):
         if not job or not job.get("result"):
             raise HTTPException(404, "Miniatura não encontrada")
         params = dict(job.get("params") or {})
-        style = params.get("caption_style")
+        from shorts_generator.captions import resolve_style_for_aspect
+
+        style = resolve_style_for_aspect(params)
         aspect = params.get("aspect_ratio") or "9:16"
         result = job["result"]
         highlights = result.get("highlights") or []
@@ -2719,7 +3069,9 @@ def get_short_thumb(job_id: str, index: int):
         if not job or not job.get("result"):
             raise HTTPException(404, "Miniatura do short não encontrada")
         shorts = job["result"].get("shorts") or []
-        style = (job.get("params") or {}).get("caption_style")
+        from shorts_generator.captions import resolve_style_for_aspect
+
+        style = resolve_style_for_aspect(job.get("params") or {})
         target = None
         for i, s in enumerate(shorts):
             if _short_id(s, i) == int(index):
@@ -2758,18 +3110,30 @@ def get_cast_portrait(job_id: str, speaker_id: str):
 @app.post("/api/jobs/{job_id}/cast/{speaker_id}/next-portrait")
 def next_cast_portrait(job_id: str, speaker_id: str):
     """Advance to another face frame for this speaker (cast UI correction)."""
+    allowed = {
+        "awaiting_cast",
+        "awaiting_selection",
+        "completed",
+        "interrupted",
+        "failed",
+        "rendering",
+    }
     with _jobs_lock:
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "Job não encontrado")
-        if job.get("status") != "awaiting_cast":
+        status = job.get("status")
+        if status not in allowed:
             raise HTTPException(
                 400,
-                f"Só é possível trocar foto enquanto identifica locutores (status={job['status']})",
+                f"Só é possível trocar foto com análise pronta (status={status})",
             )
         result = job.get("result")
         if not isinstance(result, dict):
             raise HTTPException(400, "Job sem resultado de análise")
+        speakers = result.get("speakers") or []
+        if not isinstance(speakers, list) or not speakers:
+            raise HTTPException(400, "Job sem locutores para trocar foto")
         url = (job.get("params") or {}).get("url") or ""
 
     updated = _advance_cast_portrait(job_id, result, speaker_id, original_url=url)
@@ -2778,8 +3142,8 @@ def next_cast_portrait(job_id: str, speaker_id: str):
         job = _jobs.get(job_id)
         if not job:
             raise HTTPException(404, "Job não encontrado")
-        if job.get("status") != "awaiting_cast":
-            raise HTTPException(400, "Job não está mais na etapa de locutores")
+        if job.get("status") not in allowed:
+            raise HTTPException(400, "Job mudou de status durante a troca de foto")
         current = job.get("result")
         if current is not result and isinstance(current, dict):
             # Job result object replaced — apply URL onto matching speaker if present
@@ -2878,7 +3242,12 @@ def _discover_shorts_on_disk(job: Dict[str, Any]) -> Dict[int, Dict[str, Any]]:
     if not clips_dir:
         return {}
 
-    style = (job.get("params") or {}).get("caption_style")
+    style = None
+    params = job.get("params") or {}
+    if isinstance(params, dict):
+        from shorts_generator.captions import resolve_style_for_aspect
+
+        style = resolve_style_for_aspect(params)
     found: Dict[int, Dict[str, Any]] = {}
     for i, h in enumerate(result.get("highlights") or []):
         if not isinstance(h, dict):
@@ -3205,7 +3574,11 @@ def update_cast_roster(job_id: str, body: UpdateCastRoster):
 
 @app.post("/api/jobs/{job_id}/select")
 def select_highlights(job_id: str, body: SelectHighlights):
-    from shorts_generator.captions import resolve_style
+    from shorts_generator.captions import (
+        merge_caption_styles,
+        normalize_caption_aspect,
+        resolve_style_for_aspect,
+    )
 
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -3227,8 +3600,18 @@ def select_highlights(job_id: str, body: SelectHighlights):
         if bad:
             raise HTTPException(400, f"IDs inválidos: {bad}")
         ids = _sorted_selection_ids(highlights, ids)
-        style = resolve_style(body.caption_style if body.caption_style is not None else job["params"].get("caption_style"))
-        prev_style = job["params"].get("caption_style")
+        aspect = normalize_caption_aspect(job["params"].get("aspect_ratio"))
+        prev_style = resolve_style_for_aspect(job["params"], aspect)
+        if body.caption_styles is not None or body.caption_style is not None:
+            merged = merge_caption_styles(
+                job["params"].get("caption_styles"),
+                body.caption_styles,
+                active_aspect=aspect,
+                active_style=body.caption_style,
+            )
+            if merged:
+                job["params"]["caption_styles"] = merged
+        style = resolve_style_for_aspect(job["params"], aspect)
         style_changed = prev_style != style
         job["params"]["caption_style"] = style
         append = bool(body.append)
@@ -3280,6 +3663,7 @@ def select_highlights(job_id: str, body: SelectHighlights):
         "append": append,
         "resume": resume,
         "caption_style": style,
+        "caption_styles": (job.get("params") or {}).get("caption_styles"),
     }
 
 
@@ -3346,6 +3730,13 @@ def update_job_params(job_id: str, body: UpdateJobParams):
         job["params"]["aspect_ratio"] = aspect
         if fmt:
             job["params"]["download_format"] = fmt
+        # Keep singular caption_style aligned with the active aspect bucket.
+        if changed and isinstance(job["params"].get("caption_styles"), dict):
+            from shorts_generator.captions import resolve_style_for_aspect
+
+            job["params"]["caption_style"] = resolve_style_for_aspect(
+                job["params"], aspect
+            )
         ui_changed = False
         if body.ui_step is not None:
             step = int(body.ui_step)
@@ -3360,11 +3751,27 @@ def update_job_params(job_id: str, body: UpdateJobParams):
                 sel_changed = True
             job["params"]["selected_ids"] = new_sel
         style_changed = False
-        if body.caption_style is not None:
-            from shorts_generator.captions import resolve_style
+        if body.caption_styles is not None or body.caption_style is not None:
+            from shorts_generator.captions import (
+                merge_caption_styles,
+                normalize_caption_aspect,
+                resolve_style_for_aspect,
+            )
 
-            style = resolve_style(body.caption_style)
-            if job["params"].get("caption_style") != style:
+            aspect_for_style = normalize_caption_aspect(
+                job["params"].get("aspect_ratio")
+            )
+            prev_style = resolve_style_for_aspect(job["params"], aspect_for_style)
+            merged = merge_caption_styles(
+                job["params"].get("caption_styles"),
+                body.caption_styles,
+                active_aspect=aspect_for_style,
+                active_style=body.caption_style,
+            )
+            if merged:
+                job["params"]["caption_styles"] = merged
+            style = resolve_style_for_aspect(job["params"], aspect_for_style)
+            if prev_style != style:
                 style_changed = True
             job["params"]["caption_style"] = style
         selected = [int(i) for i in (job["params"].get("selected_ids") or [])]
@@ -3378,9 +3785,36 @@ def update_job_params(job_id: str, body: UpdateJobParams):
             # Aspect/style change invalidates hook posters on topic cards
             _invalidate_preview_thumbs(job_id)
         if style_changed:
+            # Drop only auto frame+hook posters so they can refresh with the new
+            # karaoke palette. Keep custom/AI/cutout short_thumbs intact.
             short_thumb_dir = JOBS_DIR / job_id / "short_thumbs"
             if short_thumb_dir.exists():
+                protected: set[int] = set()
+                result = (
+                    job.get("result") if isinstance(job.get("result"), dict) else {}
+                )
+                for collection in (
+                    result.get("highlights") or [],
+                    result.get("shorts") or [],
+                ):
+                    for i, item in enumerate(collection):
+                        if not isinstance(item, dict):
+                            continue
+                        if (
+                            item.get("thumbnail_ai")
+                            or item.get("has_custom_thumbnail")
+                            or item.get("thumbnail_frame_injected")
+                        ):
+                            protected.add(_short_id(item, i))
                 for p in short_thumb_dir.glob("*.jpg"):
+                    if p.name.startswith("."):
+                        continue
+                    try:
+                        sid = int(p.stem)
+                    except ValueError:
+                        continue
+                    if sid in protected:
+                        continue
                     try:
                         p.unlink()
                     except OSError:
@@ -3465,6 +3899,7 @@ async def create_job(
     aspect_ratio: str = Form("9:16"),
     download_format: str = Form("720"),
     language: Optional[str] = Form(None),
+    clip_length: str = Form("short"),
     project_id: Optional[str] = Form(None),
     file: Optional[UploadFile] = File(None),
 ):
@@ -3473,6 +3908,12 @@ async def create_job(
         raise HTTPException(400, "mode deve ser 'api' ou 'local'")
     if download_format not in ("360", "480", "720", "1080"):
         raise HTTPException(400, "format inválido")
+
+    from shorts_generator.highlights import normalize_clip_length
+
+    clip_len = normalize_clip_length(clip_length)
+    # Aspect locked to clip format from step 1 (short → 9:16, long → 16:9)
+    aspect_ratio = "16:9" if clip_len == "long" else "9:16"
 
     pid = (project_id or "").strip() or None
     if not pid:
@@ -3510,6 +3951,7 @@ async def create_job(
             "aspect_ratio": aspect_ratio.strip() or "9:16",
             "download_format": download_format,
             "language": lang,
+            "clip_length": clip_len,
             "original_filename": file.filename if file and file.filename else None,
         },
         "logs": [],
@@ -3720,12 +4162,39 @@ def _youtube_upload_preview(job_id: str, short_id: int) -> Dict[str, Any]:
         configured = bool(creds and yt.credentials_configured(creds))
 
     seo = _build_youtube_seo_for_short(job_snapshot, short_snapshot, short_id)
+    # Heal JPG overwritten by the old frame+hook attach bug (frame 0 is source of truth).
+    if _heal_injected_short_thumbnail(job_id, short_snapshot):
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job and job.get("result"):
+                live, _ = _find_job_short(job, short_id)
+                if live is not None:
+                    if short_snapshot.get("thumbnail_url"):
+                        live["thumbnail_url"] = short_snapshot["thumbnail_url"]
+                    if short_snapshot.get("thumbnail_version") is not None:
+                        live["thumbnail_version"] = short_snapshot["thumbnail_version"]
+                    job["updated_at"] = _now()
+                    _persist_job(job)
     public = _public_short(job_id, short_snapshot, target_index if target_index >= 0 else 0)
     thumb_path = _short_thumbnail_path(job_id, short_snapshot)
     thumbnail_url = public.get("thumbnail_url") or ""
     if not thumbnail_url and thumb_path:
         hid = _short_id(short_snapshot)
-        thumbnail_url = f"/api/jobs/{job_id}/short-thumbs/{hid}?v=2"
+        try:
+            ver = int(thumb_path.stat().st_mtime)
+        except OSError:
+            ver = 2
+        thumbnail_url = f"/api/jobs/{job_id}/short-thumbs/{hid}?v={ver}"
+    elif thumb_path:
+        try:
+            ver = int(thumb_path.stat().st_mtime)
+        except OSError:
+            ver = None
+        if ver is not None:
+            hid = _short_id(short_snapshot)
+            thumbnail_url = f"/api/jobs/{job_id}/short-thumbs/{hid}?v={ver}"
+            short_snapshot["thumbnail_version"] = ver
+            public["thumbnail_url"] = thumbnail_url
 
     already_uploaded = bool(
         short_snapshot.get("youtube_video_id") or short_snapshot.get("youtube_url")
@@ -3995,8 +4464,206 @@ def youtube_upload_preview(job_id: str, short_id: int):
         raise HTTPException(code, msg) from exc
 
 
-def _generate_ai_short_thumbnail(job_id: str, short_id: int) -> Dict[str, Any]:
-    """Build an OpenAI viral thumbnail for a topic/short id (clip optional).
+def _reload_image_config() -> None:
+    """Refresh image-provider settings from .env before each AI thumbnail call."""
+    load_dotenv(ENV_PATH, override=True)
+    import shorts_generator.config as cfg
+
+    cfg.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+    cfg.OPENAI_IMAGE_MODEL = (
+        os.getenv("OPENAI_IMAGE_MODEL") or "gpt-image-1-mini"
+    ).strip().strip("'\"") or "gpt-image-1-mini"
+    _q = (
+        os.getenv("OPENAI_IMAGE_QUALITY") or "medium"
+    ).strip().strip("'\"").lower() or "medium"
+    cfg.OPENAI_IMAGE_QUALITY = _q if _q in ("low", "medium", "high") else "medium"
+    _f = (
+        os.getenv("OPENAI_IMAGE_FIDELITY") or "low"
+    ).strip().strip("'\"").lower() or "low"
+    cfg.OPENAI_IMAGE_FIDELITY = (
+        _f if _f in ("low", "high", "none", "off") else "low"
+    )
+    cfg.THUMBNAIL_HYBRID = os.getenv("THUMBNAIL_HYBRID", "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    _tm = (
+        os.getenv("THUMBNAIL_MODE") or "frame"
+    ).strip().strip("'\"").lower() or "frame"
+    cfg.THUMBNAIL_MODE = _tm if _tm in ("cutout", "ai", "frame") else "frame"
+    _ip = (
+        os.getenv("IMAGE_PROVIDER") or "auto"
+    ).strip().strip("'\"").lower() or "auto"
+    cfg.IMAGE_PROVIDER = _ip if _ip in ("openai", "gemini", "auto") else "auto"
+    cfg.GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip().strip("'\"")
+    cfg.GEMINI_MODEL = os.getenv("GEMINI_MODEL") or "gemini-2.5-flash"
+    cfg.GEMINI_IMAGE_MODEL = (
+        os.getenv("GEMINI_IMAGE_MODEL") or "gemini-2.5-flash-image"
+    ).strip().strip("'\"") or "gemini-2.5-flash-image"
+    cfg.LLM_PROVIDER = (os.getenv("LLM_PROVIDER") or "openai").strip().lower()
+    from shorts_generator.config import DEFAULT_THUMBNAIL_PALETTE, format_thumbnail_palette, parse_thumbnail_palette
+
+    cfg.THUMBNAIL_PALETTE = format_thumbnail_palette(
+        parse_thumbnail_palette(
+            os.getenv("THUMBNAIL_PALETTE") or DEFAULT_THUMBNAIL_PALETTE
+        )
+    )
+
+
+def _face_cand_dir(job_id: str, highlight_id: int) -> Path:
+    return JOBS_DIR / job_id / "face_cands" / str(int(highlight_id))
+
+
+def _resolve_cast_portrait_for_name(
+    job_id: str,
+    attributed_to: str,
+    speakers: List[Any],
+) -> Optional[Path]:
+    from shorts_generator.thumbnails_ai import match_cast_portrait
+
+    cast_dir = JOBS_DIR / job_id / "cast"
+    if not cast_dir.is_dir():
+        return None
+    matched = match_cast_portrait(attributed_to, speakers, cast_dir)
+    return matched[0] if matched else None
+
+
+def _build_face_candidates_for_highlight(
+    job_id: str, highlight_id: int, *, limit: int = 6
+) -> Dict[str, Any]:
+    """Sample video frames in the topic range and return ranked face plates."""
+    from shorts_generator.thumbnail_cutout import build_face_candidates
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or not job.get("result"):
+            raise ValueError("Job/resultado não encontrado")
+        highlight, _ = _find_job_highlight(job, highlight_id)
+        short, _ = _find_job_short(job, highlight_id)
+        if highlight is None and short is None:
+            raise ValueError("Tópico não encontrado")
+        base = dict(highlight or {})
+        if short:
+            for key in ("attributed_to", "start_time", "end_time", "title"):
+                if not base.get(key) and short.get(key) is not None:
+                    base[key] = short.get(key)
+        result = job.get("result") or {}
+        speakers = list(result.get("speakers") or [])
+        transcript = (
+            result.get("transcript") if isinstance(result.get("transcript"), dict) else {}
+        )
+        params = dict(job.get("params") or {})
+        original_url = str(params.get("url") or result.get("source_url") or "")
+        ffmpeg_src, _yt = _resolve_job_source(result, original_url)
+
+    if not (transcript.get("segments") if isinstance(transcript, dict) else None):
+        result_path = JOBS_DIR / f"{job_id}_result.json"
+        if result_path.exists():
+            try:
+                full = json.loads(result_path.read_text(encoding="utf-8"))
+                if isinstance(full.get("transcript"), dict):
+                    transcript = full["transcript"]
+                if not speakers and isinstance(full.get("speakers"), list):
+                    speakers = full["speakers"]
+            except Exception:
+                pass
+
+    if not ffmpeg_src:
+        raise ValueError("Vídeo fonte indisponível para extrair frames")
+
+    try:
+        start = float(base.get("start_time") or 0)
+        end = float(base.get("end_time") or start + 60)
+    except (TypeError, ValueError):
+        start, end = 0.0, 60.0
+
+    attributed = str(base.get("attributed_to") or "").strip()
+    cast_path = _resolve_cast_portrait_for_name(job_id, attributed, speakers)
+    out_dir = _face_cand_dir(job_id, highlight_id)
+    built = build_face_candidates(
+        ffmpeg_src=str(ffmpeg_src),
+        extract_frame_fn=_extract_frame,
+        out_dir=out_dir,
+        start=start,
+        end=end,
+        transcript=transcript if isinstance(transcript, dict) else None,
+        attributed_to=attributed,
+        speakers=speakers,
+        cast_portrait=cast_path,
+        limit=max(3, min(8, int(limit))),
+    )
+    if not built:
+        raise RuntimeError(
+            "Não achei frames com rosto neste trecho — tente outro corte ou use a foto do locutor"
+        )
+
+    candidates = []
+    for item in built:
+        cid = str(item["id"])
+        candidates.append(
+            {
+                "id": cid,
+                "time": item.get("time"),
+                "score": item.get("score"),
+                "source": item.get("source"),
+                "label": item.get("label") or cid,
+                "url": f"/api/jobs/{job_id}/highlights/{int(highlight_id)}/face-candidates/{cid}",
+            }
+        )
+    return {
+        "ok": True,
+        "highlight_id": int(highlight_id),
+        "attributed_to": attributed,
+        "candidates": candidates,
+    }
+
+
+def _face_candidate_path(job_id: str, highlight_id: int, candidate_id: str) -> Path:
+    sid = re.sub(r"[^A-Za-z0-9_-]", "", candidate_id or "")
+    if not sid:
+        raise ValueError("Candidato inválido")
+    folder = _face_cand_dir(job_id, highlight_id)
+    manifest_path = folder / "manifest.json"
+    if manifest_path.exists():
+        try:
+            items = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for item in items or []:
+                if str(item.get("id") or "") != sid:
+                    continue
+                path = folder / str(item.get("file") or "")
+                if path.exists():
+                    return path
+        except Exception:
+            pass
+    # Legacy / fallback lookups
+    if sid == "cast":
+        for path in folder.glob("*cast*.jpg"):
+            if path.exists():
+                return path
+    for path in folder.glob(f"*_{sid}.jpg"):
+        if path.exists():
+            return path
+    for path in folder.glob(f"*{sid}*.jpg"):
+        if path.exists():
+            return path
+    raise ValueError("Candidato de rosto não encontrado — abra o seletor de novo")
+
+
+def _generate_ai_short_thumbnail(
+    job_id: str,
+    short_id: int,
+    *,
+    face_candidate_id: Optional[str] = None,
+    mode: Optional[str] = None,
+    overlay_text: Optional[str] = None,
+    text_color_mode: Optional[str] = None,
+    margin_v: Optional[int] = None,
+    font_size: Optional[int] = None,
+    border_pct: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Build a viral thumbnail for a topic/short id (clip optional).
 
     Works before render by sampling a frame from the source video. Writes
     ``short_thumbs/{id}.jpg`` and stamps ``thumbnail_ai`` on the highlight
@@ -4005,6 +4672,7 @@ def _generate_ai_short_thumbnail(job_id: str, short_id: int) -> Dict[str, Any]:
     from shorts_generator.highlights import snippet_for_range
     from shorts_generator.thumbnails_ai import generate_ai_thumbnail
 
+    _reload_image_config()
     with _jobs_lock:
         job = _jobs.get(job_id)
         if not job or not job.get("result"):
@@ -4022,6 +4690,7 @@ def _generate_ai_short_thumbnail(job_id: str, short_id: int) -> Dict[str, Any]:
             for key in (
                 "title",
                 "hook_sentence",
+                "virality_reason",
                 "attributed_to",
                 "snippet",
                 "start_time",
@@ -4074,6 +4743,11 @@ def _generate_ai_short_thumbnail(job_id: str, short_id: int) -> Dict[str, Any]:
     if not snippet and isinstance(transcript, dict):
         snippet = snippet_for_range(transcript, start, end, max_chars=900)
 
+    # Selected face plate for cutout mode
+    person_frame: Optional[Path] = None
+    if face_candidate_id:
+        person_frame = _face_candidate_path(job_id, hid, face_candidate_id)
+
     # Reference frame: rendered clip → existing AI/raw thumbs → source video
     ref_frame: Optional[Path] = None
     tmp_frame = JOBS_DIR / job_id / "short_thumbs" / f".{hid}.ai_ref.jpg"
@@ -4097,29 +4771,70 @@ def _generate_ai_short_thumbnail(job_id: str, short_id: int) -> Dict[str, Any]:
         if _extract_frame(str(ffmpeg_src), ts, tmp_frame):
             ref_frame = tmp_frame
 
-    _append_log(job_id, f"Gerando thumbnail IA para tópico #{hid}…")
+    if person_frame is None:
+        person_frame = ref_frame
+
+    _append_log(
+        job_id,
+        f"Gerando thumbnail (frame original) para tópico #{hid}"
+        + (f" · frame={face_candidate_id}" if face_candidate_id else "")
+        + "…",
+    )
+    _append_log(
+        job_id,
+        f"[thumb] person_frame="
+        + (person_frame.name if person_frame else "None")
+        + f" · ref_frame="
+        + (ref_frame.name if ref_frame else "None")
+        + f" · wiki_dir={wiki_dir.name if wiki_dir else 'None'}"
+        + f" · attributed_to={short_snapshot.get('attributed_to') or '—'}",
+    )
     full_hook = str(
         short_snapshot.get("hook_sentence") or short_snapshot.get("title") or ""
     ).strip()
+    from shorts_generator.captions import resolve_style_for_aspect
+
+    caption_style = resolve_style_for_aspect(params, aspect)
+    color_mode = _normalize_thumb_color_mode(text_color_mode)
+    margin_override = _normalize_thumb_margin_v(margin_v)
+    font_override = _normalize_thumb_font_size(font_size)
+    border_override = _normalize_thumb_border_pct(border_pct)
+    capture = LogCapture(job_id, sys.stdout)
+    err_capture = LogCapture(job_id, sys.stderr)
     try:
-        meta = generate_ai_thumbnail(
-            dest=dest,
-            hook=full_hook,
-            title=str(short_snapshot.get("title") or ""),
-            attributed_to=str(short_snapshot.get("attributed_to") or ""),
-            snippet=snippet,
-            speakers=speakers,
-            cast_dir=cast_dir if cast_dir.is_dir() else None,
-            wiki_dir=wiki_dir,
-            reference_frame=ref_frame,
-            aspect_ratio=aspect,
-            language=str(language or "pt"),
-        )
+        with redirect_stdout(capture), redirect_stderr(err_capture):
+            meta = generate_ai_thumbnail(
+                dest=dest,
+                hook=full_hook,
+                title=str(short_snapshot.get("title") or ""),
+                virality_reason=str(short_snapshot.get("virality_reason") or ""),
+                attributed_to=str(short_snapshot.get("attributed_to") or ""),
+                snippet=snippet,
+                speakers=speakers,
+                cast_dir=cast_dir if cast_dir.is_dir() else None,
+                wiki_dir=wiki_dir,
+                reference_frame=ref_frame,
+                person_frame=person_frame,
+                aspect_ratio=aspect,
+                language=str(language or "pt"),
+                mode=mode,
+                overlay_text=overlay_text,
+                caption_style=caption_style,
+                text_color_mode=color_mode,
+                margin_v=margin_override,
+                font_size=font_override,
+                border_pct=border_override,
+            )
         # Hybrid: PIL burns hook + frame. Full mode: model paints typography.
         if full_hook and not meta.get("hook"):
             meta["hook"] = full_hook
         meta["hook_burned"] = bool(meta.get("hook_burned"))
     finally:
+        try:
+            capture.flush()
+            err_capture.flush()
+        except Exception:
+            pass
         try:
             if tmp_frame.exists() and tmp_frame != dest and tmp_frame != ref_frame:
                 tmp_frame.unlink(missing_ok=True)
@@ -4136,15 +4851,31 @@ def _generate_ai_short_thumbnail(job_id: str, short_id: int) -> Dict[str, Any]:
 
     thumb_url = f"/api/jobs/{job_id}/short-thumbs/{hid}?v={version}"
     ai_meta = {
+        "provider": meta.get("provider"),
         "model": meta.get("model"),
         "size": meta.get("size"),
         "quality": meta.get("quality"),
         "fidelity": meta.get("fidelity"),
         "hybrid": meta.get("hybrid"),
+        "mode": meta.get("mode"),
+        "mode_requested": meta.get("mode_requested"),
         "hook": meta.get("hook"),
         "hook_burned": bool(meta.get("hook_burned")),
+        "overlay_text": meta.get("overlay_text") or meta.get("hook"),
+        "overlay_from_llm": bool(meta.get("overlay_from_llm")),
+        "text_color_mode": meta.get("text_color_mode") or color_mode,
+        "margin_v": meta.get("margin_v") if meta.get("margin_v") is not None else margin_override,
+        "font_size": meta.get("font_size") if meta.get("font_size") is not None else font_override,
+        "border_pct": meta.get("border_pct") if meta.get("border_pct") is not None else border_override,
         "faces": meta.get("faces") or [],
         "cited_people": meta.get("cited_people") or [],
+        "wiki_hits": meta.get("wiki_hits") or [],
+        "wiki_skip_reason": meta.get("wiki_skip_reason"),
+        "refs_sent_to_ai": meta.get("refs_sent_to_ai") or [],
+        "refs_sent_count": meta.get("refs_sent_count") or 0,
+        "person_src": meta.get("person_src"),
+        "person_src_origin": meta.get("person_src_origin"),
+        "face_candidate_id": face_candidate_id,
     }
 
     with _jobs_lock:
@@ -4184,10 +4915,39 @@ def _generate_ai_short_thumbnail(job_id: str, short_id: int) -> Dict[str, Any]:
     face_note = ", ".join(
         f"{f.get('kind')}:{f.get('name')}" for f in (meta.get("faces") or []) if f.get("name")
     )
+    cited_note = ", ".join(
+        str(c.get("name") or "")
+        for c in (meta.get("cited_people") or [])
+        if isinstance(c, dict) and c.get("name")
+    )
+    wiki_note = ", ".join(
+        str(h.get("name") or "")
+        for h in (meta.get("wiki_hits") or [])
+        if isinstance(h, dict) and h.get("name")
+    )
+    refs_n = int(meta.get("refs_sent_count") or 0)
+    refs_names = ", ".join(
+        str(r.get("name") or "")
+        for r in (meta.get("refs_sent_to_ai") or [])
+        if isinstance(r, dict) and r.get("name")
+    )
     _append_log(
         job_id,
-        f"Thumbnail IA pronta: tópico #{hid}"
+        f"Thumbnail pronta: tópico #{hid} mode={meta.get('mode')}"
+        f" provider={meta.get('provider')}/{meta.get('model')}"
         + (f" ({face_note})" if face_note else ""),
+    )
+    _append_log(
+        job_id,
+        f"[thumb] citados={cited_note or '—'} · wiki="
+        + (wiki_note or (f"pulado ({meta.get('wiki_skip_reason')})" if meta.get("wiki_skip_reason") else "—"))
+        + f" · refs→IA={refs_n}"
+        + (f" [{refs_names}]" if refs_names else "")
+        + (
+            f" · frame={Path(meta['person_src']).name} ({meta.get('person_src_origin')})"
+            if meta.get("person_src")
+            else ""
+        ),
     )
     return {
         "ok": True,
@@ -4200,8 +4960,18 @@ def _generate_ai_short_thumbnail(job_id: str, short_id: int) -> Dict[str, Any]:
         ),
         "has_custom_thumbnail": True,
         "thumbnail_ai": True,
+        "mode": meta.get("mode"),
+        "overlay_text": meta.get("overlay_text") or meta.get("hook"),
+        "text_color_mode": meta.get("text_color_mode") or color_mode,
+        "margin_v": meta.get("margin_v") if meta.get("margin_v") is not None else margin_override,
+        "font_size": meta.get("font_size") if meta.get("font_size") is not None else font_override,
+        "border_pct": meta.get("border_pct") if meta.get("border_pct") is not None else border_override,
         "faces": meta.get("faces") or [],
         "cited_people": meta.get("cited_people") or [],
+        "wiki_hits": meta.get("wiki_hits") or [],
+        "wiki_skip_reason": meta.get("wiki_skip_reason"),
+        "refs_sent_to_ai": meta.get("refs_sent_to_ai") or [],
+        "refs_sent_count": refs_n,
         "short": public_short,
         "highlight": public_hl,
         "openai_configured": True,
@@ -4209,43 +4979,183 @@ def _generate_ai_short_thumbnail(job_id: str, short_id: int) -> Dict[str, Any]:
 
 
 @app.post("/api/jobs/{job_id}/shorts/{short_id}/generate-thumbnail")
-def generate_short_ai_thumbnail(job_id: str, short_id: int):
-    """Generate a viral AI thumbnail (OpenAI) and replace the short poster."""
+def generate_short_ai_thumbnail(
+    job_id: str, short_id: int, body: Optional[GenerateThumbnailBody] = None
+):
+    """Enqueue (default) or sync-generate a viral AI thumbnail for a short."""
+    from shorts_generator.thumbnails_ai import ImageBillingError
+
+    body = body or GenerateThumbnailBody()
+    if body.sync:
+        try:
+            return _generate_ai_short_thumbnail(
+                job_id,
+                short_id,
+                face_candidate_id=body.face_candidate_id,
+                mode=body.mode,
+                overlay_text=body.overlay_text,
+                text_color_mode=body.text_color_mode,
+                margin_v=body.margin_v,
+                font_size=body.font_size,
+                border_pct=body.border_pct,
+            )
+        except ImageBillingError as exc:
+            _append_log(job_id, f"Thumbnail IA billing (short #{short_id}): {exc}")
+            raise HTTPException(402, str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ValueError as exc:
+            msg = str(exc)
+            code = 404 if "não encontrado" in msg.lower() or "sumiu" in msg.lower() else 400
+            raise HTTPException(code, msg) from exc
+        except RuntimeError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            tb = traceback.format_exc()
+            _append_log(job_id, f"Thumbnail IA falhou (short #{short_id}): {exc}")
+            _append_log(job_id, tb)
+            raise HTTPException(500, f"Falha ao gerar thumbnail: {exc}") from exc
     try:
-        return _generate_ai_short_thumbnail(job_id, short_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        return _enqueue_ai_thumbnail(
+            job_id,
+            short_id,
+            face_candidate_id=body.face_candidate_id,
+            mode=body.mode,
+            overlay_text=body.overlay_text,
+            text_color_mode=body.text_color_mode,
+            margin_v=body.margin_v,
+            font_size=body.font_size,
+            border_pct=body.border_pct,
+        )
     except ValueError as exc:
         msg = str(exc)
-        code = 404 if "não encontrado" in msg.lower() or "sumiu" in msg.lower() else 400
+        code = 404 if "não encontrado" in msg.lower() else 400
         raise HTTPException(code, msg) from exc
-    except RuntimeError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except Exception as exc:
-        tb = traceback.format_exc()
-        _append_log(job_id, f"Thumbnail IA falhou (short #{short_id}): {exc}")
-        _append_log(job_id, tb)
-        raise HTTPException(500, f"Falha ao gerar thumbnail: {exc}") from exc
 
 
 @app.post("/api/jobs/{job_id}/highlights/{highlight_id}/generate-thumbnail")
-def generate_highlight_ai_thumbnail(job_id: str, highlight_id: int):
-    """Generate a viral AI thumbnail for a topic before (or after) render."""
+def generate_highlight_ai_thumbnail(
+    job_id: str, highlight_id: int, body: Optional[GenerateThumbnailBody] = None
+):
+    """Enqueue (default) or sync-generate a viral AI thumbnail for a topic."""
+    from shorts_generator.thumbnails_ai import ImageBillingError
+
+    body = body or GenerateThumbnailBody()
+    if body.sync:
+        try:
+            return _generate_ai_short_thumbnail(
+                job_id,
+                highlight_id,
+                face_candidate_id=body.face_candidate_id,
+                mode=body.mode,
+                overlay_text=body.overlay_text,
+                text_color_mode=body.text_color_mode,
+                margin_v=body.margin_v,
+                font_size=body.font_size,
+                border_pct=body.border_pct,
+            )
+        except ImageBillingError as exc:
+            _append_log(job_id, f"Thumbnail IA billing (tópico #{highlight_id}): {exc}")
+            raise HTTPException(402, str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except ValueError as exc:
+            msg = str(exc)
+            code = 404 if "não encontrado" in msg.lower() or "sumiu" in msg.lower() else 400
+            raise HTTPException(code, msg) from exc
+        except RuntimeError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except Exception as exc:
+            tb = traceback.format_exc()
+            _append_log(job_id, f"Thumbnail IA falhou (tópico #{highlight_id}): {exc}")
+            _append_log(job_id, tb)
+            raise HTTPException(500, f"Falha ao gerar thumbnail: {exc}") from exc
     try:
-        return _generate_ai_short_thumbnail(job_id, highlight_id)
-    except FileNotFoundError as exc:
-        raise HTTPException(400, str(exc)) from exc
+        return _enqueue_ai_thumbnail(
+            job_id,
+            highlight_id,
+            face_candidate_id=body.face_candidate_id,
+            mode=body.mode,
+            overlay_text=body.overlay_text,
+            text_color_mode=body.text_color_mode,
+            margin_v=body.margin_v,
+            font_size=body.font_size,
+            border_pct=body.border_pct,
+        )
     except ValueError as exc:
         msg = str(exc)
-        code = 404 if "não encontrado" in msg.lower() or "sumiu" in msg.lower() else 400
+        code = 404 if "não encontrado" in msg.lower() else 400
+        raise HTTPException(code, msg) from exc
+
+
+@app.get("/api/jobs/{job_id}/highlights/{highlight_id}/thumbnail-status")
+def get_highlight_thumbnail_status(job_id: str, highlight_id: int):
+    """Poll async thumbnail generation status for a topic/short id."""
+    task_key = _thumb_task_key(job_id, highlight_id)
+    with _thumb_tasks_lock:
+        task = _thumb_tasks.get(task_key)
+        if not task:
+            # No in-flight task — report current thumb on disk if any
+            dest = JOBS_DIR / job_id / "short_thumbs" / f"{int(highlight_id)}.jpg"
+            if dest.exists() and dest.stat().st_size > 0:
+                try:
+                    version = int(dest.stat().st_mtime)
+                except OSError:
+                    version = 0
+                return {
+                    "ok": True,
+                    "status": "ready",
+                    "job_id": job_id,
+                    "highlight_id": int(highlight_id),
+                    "short_id": int(highlight_id),
+                    "thumbnail_url": f"/api/jobs/{job_id}/short-thumbs/{int(highlight_id)}?v={version}",
+                    "thumbnail_ai": True,
+                    "has_custom_thumbnail": True,
+                }
+            return {
+                "ok": True,
+                "status": "idle",
+                "job_id": job_id,
+                "highlight_id": int(highlight_id),
+                "short_id": int(highlight_id),
+            }
+        public = _public_thumb_task(task)
+        http_status = task.get("http_status")
+    if public.get("status") == "failed" and http_status == 402:
+        # Keep polling contract (200 + status=failed); UI reads error field.
+        pass
+    return public
+
+
+@app.get("/api/jobs/{job_id}/highlights/{highlight_id}/face-candidates")
+def list_highlight_face_candidates(job_id: str, highlight_id: int, limit: int = 6):
+    """Ranked face frames from the topic range for thumbnail picker."""
+    try:
+        return _build_face_candidates_for_highlight(
+            job_id, highlight_id, limit=limit
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        code = 404 if "não encontrado" in msg.lower() else 400
         raise HTTPException(code, msg) from exc
     except RuntimeError as exc:
         raise HTTPException(400, str(exc)) from exc
     except Exception as exc:
         tb = traceback.format_exc()
-        _append_log(job_id, f"Thumbnail IA falhou (tópico #{highlight_id}): {exc}")
+        _append_log(job_id, f"Face candidates falhou (#{highlight_id}): {exc}")
         _append_log(job_id, tb)
-        raise HTTPException(500, f"Falha ao gerar thumbnail: {exc}") from exc
+        raise HTTPException(500, f"Falha ao buscar frames: {exc}") from exc
+
+
+@app.get("/api/jobs/{job_id}/highlights/{highlight_id}/face-candidates/{candidate_id}")
+def get_highlight_face_candidate(job_id: str, highlight_id: int, candidate_id: str):
+    try:
+        path = _face_candidate_path(job_id, highlight_id, candidate_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return FileResponse(
+        path, media_type="image/jpeg", filename=f"face_{highlight_id}_{candidate_id}.jpg"
+    )
 
 
 @app.post("/api/jobs/{job_id}/shorts/{short_id}/youtube")

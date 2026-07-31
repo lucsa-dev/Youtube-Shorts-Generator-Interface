@@ -21,19 +21,23 @@
     castRosterJobId: null,
     renderedIds: new Set(),
     followJobStep: true,
+    lastNotifiedStatus: null,
+    lastNotifiedRenderDone: null,
     captionThemes: [],
+    // Karaoke styles keyed by aspect ("9:16" / "16:9") — independent size/position.
+    captionStyles: {},
     captionStyle: {
       theme: "bold-white",
       enabled: true,
-      font_name: "Arial Black",
-      font_size: 72,
+      font_name: "DejaVu Sans",
+      font_size: 100,
       primary_colour: "&H0000FFFF",
       secondary_colour: "&H00FFFFFF",
       outline_colour: "&H00000000",
       bold: true,
-      outline: 4,
+      outline: 20,
       shadow: 0,
-      margin_v: 160,
+      margin_v: 610,
       max_words_per_line: 4,
     },
     trim: {
@@ -233,6 +237,8 @@
     state.maxStep = 1;
     state.viewStep = 1;
     state.followJobStep = true;
+    state.lastNotifiedStatus = null;
+    state.lastNotifiedRenderDone = null;
     closeTrimEditor({ silent: true });
     setProjectLibraryVisible(true);
     $("#run-area").hidden = true;
@@ -306,11 +312,38 @@
     if (Number(job?.params?.flow_version) !== 2) {
       if (saved === 3) saved = 4;
       else if (saved === 4) saved = 3;
+      // Format step removed: old ui_step 2 (formato) → legendas
+      if (saved === 2) saved = 3;
     }
-    // Format step removed: old ui_step 2 (formato) → legendas
-    if (saved === 2) saved = 3;
     if (saved >= 2 && saved <= 5) return saved;
     return 3;
+  }
+
+  function castEditable() {
+    return state.jobStatus === "awaiting_cast";
+  }
+
+  function castPortraitEditable() {
+    return [
+      "awaiting_cast",
+      "awaiting_selection",
+      "completed",
+      "interrupted",
+      "failed",
+      "rendering",
+    ].includes(state.jobStatus);
+  }
+
+  function hasCastSpeakers(job = state.lastJob) {
+    if (Array.isArray(state.castRoster) && state.castRoster.length) return true;
+    return (job?.result?.speakers || []).length > 0;
+  }
+
+  function shouldShowCast(step) {
+    if (step !== 2 || !state.activeJobId) return false;
+    if (castEditable()) return true;
+    if (state.jobStatus === "ranking") return false;
+    return hasCastSpeakers();
   }
 
   async function persistUiStep(step) {
@@ -380,7 +413,7 @@
     else selectedPersistTimer = setTimeout(flush, 250);
   }
 
-  function selectedIdsFromJob(job, highlights) {
+  function selectedIdsFromJob(job) {
     const params = job?.params || {};
     if (Array.isArray(params.selected_ids)) {
       return new Set(params.selected_ids.map(Number).filter((n) => !Number.isNaN(n)));
@@ -389,8 +422,9 @@
     if (Array.isArray(fromResult)) {
       return new Set(fromResult.map(Number).filter((n) => !Number.isNaN(n)));
     }
+    // Prefer already-rendered clips if any; otherwise start with none selected.
     if (state.renderedIds.size) return new Set(state.renderedIds);
-    return new Set((highlights || []).map((h, i) => Number(h.id ?? i)));
+    return new Set();
   }
 
   function setFlowStep(step, { maxStep } = {}) {
@@ -466,14 +500,22 @@
     if (logEl) logEl.hidden = false;
 
     const canPick = hasTopics && selectableStatus;
-    const showCast = step === 2 && state.jobStatus === "awaiting_cast";
+    const showCast = shouldShowCast(step);
     const showCaptions = step === 3 && canPick;
     const showPick = step === 4 && canPick;
     const showResults = step === 5;
 
     if (cast) {
+      const wasHidden = cast.hidden;
       cast.hidden = !showCast;
-      if (showCast && state.lastJob) renderCastForm(state.lastJob);
+      if (showCast && state.lastJob) {
+        const list = $("#cast-list");
+        const empty = !list || !list.querySelector(".cast-card");
+        // Re-paint while naming, or when first opening the step; skip poll flicker
+        if (castEditable() || empty || wasHidden) {
+          renderCastForm(state.lastJob);
+        }
+      }
     }
     if (pick) {
       pick.hidden = !showPick;
@@ -520,9 +562,7 @@
       ) {
         persistUiStep(n);
       }
-      if (n === 2 && state.lastJob && state.jobStatus === "awaiting_cast") {
-        renderCastForm(state.lastJob);
-      }
+      if (n === 2 && state.lastJob) renderCastForm(state.lastJob);
       if (n === 3) syncCaptionForm();
       if (n === 4 && state.lastJob) renderTopicPicker(state.lastJob);
       if (n === 5 && state.lastJob?.result) renderResults(state.lastJob);
@@ -537,23 +577,64 @@
       modeEl.value = params.mode;
       syncUploadState();
     }
-    if (params.aspect_ratio) {
-      const aspect = params.aspect_ratio === "16:9" ? "16:9" : "9:16";
-      $("#aspect_ratio").value = aspect;
-      syncAspectToggle(aspect);
+    syncClipLengthToggle(params.clip_length || job?.result?.clip_length || "short");
+    const derivedAspect = aspectRatioForClipLength(currentClipLength());
+    if ((params.aspect_ratio || "9:16") !== derivedAspect) {
+      // Jobs antigos podiam ter proporção alterada no step 3 — realinha com o formato do step 1
+      setAspectRatio(derivedAspect, { persist: Boolean(state.activeJobId) });
     }
     if (params.download_format) $("#download_format").value = params.download_format;
     else if ($("#download_format")) $("#download_format").value = "720";
-    if (params.caption_style) {
-      state.captionStyle = { ...state.captionStyle, ...params.caption_style };
+    hydrateCaptionStylesFromParams(params);
+  }
+
+  function currentClipLength() {
+    return ($("#clip_length")?.value || state.jobParams?.clip_length || "short") === "long"
+      ? "long"
+      : "short";
+  }
+
+  function aspectRatioForClipLength(length) {
+    return length === "long" ? "16:9" : "9:16";
+  }
+
+  function syncClipLengthToggle(value) {
+    const length = value === "long" ? "long" : "short";
+    const input = $("#clip_length");
+    if (input) input.value = length;
+    $$("#clip-length-toggle .clip-length-btn").forEach((btn) => {
+      const on = btn.dataset.clipLength === length;
+      btn.classList.toggle("is-active", on);
+      btn.setAttribute("aria-pressed", on ? "true" : "false");
+    });
+    const hint = $("#clip-length-hint");
+    if (hint) {
+      hint.textContent =
+        length === "long"
+          ? "Segmentos autônomos de 3–10 minutos (16:9)"
+          : "Shorts virais para o feed (45–90s · 9:16)";
     }
+    const aspect = aspectRatioForClipLength(length);
+    const aspectInput = $("#aspect_ratio");
+    if (aspectInput) aspectInput.value = aspect;
+    applyPreviewAspect(aspect);
+  }
+
+  function fmtClipDuration(seconds) {
+    const n = Math.max(0, Number(seconds) || 0);
+    if (n < 90) return `${Math.round(n)}s`;
+    const m = Math.floor(n / 60);
+    const s = Math.round(n % 60);
+    return s ? `${m}m${String(s).padStart(2, "0")}s` : `${m} min`;
   }
 
   function syncPickContinueLabel() {
+    const length = currentClipLength();
+    const noun = length === "long" ? "vídeos" : "shorts";
     const label = $("#pick-continue-label");
     if (label) {
       const hasRendered = state.renderedIds.size > 0 || state.jobStatus === "completed";
-      label.textContent = hasRendered ? "Atualizar shorts" : "Gerar shorts";
+      label.textContent = hasRendered ? `Atualizar ${noun}` : `Gerar ${noun}`;
     }
     const capLabel = $("#caption-continue-label");
     if (capLabel) capLabel.textContent = "Continuar para tópicos";
@@ -1195,7 +1276,9 @@
     const data = await res.json();
     const langOpts = data.language_options || [];
     for (const item of data.items) {
-      const wrap = document.createElement("label");
+      const wrap = document.createElement(
+        item.input_type === "palette" ? "div" : "label"
+      );
       wrap.className = "field config-item";
       if (item.input_type === "language") {
         const options = langOpts
@@ -1210,6 +1293,61 @@
           <span class="label">${item.key} <em>— padrão para Whisper, títulos e hooks</em></span>
           <select name="${item.key}">${options}</select>
         `;
+      } else if (item.input_type === "palette") {
+        wrap.classList.add("config-palette-item");
+        const colors = Array.isArray(item.colors) && item.colors.length
+          ? item.colors
+          : String(item.value || "")
+              .split(",")
+              .map((c) => c.trim())
+              .filter(Boolean);
+        wrap.innerHTML = `
+          <span class="label">${item.key} <em>— cores da borda e do texto da thumbnail (mesma paleta)</em></span>
+          <div class="palette-editor" data-palette-key="${escapeAttr(item.key)}">
+            <div class="palette-swatches"></div>
+            <div class="palette-actions">
+              <button type="button" class="btn ghost palette-add">+ cor</button>
+              <span class="secret-note">usada no degradê da moldura e no preenchimento de cada linha</span>
+            </div>
+            <input type="hidden" name="${escapeAttr(item.key)}" value="${escapeAttr(
+              colors.join(",")
+            )}" />
+          </div>
+        `;
+        const swatches = wrap.querySelector(".palette-swatches");
+        const hidden = wrap.querySelector(`input[name="${item.key}"]`);
+        const syncHidden = () => {
+          const hexes = [...swatches.querySelectorAll('input[type="color"]')].map(
+            (el) => el.value.toUpperCase()
+          );
+          hidden.value = hexes.join(",");
+        };
+        const addSwatch = (hex) => {
+          const color = /^#[0-9A-Fa-f]{6}$/.test(hex || "")
+            ? hex.toUpperCase()
+            : "#FF28B4";
+          const chip = document.createElement("div");
+          chip.className = "palette-chip";
+          chip.innerHTML = `
+            <input type="color" value="${escapeAttr(color)}" aria-label="Cor da paleta" />
+            <button type="button" class="palette-remove" title="Remover cor" aria-label="Remover cor">×</button>
+          `;
+          chip.querySelector('input[type="color"]').addEventListener("input", syncHidden);
+          chip.querySelector(".palette-remove").addEventListener("click", () => {
+            if (swatches.querySelectorAll(".palette-chip").length <= 1) return;
+            chip.remove();
+            syncHidden();
+          });
+          swatches.appendChild(chip);
+          syncHidden();
+        };
+        (colors.length ? colors : ["#FF28B4", "#FF7828", "#FFDC28", "#28DCFF", "#A03CFF"]).forEach(
+          addSwatch
+        );
+        wrap.querySelector(".palette-add").addEventListener("click", () => {
+          if (swatches.querySelectorAll(".palette-chip").length >= 12) return;
+          addSwatch("#FFFFFF");
+        });
       } else {
         const labelExtra =
           item.key === "LOCAL_FACE_SMOOTHING"
@@ -1344,6 +1482,157 @@
     }
   });
 
+  /* ---------- Browser notifications ---------- */
+  const NOTIFY_STORAGE_KEY = "shorts.browserNotify";
+
+  function notificationsWanted() {
+    return Boolean($("#browser-notify")?.checked);
+  }
+
+  function setNotifyHint(msg, { error = false } = {}) {
+    const hint = $("#notify-hint");
+    if (!hint) return;
+    hint.hidden = !msg;
+    hint.textContent = msg || "";
+    hint.classList.toggle("is-error", Boolean(error && msg));
+  }
+
+  function syncNotifyUi() {
+    const box = $("#browser-notify");
+    if (!box) return;
+    const stored = localStorage.getItem(NOTIFY_STORAGE_KEY);
+    box.checked = stored === "1" || (stored == null && "Notification" in window);
+    if (!("Notification" in window)) {
+      box.checked = false;
+      box.disabled = true;
+      setNotifyHint("Seu navegador não suporta notificações.", { error: true });
+      return;
+    }
+    if (Notification.permission === "denied") {
+      setNotifyHint(
+        "Permissão bloqueada nas configurações do site.",
+        { error: true }
+      );
+    } else if (box.checked && Notification.permission === "granted") {
+      setNotifyHint("Avisos quando a aba estiver em segundo plano.");
+    } else if (box.checked) {
+      setNotifyHint("Será pedida permissão ao iniciar um job.");
+    } else {
+      setNotifyHint("");
+    }
+  }
+
+  async function ensureNotifyPermission() {
+    if (!("Notification" in window)) return false;
+    if (!notificationsWanted()) return false;
+    if (Notification.permission === "granted") {
+      syncNotifyUi();
+      return true;
+    }
+    if (Notification.permission === "denied") {
+      syncNotifyUi();
+      return false;
+    }
+    const result = await Notification.requestPermission();
+    syncNotifyUi();
+    return result === "granted";
+  }
+
+  function notifyStage(title, body, { force = false } = {}) {
+    if (!notificationsWanted()) return;
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    // Só interrompe quando o usuário não está olhando a aba
+    if (!force && !document.hidden) return;
+    try {
+      const n = new Notification(title, {
+        body,
+        tag: `shorts-${state.activeJobId || "job"}-${title}`,
+        renotify: true,
+      });
+      n.onclick = () => {
+        window.focus();
+        n.close();
+      };
+    } catch {
+      /* ignore Notification constructor failures */
+    }
+  }
+
+  function maybeNotifyJobProgress(job) {
+    if (!job) return;
+    const next = job.status;
+    const prev = state.lastNotifiedStatus;
+    const progress = job.result?.render_progress || null;
+    const done = progress != null ? Number(progress.done) : null;
+    const total = progress != null ? Number(progress.total) : null;
+
+    // Primeira observação do job — só grava baseline, sem notificar
+    if (prev === null) {
+      state.lastNotifiedStatus = next;
+      state.lastNotifiedRenderDone =
+        Number.isFinite(done) && !Number.isNaN(done) ? done : null;
+      return;
+    }
+
+    if (prev !== next) {
+      const messages = {
+        awaiting_cast: [
+          "Análise pronta",
+          "Download e transcrição concluídos — confirme os locutores.",
+        ],
+        awaiting_selection: [
+          "Tópicos prontos",
+          "Ranking concluído — escolha os cortes.",
+        ],
+        completed: [
+          "Renderização concluída",
+          "Seus shorts estão prontos.",
+        ],
+        failed: ["Job falhou", job.error || "Veja o log no painel."],
+        interrupted: [
+          "Render interrompido",
+          "Alguns clips podem estar prontos.",
+        ],
+      };
+      const msg = messages[next];
+      if (msg) notifyStage(msg[0], msg[1]);
+      state.lastNotifiedStatus = next;
+    }
+
+    // Progresso parcial de render (novo clip pronto), sem spam no último
+    if (
+      next === "rendering" &&
+      Number.isFinite(done) &&
+      !Number.isNaN(done) &&
+      done > 0 &&
+      state.lastNotifiedRenderDone != null &&
+      done > state.lastNotifiedRenderDone &&
+      !(Number.isFinite(total) && done >= total)
+    ) {
+      const label = Number.isFinite(total) && total > 0 ? `${done}/${total}` : `${done}`;
+      notifyStage("Clip renderizado", `Short ${label} pronto.`);
+    }
+    if (Number.isFinite(done) && !Number.isNaN(done)) {
+      state.lastNotifiedRenderDone = done;
+    }
+  }
+
+  $("#browser-notify")?.addEventListener("change", async () => {
+    const box = $("#browser-notify");
+    if (!box) return;
+    if (box.checked) {
+      localStorage.setItem(NOTIFY_STORAGE_KEY, "1");
+      const ok = await ensureNotifyPermission();
+      if (!ok && Notification.permission === "denied") {
+        box.checked = false;
+        localStorage.setItem(NOTIFY_STORAGE_KEY, "0");
+      }
+    } else {
+      localStorage.setItem(NOTIFY_STORAGE_KEY, "0");
+    }
+    syncNotifyUi();
+  });
+
   /* ---------- Generate ---------- */
   $("#generate-form").addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -1356,11 +1645,20 @@
     btn.disabled = true;
     hint.textContent = "enviando job…";
 
+    if (notificationsWanted()) {
+      await ensureNotifyPermission();
+    }
+
     const fd = new FormData(e.target);
     if (!fileInput.files?.length) fd.delete("file");
-    // Defaults: 9:16 + 720p (proporção ajustável no preview de legendas)
-    fd.set("aspect_ratio", $("#aspect_ratio")?.value || "9:16");
+    // Proporção vem do formato do step 1 (short → 9:16, long → 16:9)
+    const clipLen = currentClipLength();
+    const aspect = aspectRatioForClipLength(clipLen);
+    const aspectInput = $("#aspect_ratio");
+    if (aspectInput) aspectInput.value = aspect;
+    fd.set("aspect_ratio", aspect);
     fd.set("download_format", $("#download_format")?.value || "720");
+    fd.set("clip_length", clipLen);
     fd.set("project_id", state.projectId);
     // Idioma vem de CONTENT_LANGUAGE na Config (padrão das gerações)
 
@@ -1389,6 +1687,8 @@
     state.castRosterJobId = null;
     state.jobStatus = "queued";
     state.maxStep = 1;
+    state.lastNotifiedStatus = null;
+    state.lastNotifiedRenderDone = null;
     closeTrimEditor({ silent: true });
     setProjectLibraryVisible(false);
     $("#run-area").hidden = true;
@@ -1610,7 +1910,7 @@
     const highlights = job.result?.highlights || [];
     state.highlights = highlights;
     if (state.selectedIds.size === 0) {
-      state.selectedIds = selectedIdsFromJob(job, highlights);
+      state.selectedIds = selectedIdsFromJob(job);
     }
     if (state.viewStep === 4) syncTopicPicker(job);
   }
@@ -1639,6 +1939,11 @@
       state.castRosterJobId = job?.id || null;
       return state.castRoster;
     }
+    // After confirmation, always mirror the server roster (names + portraits)
+    if (!castEditable()) {
+      state.castRoster = speakers.map((sp) => ({ ...sp }));
+      return state.castRoster;
+    }
     // Merge portrait updates from server without restoring removed slots
     for (const sp of state.castRoster) {
       const fresh = speakers.find((s) => String(s.id) === String(sp.id));
@@ -1653,8 +1958,13 @@
     const list = $("#cast-list");
     const area = $("#cast-area");
     const addBtn = $("#cast-add");
+    const continueBtn = $("#cast-continue");
+    const skipBtn = $("#cast-skip");
+    const hint = $("#cast-hint");
     if (!list || !area) return;
-    if (state.viewStep === 2 && state.jobStatus === "awaiting_cast") {
+    const editable = castEditable();
+    const canSwapPhoto = castPortraitEditable();
+    if (state.viewStep === 2 && shouldShowCast(2)) {
       area.hidden = false;
     }
 
@@ -1662,15 +1972,33 @@
     const speakers = ensureCastRoster(job);
 
     if (addBtn) {
-      addBtn.disabled = speakers.length >= CAST_MAX_SPEAKERS;
+      addBtn.hidden = !editable;
+      addBtn.disabled = !editable || speakers.length >= CAST_MAX_SPEAKERS;
       addBtn.title =
         speakers.length >= CAST_MAX_SPEAKERS
           ? `Máximo de ${CAST_MAX_SPEAKERS} locutores`
           : "Adicionar um locutor que o sistema não detectou";
     }
+    const footer = $(".cast-footer");
+    if (footer) footer.hidden = !editable;
+    if (continueBtn) {
+      continueBtn.hidden = !editable;
+      continueBtn.disabled = !editable;
+    }
+    if (skipBtn) {
+      skipBtn.hidden = !editable;
+      skipBtn.disabled = !editable;
+    }
+    if (hint) {
+      hint.textContent = editable
+        ? "Confirme, adicione ou remova locutores — isso melhora os títulos dos shorts"
+        : "Nomes já confirmados — ainda dá para trocar a foto de cada locutor";
+    }
 
     if (!speakers.length) {
-      list.innerHTML = `<p class="empty">Nenhum locutor — adicione manualmente ou pule esta etapa.</p>`;
+      list.innerHTML = editable
+        ? `<p class="empty">Nenhum locutor — adicione manualmente ou pule esta etapa.</p>`
+        : `<p class="empty">Nenhum locutor registrado nesta análise.</p>`;
       return;
     }
 
@@ -1683,7 +2011,7 @@
       const evidence = sp.evidence || "";
       const portrait = sp.portrait_url || "";
       const card = document.createElement("div");
-      card.className = "cast-card";
+      card.className = "cast-card" + (editable ? "" : " is-readonly");
       card.dataset.id = sid;
       const placeholder = `<span class="cast-face is-placeholder" aria-hidden="true">${escapeHtml(sid)}</span>`;
       const face = portrait
@@ -1693,9 +2021,13 @@
         <div class="cast-avatar">
           ${face}
           <span class="cast-id">${escapeHtml(sid)}</span>
-          <button type="button" class="cast-next-photo" data-id="${escapeAttr(sid)}" title="Buscar outro frame com rosto">
+          ${
+            canSwapPhoto
+              ? `<button type="button" class="cast-next-photo" data-id="${escapeAttr(sid)}" title="Buscar outro frame com rosto">
             Trocar foto
-          </button>
+          </button>`
+              : ""
+          }
         </div>
         <div class="cast-body">
           <div class="cast-body-head">
@@ -1703,11 +2035,16 @@
               <span class="label">Nome ${role !== "unknown" ? `(${escapeHtml(role)})` : ""}</span>
               <input type="text" class="cast-name" data-id="${escapeAttr(sid)}"
                 value="${escapeAttr(suggested)}"
-                placeholder="Ex.: Rodrigo Pimentel" />
+                placeholder="Ex.: Rodrigo Pimentel"
+                ${editable ? "" : "readonly"} />
             </label>
-            <button type="button" class="cast-remove" data-id="${escapeAttr(sid)}" title="Remover este locutor">
+            ${
+              editable
+                ? `<button type="button" class="cast-remove" data-id="${escapeAttr(sid)}" title="Remover este locutor">
               Remover
-            </button>
+            </button>`
+                : ""
+            }
           </div>
           ${quote ? `<p class="cast-quote">“${escapeHtml(quote)}”</p>` : ""}
           ${evidence ? `<p class="cast-evidence">${escapeHtml(evidence)}</p>` : ""}
@@ -1724,12 +2061,16 @@
           );
         });
       }
-      card.querySelector(".cast-next-photo")?.addEventListener("click", () => {
-        cycleCastPortrait(sid, card);
-      });
-      card.querySelector(".cast-remove")?.addEventListener("click", () => {
-        removeCastSpeaker(sid);
-      });
+      if (canSwapPhoto) {
+        card.querySelector(".cast-next-photo")?.addEventListener("click", () => {
+          cycleCastPortrait(sid, card);
+        });
+      }
+      if (editable) {
+        card.querySelector(".cast-remove")?.addEventListener("click", () => {
+          removeCastSpeaker(sid);
+        });
+      }
       list.appendChild(card);
     });
   }
@@ -1837,7 +2178,7 @@
   }
 
   async function cycleCastPortrait(sid, card) {
-    if (!state.activeJobId || state.jobStatus !== "awaiting_cast") return;
+    if (!state.activeJobId || !castPortraitEditable()) return;
     const btn = card.querySelector(".cast-next-photo");
     if (btn) {
       btn.disabled = true;
@@ -1880,6 +2221,8 @@
     const skipBtn = $("#cast-skip");
     if (btn) btn.disabled = true;
     if (skipBtn) skipBtn.disabled = true;
+
+    if (notificationsWanted()) await ensureNotifyPermission();
 
     syncCastNamesFromDom();
     const speakers = (state.castRoster || [...$$(".cast-name")].map((input) => ({
@@ -1935,30 +2278,139 @@
     return raw === "16:9" ? "16:9" : "9:16";
   }
 
+  function defaultCaptionStyle(aspect) {
+    const ratio = aspect === "16:9" ? "16:9" : "9:16";
+    return {
+      theme: "bold-white",
+      enabled: true,
+      font_name: "DejaVu Sans",
+      font_size: 100,
+      primary_colour: "&H0000FFFF",
+      secondary_colour: "&H00FFFFFF",
+      outline_colour: "&H00000000",
+      bold: true,
+      outline: 20,
+      shadow: 0,
+      // 610 only for shorts (9:16); landscape keeps the lower default.
+      margin_v: ratio === "9:16" ? 610 : 160,
+      max_words_per_line: 4,
+      uppercase: true,
+      back_colour: "&H80000000",
+    };
+  }
+
+  function cloneCaptionStyle(style, aspect) {
+    return { ...defaultCaptionStyle(aspect), ...(style || {}) };
+  }
+
+  function hydrateCaptionStylesFromParams(params) {
+    // Keep in-progress karaoke edits while the caption step is open; poll
+    // would otherwise reset per-aspect buckets from the last persisted params.
+    if (state.viewStep === 3 && $("#caption-controls") && !$("#caption-controls").hidden) {
+      return;
+    }
+    const next = {};
+    const byAspect = params?.caption_styles;
+    if (byAspect && typeof byAspect === "object") {
+      for (const key of ["9:16", "16:9"]) {
+        if (byAspect[key] && typeof byAspect[key] === "object") {
+          next[key] = cloneCaptionStyle(byAspect[key], key);
+        }
+      }
+    }
+    if (params?.caption_style && typeof params.caption_style === "object") {
+      const aspect = params.aspect_ratio === "16:9" ? "16:9" : "9:16";
+      if (!next[aspect]) next[aspect] = cloneCaptionStyle(params.caption_style, aspect);
+      state.captionStyle = cloneCaptionStyle(next[aspect] || params.caption_style, aspect);
+    }
+    state.captionStyles = next;
+  }
+
+  function ensureCaptionStyleForAspect(aspect) {
+    const ratio = aspect === "16:9" ? "16:9" : "9:16";
+    if (!state.captionStyles) state.captionStyles = {};
+    if (state.captionStyles[ratio]) return state.captionStyles[ratio];
+    const saved =
+      state.jobParams?.caption_styles?.[ratio] ||
+      (state.jobParams?.aspect_ratio === ratio ? state.jobParams?.caption_style : null);
+    if (saved && typeof saved === "object") {
+      state.captionStyles[ratio] = cloneCaptionStyle(saved, ratio);
+      return state.captionStyles[ratio];
+    }
+    // Seed typography from the other aspect if present, but keep this
+    // aspect's default vertical position (610 shorts / 160 landscape).
+    const other = ratio === "16:9" ? "9:16" : "16:9";
+    const fromOther = state.captionStyles[other];
+    if (fromOther) {
+      const { margin_v: _mv, ...rest } = fromOther;
+      state.captionStyles[ratio] = cloneCaptionStyle(rest, ratio);
+    } else {
+      state.captionStyles[ratio] = defaultCaptionStyle(ratio);
+    }
+    return state.captionStyles[ratio];
+  }
+
+  function stashCaptionFormForAspect(aspect) {
+    const ratio = aspect === "16:9" ? "16:9" : "9:16";
+    if (!state.captionStyles) state.captionStyles = {};
+    const style = readCaptionForm();
+    state.captionStyles[ratio] = style;
+    if (ratio === currentAspectRatio()) state.captionStyle = style;
+    return style;
+  }
+
+  function loadCaptionFormForAspect(aspect) {
+    const ratio = aspect === "16:9" ? "16:9" : "9:16";
+    const style = ensureCaptionStyleForAspect(ratio);
+    state.captionStyle = cloneCaptionStyle(style, ratio);
+    renderThemeGrid();
+    applyThemeToForm({ ...state.captionStyle, id: state.captionStyle.theme });
+  }
+
+  function captionStylesPayload() {
+    const aspect = currentAspectRatio();
+    if (state.viewStep === 3 && $("#caption-controls")) {
+      stashCaptionFormForAspect(aspect);
+    } else if (state.captionStyle) {
+      if (!state.captionStyles) state.captionStyles = {};
+      state.captionStyles[aspect] = cloneCaptionStyle(state.captionStyle, aspect);
+    }
+    const out = {};
+    for (const key of ["9:16", "16:9"]) {
+      if (state.captionStyles?.[key]) out[key] = state.captionStyles[key];
+    }
+    return out;
+  }
+
   function syncAspectToggle(aspect) {
     const ratio = aspect || currentAspectRatio();
     const input = $("#aspect_ratio");
     if (input) input.value = ratio;
-    $$("#aspect-toggle .aspect-toggle-btn").forEach((btn) => {
-      const on = btn.dataset.ratio === ratio;
-      btn.classList.toggle("is-active", on);
-      btn.setAttribute("aria-pressed", on ? "true" : "false");
-    });
   }
 
   async function setAspectRatio(aspect, { persist = true } = {}) {
+    const prev = currentAspectRatio();
     const ratio = aspect === "16:9" ? "16:9" : "9:16";
+    const onCaptions = state.viewStep === 3 && $("#caption-controls");
+    if (onCaptions && prev !== ratio) {
+      stashCaptionFormForAspect(prev);
+    }
     const input = $("#aspect_ratio");
     if (input) input.value = ratio;
     syncAspectToggle(ratio);
     applyPreviewAspect(ratio);
-    if (state.viewStep === 3) updateCaptionPreview();
+    if (onCaptions) {
+      if (prev !== ratio) loadCaptionFormForAspect(ratio);
+      else updateCaptionPreview();
+    }
     if (!persist || !state.activeJobId) return;
     const fmt =
       $("#download_format")?.value ||
       state.jobParams?.download_format ||
       state.lastJob?.params?.download_format ||
       "720";
+    const styles = captionStylesPayload();
+    const activeStyle = styles[ratio] || state.captionStyle;
     try {
       const res = await fetch(`/api/jobs/${state.activeJobId}/params`, {
         method: "PATCH",
@@ -1967,11 +2419,23 @@
           aspect_ratio: ratio,
           download_format: fmt,
           regenerate: false,
+          caption_style: activeStyle,
+          caption_styles: styles,
         }),
       });
       if (!res.ok) return;
-      if (state.lastJob?.params) state.lastJob.params.aspect_ratio = ratio;
-      state.jobParams = { ...(state.jobParams || {}), aspect_ratio: ratio };
+      if (state.lastJob?.params) {
+        state.lastJob.params.aspect_ratio = ratio;
+        state.lastJob.params.caption_style = activeStyle;
+        state.lastJob.params.caption_styles = styles;
+      }
+      state.jobParams = {
+        ...(state.jobParams || {}),
+        aspect_ratio: ratio,
+        caption_style: activeStyle,
+        caption_styles: styles,
+      };
+      state.captionStyle = cloneCaptionStyle(activeStyle, ratio);
     } catch (_) {
       /* best-effort */
     }
@@ -1983,9 +2447,13 @@
     if (state.viewStep === 3 && $("#caption-controls")) {
       return readCaptionForm();
     }
+    const aspect = currentAspectRatio();
+    const byAspect =
+      state.captionStyles?.[aspect] || state.jobParams?.caption_styles?.[aspect];
     return {
       ...state.captionStyle,
       ...(state.jobParams?.caption_style || {}),
+      ...(byAspect || {}),
       enabled: true,
     };
   }
@@ -2014,11 +2482,11 @@
     const primary = assToHex(style.primary_colour || "&H0000FFFF");
     const secondary = assToHex(style.secondary_colour || "&H00FFFFFF");
     const outline = assToHex(style.outline_colour || "&H00000000");
-    const size = Number(style.font_size || 72);
+    const size = Number(style.font_size || 100);
     const bold = style.bold !== false;
-    const font = style.font_name || "Arial Black";
-    const border = Number(style.outline || 4);
-    const marginV = Math.max(0, Number(style.margin_v ?? 160));
+    const font = style.font_name || "DejaVu Sans";
+    const border = Number(style.outline || 20);
+    const marginV = Math.max(0, Number(style.margin_v ?? 610));
     const frameW = frameEl?.clientWidth || el.parentElement?.clientWidth || 280;
     const frameH = frameEl?.clientHeight || el.parentElement?.clientHeight || 500;
     const scale = frameW / 1080;
@@ -2036,46 +2504,145 @@
     el.dataset.secondary = secondary;
   }
 
+  // Keep in sync with shorts_generator/captions.py CAPTION_FADE_* / chunking.
+  const CAPTION_FADE_IN_MS = 200;
+  const CAPTION_FADE_OUT_MS = 180;
+
+  function cleanCaptionWordToken(raw) {
+    let token = String(raw || "").replace(/^>+\s*/, "").trim();
+    if (token === ">>" || token === ">" || token === "->" || token === "-->") return "";
+    return token;
+  }
+
+  function chunkCaptionWords(words, maxPerLine) {
+    const maxW = Math.max(1, Number(maxPerLine) || 4);
+    const chunks = [];
+    let cur = [];
+    for (const w of words || []) {
+      const token = cleanCaptionWordToken(w?.word);
+      if (!token) continue;
+      cur.push({ ...w, word: token });
+      if (cur.length >= maxW || /[.!?…]$/.test(token)) {
+        chunks.push(cur);
+        cur = [];
+      }
+    }
+    if (cur.length) chunks.push(cur);
+    return chunks;
+  }
+
+  function captionLineWindow(chunks, index) {
+    const chunk = chunks[index];
+    if (!chunk?.length) return { start: 0, end: 0 };
+    const start = float(chunk[0].start);
+    let end =
+      index + 1 < chunks.length
+        ? float(chunks[index + 1][0].start)
+        : float(chunk[chunk.length - 1].end);
+    const minDur = (CAPTION_FADE_IN_MS + CAPTION_FADE_OUT_MS) / 1000 + 0.05;
+    if (end <= start) end = start + minDur;
+    return { start, end };
+  }
+
+  function activeCaptionChunkIndex(chunks, tAbs) {
+    if (!chunks.length) return -1;
+    for (let i = 0; i < chunks.length; i++) {
+      const { start, end } = captionLineWindow(chunks, i);
+      if (tAbs >= start && tAbs < end) return i;
+    }
+    let last = -1;
+    for (let i = 0; i < chunks.length; i++) {
+      if (float(chunks[i][0].start) <= tAbs) last = i;
+      else break;
+    }
+    return last;
+  }
+
   function paintLiveCaption(el, words, tAbs, frameEl) {
     if (!el) return;
     const style = effectiveCaptionStyle();
     if (!words?.length) {
       el.hidden = true;
       el.innerHTML = "";
-      return;
-    }
-    let activeIdx = words.findIndex((w) => tAbs >= float(w.start) && tAbs < float(w.end));
-    if (activeIdx < 0) {
-      activeIdx = -1;
-      for (let i = 0; i < words.length; i++) {
-        if (float(words[i].start) <= tAbs) activeIdx = i;
-        else break;
-      }
-    }
-    if (activeIdx < 0) {
-      el.hidden = true;
-      el.innerHTML = "";
+      el._capLineKey = null;
       return;
     }
     const maxW = Math.max(1, Number(style.max_words_per_line || 4));
-    const lineStart = Math.floor(activeIdx / maxW) * maxW;
-    const line = words.slice(lineStart, lineStart + maxW);
+    const chunks = chunkCaptionWords(words, maxW);
+    const chunkIdx = activeCaptionChunkIndex(chunks, tAbs);
+    if (chunkIdx < 0) {
+      el.hidden = true;
+      el.innerHTML = "";
+      el._capLineKey = null;
+      return;
+    }
+    const line = chunks[chunkIdx];
+    let activeInLine = -1;
+    for (let i = 0; i < line.length; i++) {
+      const ws = float(line[i].start);
+      const we = float(line[i].end);
+      if (tAbs >= ws && tAbs < we) {
+        activeInLine = i;
+        break;
+      }
+      if (ws <= tAbs) activeInLine = i;
+    }
+    if (activeInLine < 0) activeInLine = 0;
+
     el.hidden = false;
     styleLiveCaption(el, frameEl);
     const primary = el.dataset.primary || "#ffff00";
     const secondary = el.dataset.secondary || "#ffffff";
-    el.innerHTML = line
-      .map((w, i) => {
-        const gi = lineStart + i;
-        const cls =
-          gi < activeIdx ? " is-done" : gi === activeIdx ? " is-active" : "";
-        return `<span class="cap-word${cls}">${escapeHtml(String(w.word || ""))}</span>`;
-      })
-      .join("");
-    $$(".cap-word", el).forEach((node, i) => {
-      const gi = lineStart + i;
-      node.style.color = gi <= activeIdx ? primary : secondary;
-    });
+    const lineKey = `${chunkIdx}:${line.map((w) => w.word).join(" ")}`;
+
+    const renderWords = (host) => {
+      host.innerHTML = line
+        .map((w, i) => {
+          const cls =
+            i < activeInLine ? " is-done" : i === activeInLine ? " is-active" : "";
+          return `<span class="cap-word${cls}">${escapeHtml(String(w.word || ""))}</span>`;
+        })
+        .join("");
+      $$(".cap-word", host).forEach((node, i) => {
+        node.style.color = i <= activeInLine ? primary : secondary;
+      });
+    };
+
+    if (el._capLineKey === lineKey) {
+      const cur = $(".cap-line.is-current", el);
+      if (cur) renderWords(cur);
+      return;
+    }
+
+    const prevKey = el._capLineKey;
+    el._capLineKey = lineKey;
+
+    // First paint or scrub with no prior line — enter from below, no exit.
+    if (!prevKey) {
+      el.innerHTML = "";
+      const incoming = document.createElement("div");
+      incoming.className = "cap-line is-current is-enter";
+      renderWords(incoming);
+      el.appendChild(incoming);
+      return;
+    }
+
+    const outgoing = $(".cap-line.is-current", el);
+    if (outgoing) {
+      outgoing.classList.remove("is-current", "is-enter");
+      outgoing.classList.add("is-exit");
+      const removeOut = () => outgoing.remove();
+      outgoing.addEventListener("animationend", removeOut, { once: true });
+      setTimeout(removeOut, CAPTION_FADE_OUT_MS + 40);
+    } else {
+      // Clear stale nodes if structure was wiped.
+      el.querySelectorAll(".cap-line:not(.is-exit)").forEach((n) => n.remove());
+    }
+
+    const incoming = document.createElement("div");
+    incoming.className = "cap-line is-current is-enter";
+    renderWords(incoming);
+    el.appendChild(incoming);
   }
 
   async function ensureMediaCaptionWords(media) {
@@ -2115,17 +2682,49 @@
     );
   }
 
+  function applyFacePickAspect(aspect) {
+    const ratio =
+      aspect ||
+      aspectRatioForClipLength(currentClipLength()) ||
+      currentAspectRatio() ||
+      "9:16";
+    const modal = $("#face-pick-modal");
+    if (modal) modal.dataset.ratio = ratio;
+    const layout = (modal && $(".face-pick-layout", modal)) || $(".face-pick-layout");
+    if (layout) layout.dataset.ratio = ratio;
+    const preview = $("#face-pick-preview");
+    if (preview) preview.dataset.ratio = ratio;
+    const grid = $("#face-pick-grid");
+    if (grid) grid.dataset.ratio = ratio;
+  }
+
+  function resultsAspectRatio(job) {
+    const raw =
+      job?.result?.rendered_aspect_ratio ||
+      job?.params?.aspect_ratio ||
+      currentAspectRatio();
+    return raw === "16:9" ? "16:9" : "9:16";
+  }
+
   function applyPreviewAspect(aspect) {
     const ratio = aspect || currentAspectRatio();
     $$(".topic-media").forEach((el) => {
       el.dataset.ratio = ratio;
     });
+    $$(".short-card").forEach((el) => {
+      el.dataset.ratio = ratio;
+    });
+    const results = $("#results");
+    if (results) results.dataset.ratio = ratio;
+    const ytModal = $("#yt-upload-modal");
+    if (ytModal) ytModal.dataset.ratio = ratio;
     const trimFrame = $("#trim-player-frame");
     if (trimFrame) trimFrame.dataset.ratio = ratio;
     const capFrame = $("#caption-preview-frame");
     if (capFrame) capFrame.dataset.ratio = ratio;
     const badge = $("#caption-preview-badge");
     if (badge) badge.textContent = ratio;
+    applyFacePickAspect(ratio);
     syncAspectToggle(ratio);
   }
 
@@ -2301,56 +2900,634 @@
   }
 
   async function generateTopicAiThumbnail(id, btn) {
+    openFacePickModal(id, { triggerBtn: btn, source: "topic" });
+  }
+
+  const facePickState = {
+    highlightId: null,
+    selectedId: null,
+    selectedUrl: null,
+    triggerBtn: null,
+    source: "topic",
+    loading: false,
+    textColorMode: "caption", // caption | palette
+    marginV: 160,
+    fontSize: 100,
+    borderPct: 3.8,
+  };
+
+  const FACE_PICK_PALETTE = [
+    "#FF28B4",
+    "#FF7828",
+    "#FFDC28",
+    "#28DCFF",
+    "#A03CFF",
+  ];
+
+  function resolveThumbOverlayDraft(highlightId) {
+    const h =
+      highlightById(highlightId) ||
+      (state.lastJob?.result?.highlights || []).find(
+        (item, i) => Number(item.id ?? i) === Number(highlightId)
+      ) ||
+      (state.lastJob?.result?.shorts || []).find(
+        (item, i) => Number(item.id ?? i) === Number(highlightId)
+      );
+    if (!h) return "";
+    const meta = h.thumbnail_ai_meta || {};
+    return String(
+      meta.overlay_text || meta.hook || h.title || h.hook_sentence || ""
+    ).trim();
+  }
+
+  function resolveThumbStyleDraft(highlightId) {
+    const h =
+      highlightById(highlightId) ||
+      (state.lastJob?.result?.highlights || []).find(
+        (item, i) => Number(item.id ?? i) === Number(highlightId)
+      ) ||
+      (state.lastJob?.result?.shorts || []).find(
+        (item, i) => Number(item.id ?? i) === Number(highlightId)
+      );
+    const meta = h?.thumbnail_ai_meta || {};
+    const caption = effectiveCaptionStyle();
+    const mode =
+      meta.text_color_mode === "palette" || meta.text_color_mode === "caption"
+        ? meta.text_color_mode
+        : "caption";
+    let marginV = Number(meta.margin_v);
+    if (!Number.isFinite(marginV)) {
+      marginV = Number(caption.margin_v ?? 160);
+    }
+    marginV = Math.max(40, Math.min(720, marginV || 160));
+    let fontSize = Number(meta.font_size);
+    if (!Number.isFinite(fontSize)) {
+      fontSize = Number(caption.font_size ?? 100);
+    }
+    fontSize = Math.max(40, Math.min(140, fontSize || 100));
+    let borderPct = Number(meta.border_pct);
+    if (!Number.isFinite(borderPct)) {
+      borderPct = 3.8;
+    }
+    borderPct = Math.max(1, Math.min(8, borderPct));
+    return { textColorMode: mode, marginV, fontSize, borderPct };
+  }
+
+  function syncFacePickMarginLabel(value) {
+    const n = Math.max(40, Math.min(720, Number(value) || 160));
+    const val = $("#face-pick-margin-v-val");
+    const input = $("#face-pick-margin-v");
+    if (val) val.textContent = String(n);
+    if (input) {
+      input.value = String(n);
+      input.setAttribute("aria-valuenow", String(n));
+    }
+    facePickState.marginV = n;
+    return n;
+  }
+
+  function syncFacePickFontSizeLabel(value) {
+    const n = Math.max(40, Math.min(140, Number(value) || 100));
+    const rounded = Math.round(n / 2) * 2;
+    const val = $("#face-pick-font-size-val");
+    const input = $("#face-pick-font-size");
+    if (val) val.textContent = String(rounded);
+    if (input) {
+      input.value = String(rounded);
+      input.setAttribute("aria-valuenow", String(rounded));
+    }
+    facePickState.fontSize = rounded;
+    return rounded;
+  }
+
+  function syncFacePickBorderLabel(value) {
+    let n = Number(value);
+    if (!Number.isFinite(n)) n = 3.8;
+    n = Math.max(1, Math.min(8, Math.round(n * 5) / 5));
+    const display = Number.isInteger(n) ? String(n) : n.toFixed(1);
+    const val = $("#face-pick-border-val");
+    const input = $("#face-pick-border");
+    if (val) val.textContent = display;
+    if (input) {
+      input.value = String(n);
+      input.setAttribute("aria-valuenow", String(n));
+    }
+    facePickState.borderPct = n;
+    return n;
+  }
+
+  function setFacePickColorMode(mode) {
+    const next = mode === "palette" ? "palette" : "caption";
+    facePickState.textColorMode = next;
+    $$(".face-pick-color-btn").forEach((btn) => {
+      btn.classList.toggle("is-selected", btn.dataset.colorMode === next);
+    });
+  }
+
+  function initFacePickStyleControls(highlightId) {
+    const draft = resolveThumbStyleDraft(highlightId);
+    setFacePickColorMode(draft.textColorMode);
+    syncFacePickMarginLabel(draft.marginV);
+    syncFacePickFontSizeLabel(draft.fontSize);
+    syncFacePickBorderLabel(draft.borderPct);
+    const controls = $("#face-pick-style-controls");
+    if (controls) controls.hidden = false;
+  }
+
+  function wrapThumbPreviewLines(text, maxWords = 4) {
+    const words = String(text || "")
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (!words.length) return [];
+    const lines = [];
+    for (let i = 0; i < words.length; i += maxWords) {
+      lines.push(words.slice(i, i + maxWords).join(" "));
+      if (lines.length >= 4) break;
+    }
+    return lines;
+  }
+
+  function updateFacePickPreview({ imageUrl = undefined } = {}) {
+    const preview = $("#face-pick-preview");
+    const img = $("#face-pick-preview-img");
+    const placeholder = $("#face-pick-preview-placeholder");
+    const textEl = $("#face-pick-preview-text");
+    const borderEl = $(".face-pick-preview-border", preview) || $(".face-pick-preview-border");
+    const input = $("#face-pick-overlay-text");
+    if (!preview || !textEl) return;
+
+    if (imageUrl !== undefined) {
+      facePickState.selectedUrl = imageUrl || null;
+    }
+    const url = facePickState.selectedUrl;
+    if (img) {
+      if (url) {
+        img.src = url;
+        img.hidden = false;
+      } else {
+        img.removeAttribute("src");
+        img.hidden = true;
+      }
+    }
+    if (placeholder) placeholder.hidden = Boolean(url);
+
+    const raw = (input?.value || "").trim().replace(/\s+/g, " ");
+    const style = effectiveCaptionStyle();
+    const maxWords = Math.max(1, Number(style?.max_words_per_line || 4));
+    const display =
+      style && style.uppercase === false ? raw : raw.toUpperCase();
+    const lines = wrapThumbPreviewLines(display, maxWords);
+    const colorMode = facePickState.textColorMode === "palette" ? "palette" : "caption";
+    const marginV = Math.max(
+      40,
+      Math.min(720, Number(facePickState.marginV ?? style?.margin_v ?? 160))
+    );
+    const fontSize = Math.max(
+      40,
+      Math.min(140, Number(facePickState.fontSize ?? style?.font_size ?? 100))
+    );
+    const borderPct = Math.max(
+      1,
+      Math.min(8, Number(facePickState.borderPct ?? 3.8))
+    );
+    if (borderEl) borderEl.style.padding = `${borderPct}%`;
+
+    const primary = assToHex(style?.primary_colour || "&H0000FFFF");
+    const outline = assToHex(style?.outline_colour || "&H00000000");
+    const bold = style?.bold !== false;
+    const font = style?.font_name || "Arial Black";
+    const border = Number(style?.outline || 4);
+    const frameW = preview.clientWidth || 200;
+    const aspect = preview.dataset.ratio || currentAspectRatio() || "9:16";
+    const frameH =
+      preview.clientHeight ||
+      Math.round(frameW * (aspect === "16:9" ? 9 / 16 : aspect === "1:1" ? 1 : 16 / 9));
+    const scale = frameW / 1080;
+    const strokePx = border > 0 ? border * scale * 2 : 0;
+    // ASS DESIGN_PLAY_RES Y=1920 for both aspects (same as caption preview).
+    const bottomPx = marginV * (frameH / 1920);
+    textEl.classList.add("is-caption-style");
+    textEl.style.fontFamily = `"${font}", Impact, sans-serif`;
+    textEl.style.fontSize = `${Math.max(10, Math.round(fontSize * scale))}px`;
+    textEl.style.fontWeight = bold ? "900" : "600";
+    textEl.style.webkitTextStroke = strokePx > 0 ? `${strokePx}px ${outline}` : "0";
+    textEl.style.paintOrder = "stroke fill";
+    textEl.style.top = "auto";
+    textEl.style.bottom = `${Math.max(0, Math.round(bottomPx))}px`;
+    textEl.style.left = "6%";
+    textEl.style.right = "6%";
+    let wordI = 0;
+    textEl.innerHTML = lines
+      .map((line) => {
+        const words = String(line || "")
+          .trim()
+          .split(/\s+/)
+          .filter(Boolean);
+        if (!words.length) return "";
+        if (colorMode !== "palette") {
+          wordI += words.length;
+          return `<span style="color:${primary}">${escapeHtml(line)}</span>`;
+        }
+        const colored = words
+          .map((word) => {
+            const color = FACE_PICK_PALETTE[wordI % FACE_PICK_PALETTE.length];
+            wordI += 1;
+            return `<span style="color:${color}">${escapeHtml(word)}</span>`;
+          })
+          .join(" ");
+        return `<span class="fp-line">${colored}</span>`;
+      })
+      .join("");
+    requestAnimationFrame(() => {
+      if (!textEl.isConnected) return;
+      const w2 = preview.clientWidth || frameW;
+      const h2 = preview.clientHeight || frameH;
+      if (w2 === frameW && h2 === frameH) return;
+      const scale2 = w2 / 1080;
+      const stroke2 = border > 0 ? border * scale2 * 2 : 0;
+      const bottom2 = marginV * (h2 / 1920);
+      textEl.style.fontSize = `${Math.max(10, Math.round(fontSize * scale2))}px`;
+      textEl.style.webkitTextStroke = stroke2 > 0 ? `${stroke2}px ${outline}` : "0";
+      textEl.style.bottom = `${Math.max(0, Math.round(bottom2))}px`;
+    });
+  }
+
+  function fillFacePickOverlayInput(highlightId) {
+    const input = $("#face-pick-overlay-text");
+    if (!input) return;
+    input.value = resolveThumbOverlayDraft(highlightId);
+    initFacePickStyleControls(highlightId);
+    updateFacePickPreview();
+  }
+
+  function closeFacePickModal() {
+    const modal = $("#face-pick-modal");
+    if (modal) modal.hidden = true;
+    document.body.classList.remove("face-pick-modal-open");
+    facePickState.highlightId = null;
+    facePickState.selectedId = null;
+    facePickState.selectedUrl = null;
+    facePickState.triggerBtn = null;
+    facePickState.loading = false;
+    const input = $("#face-pick-overlay-text");
+    if (input) input.value = "";
+    updateFacePickPreview({ imageUrl: null });
+    const status = $("#face-pick-status");
+    if (status) {
+      status.hidden = true;
+      status.textContent = "";
+      status.classList.remove("is-error");
+    }
+  }
+
+  function setFacePickStatus(msg, { error = false } = {}) {
+    const status = $("#face-pick-status");
+    if (!status) return;
+    status.hidden = !msg;
+    status.textContent = msg || "";
+    status.classList.toggle("is-error", Boolean(error));
+  }
+
+  async function loadFaceCandidates(highlightId) {
+    const grid = $("#face-pick-grid");
+    const confirmBtn = $("#face-pick-confirm");
+    if (grid) grid.innerHTML = `<p class="empty">Buscando frames com rosto…</p>`;
+    if (confirmBtn) confirmBtn.disabled = true;
+    facePickState.selectedId = null;
+    updateFacePickPreview({ imageUrl: null });
+    setFacePickStatus("");
+    const res = await fetch(
+      `/api/jobs/${state.activeJobId}/highlights/${encodeURIComponent(highlightId)}/face-candidates?limit=6`
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const detail = data.detail;
+      throw new Error(
+        typeof detail === "string"
+          ? detail
+          : detail
+            ? JSON.stringify(detail)
+            : res.statusText || "Falha ao buscar frames"
+      );
+    }
+    const cands = Array.isArray(data.candidates) ? data.candidates : [];
+    if (!cands.length) {
+      if (grid) {
+        grid.innerHTML = `<p class="empty">Nenhum frame com rosto neste trecho.</p>`;
+      }
+      updateFacePickPreview({ imageUrl: null });
+      return;
+    }
+    if (!grid) return;
+    grid.innerHTML = "";
+    cands.forEach((c, i) => {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "face-pick-card";
+      btn.dataset.id = String(c.id);
+      btn.dataset.url = c.url || "";
+      btn.setAttribute("role", "option");
+      btn.setAttribute("aria-selected", "false");
+      const label = c.label || c.id || `Frame ${i + 1}`;
+      btn.innerHTML = `
+        <img src="${escapeAttr(c.url)}" alt="${escapeAttr(label)}" loading="lazy" />
+        <span>${escapeHtml(label)}</span>
+      `;
+      btn.addEventListener("click", () => {
+        $$(".face-pick-card", grid).forEach((el) => {
+          el.classList.remove("is-selected");
+          el.setAttribute("aria-selected", "false");
+        });
+        btn.classList.add("is-selected");
+        btn.setAttribute("aria-selected", "true");
+        facePickState.selectedId = String(c.id);
+        if (confirmBtn) confirmBtn.disabled = false;
+        updateFacePickPreview({ imageUrl: c.url || null });
+      });
+      grid.appendChild(btn);
+      if (i === 0) btn.click();
+    });
+    const who = data.attributed_to ? ` · ${data.attributed_to}` : "";
+    setFacePickStatus(`${cands.length} opção(ões)${who}`);
+  }
+
+  async function openFacePickModal(highlightId, { triggerBtn = null, source = "topic" } = {}) {
+    if (!state.activeJobId) return;
+    facePickState.highlightId = Number(highlightId);
+    facePickState.triggerBtn = triggerBtn;
+    facePickState.source = source;
+    const modal = $("#face-pick-modal");
+    if (!modal) {
+      // Fallback: generate without picker
+      await runGenerateThumbnail(highlightId, { triggerBtn });
+      return;
+    }
+    applyFacePickAspect(
+      aspectRatioForClipLength(currentClipLength()) || currentAspectRatio()
+    );
+    modal.hidden = false;
+    document.body.classList.add("face-pick-modal-open");
+    const title = $("#face-pick-modal-title");
+    if (title) title.textContent = `Escolha o frame · tópico #${highlightId}`;
+    facePickState.selectedUrl = null;
+    fillFacePickOverlayInput(highlightId);
+    updateFacePickPreview({ imageUrl: null });
+    try {
+      await loadFaceCandidates(highlightId);
+    } catch (err) {
+      const grid = $("#face-pick-grid");
+      if (grid) grid.innerHTML = `<p class="empty">Erro: ${escapeHtml(err.message)}</p>`;
+      setFacePickStatus(err.message, { error: true });
+      updateFacePickPreview({ imageUrl: null });
+    }
+  }
+
+  async function runGenerateThumbnail(
+    highlightId,
+    { faceCandidateId = null, triggerBtn = null, mode = null, overlayText = null } = {}
+  ) {
     if (!state.activeJobId) return;
     const hint = $("#pick-hint");
-    const label = btn?.textContent || "Gerar thumbnail IA";
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "Gerando…";
-      btn.classList.add("is-busy");
+    const label = triggerBtn?.textContent || "Gerar thumbnail";
+    if (triggerBtn) {
+      triggerBtn.disabled = true;
+      triggerBtn.textContent = "Gerando…";
+      triggerBtn.classList.add("is-busy");
     }
-    if (hint) hint.textContent = `Gerando thumbnail IA do tópico #${id} (pode levar ~30–90s)…`;
+    const confirmBtn = $("#face-pick-confirm");
+    if (confirmBtn) confirmBtn.disabled = true;
+    setFacePickStatus("Enfileirando thumbnail (frame original + texto)…");
+    if (hint) {
+      hint.textContent = `Gerando thumbnail do tópico #${highlightId}…`;
+    }
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
     try {
-      const res = await fetch(
-        `/api/jobs/${state.activeJobId}/highlights/${encodeURIComponent(id)}/generate-thumbnail`,
-        { method: "POST" }
+      const payload = {};
+      if (faceCandidateId) payload.face_candidate_id = faceCandidateId;
+      if (mode) payload.mode = mode;
+      const text =
+        overlayText != null
+          ? String(overlayText).trim()
+          : ($("#face-pick-overlay-text")?.value || "").trim();
+      if (text) payload.overlay_text = text;
+      payload.text_color_mode =
+        facePickState.textColorMode === "palette" ? "palette" : "caption";
+      payload.margin_v = Math.max(
+        40,
+        Math.min(720, Number(facePickState.marginV) || 160)
       );
-      const data = await res.json().catch(() => ({}));
+      payload.font_size = Math.max(
+        40,
+        Math.min(140, Number(facePickState.fontSize) || 100)
+      );
+      payload.border_pct = Math.max(
+        1,
+        Math.min(8, Number(facePickState.borderPct) || 3.8)
+      );
+      const res = await fetch(
+        `/api/jobs/${state.activeJobId}/highlights/${encodeURIComponent(highlightId)}/generate-thumbnail`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }
+      );
+      const enqueued = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const detail = data.detail;
+        const detail = enqueued.detail;
         throw new Error(
           typeof detail === "string"
             ? detail
             : detail
               ? JSON.stringify(detail)
-              : res.statusText || "Falha ao gerar thumbnail"
+              : res.statusText || "Falha ao enfileirar thumbnail"
         );
       }
-      const url = data.thumbnail_url || data.highlight?.thumbnail_url || data.short?.thumbnail_url || "";
-      applyTopicThumbnail(id, url, { ai: true });
-      if (btn) {
-        btn.textContent = "Regenerar thumbnail IA";
-        btn.disabled = false;
-        btn.classList.remove("is-busy");
+
+      // Legacy sync response (has thumbnail_url immediately)
+      if (enqueued.thumbnail_url && enqueued.status !== "queued" && enqueued.status !== "running") {
+        applyTopicThumbnail(highlightId, enqueued.thumbnail_url, {
+          ai: true,
+          meta: {
+            overlay_text: enqueued.overlay_text || text || undefined,
+            mode: enqueued.mode,
+            text_color_mode: payload.text_color_mode,
+            margin_v: payload.margin_v,
+            font_size: payload.font_size,
+            border_pct: payload.border_pct,
+          },
+        });
+        if (facePickState.source === "youtube" || !$("#yt-upload-modal")?.hidden) {
+          syncYtUploadThumbFromGenerate(enqueued.thumbnail_url, enqueued);
+        }
+        if (triggerBtn) {
+          triggerBtn.textContent = "Regenerar thumbnail";
+          triggerBtn.disabled = false;
+          triggerBtn.classList.remove("is-busy");
+        }
+        if (hint) {
+          const modeLabel =
+            enqueued.mode === "frame" || enqueued.mode === "cutout"
+              ? "frame original"
+              : "thumbnail";
+          hint.textContent = `Thumbnail pronta (#${highlightId}) · ${modeLabel}`;
+        }
+        closeFacePickModal();
+        return enqueued;
+      }
+
+      setFacePickStatus("Gerando thumbnail em segundo plano…");
+      const started = Date.now();
+      const maxWaitMs = 5 * 60 * 1000;
+      let data = enqueued;
+      while (Date.now() - started < maxWaitMs) {
+        const st = String(data.status || "");
+        if (st === "ready") break;
+        if (st === "failed") {
+          throw new Error(data.error || "Falha ao gerar thumbnail");
+        }
+        const elapsed = Math.round((Date.now() - started) / 1000);
+        setFacePickStatus(`Gerando thumbnail… ${elapsed}s`);
+        if (hint) {
+          hint.textContent = `Gerando thumbnail #${highlightId}… ${elapsed}s`;
+        }
+        await sleep(1500);
+        const poll = await fetch(
+          `/api/jobs/${state.activeJobId}/highlights/${encodeURIComponent(highlightId)}/thumbnail-status`
+        );
+        data = await poll.json().catch(() => ({}));
+        if (!poll.ok) {
+          const detail = data.detail;
+          throw new Error(
+            typeof detail === "string"
+              ? detail
+              : detail
+                ? JSON.stringify(detail)
+                : poll.statusText || "Falha ao consultar thumbnail"
+          );
+        }
+      }
+      if (String(data.status || "") !== "ready") {
+        throw new Error("Timeout gerando thumbnail — tente de novo em instantes");
+      }
+
+      const url =
+        data.thumbnail_url ||
+        data.highlight?.thumbnail_url ||
+        data.short?.thumbnail_url ||
+        "";
+      if (!url) throw new Error("Thumbnail pronta mas sem URL");
+      applyTopicThumbnail(highlightId, url, {
+        ai: true,
+        meta: {
+          overlay_text:
+            data.overlay_text ||
+            data.highlight?.thumbnail_ai_meta?.overlay_text ||
+            text ||
+            undefined,
+          mode: data.mode,
+          text_color_mode:
+            data.text_color_mode ||
+            data.highlight?.thumbnail_ai_meta?.text_color_mode ||
+            payload.text_color_mode,
+          margin_v:
+            data.margin_v ??
+            data.highlight?.thumbnail_ai_meta?.margin_v ??
+            payload.margin_v,
+          font_size:
+            data.font_size ??
+            data.highlight?.thumbnail_ai_meta?.font_size ??
+            payload.font_size,
+          border_pct:
+            data.border_pct ??
+            data.highlight?.thumbnail_ai_meta?.border_pct ??
+            payload.border_pct,
+        },
+      });
+      if (facePickState.source === "youtube" || !$("#yt-upload-modal")?.hidden) {
+        syncYtUploadThumbFromGenerate(url, data);
+      }
+      if (triggerBtn) {
+        triggerBtn.textContent = "Regenerar thumbnail";
+        triggerBtn.disabled = false;
+        triggerBtn.classList.remove("is-busy");
       }
       if (hint) {
-        const faces = Array.isArray(data.faces) ? data.faces : [];
-        const names = faces.map((f) => f?.name).filter(Boolean).slice(0, 2);
-        hint.textContent = names.length
-          ? `Thumbnail IA pronta (#${id}) · ${names.join(", ")}`
-          : `Thumbnail IA pronta (#${id})`;
+        const modeLabel =
+          data.mode === "frame" || data.mode === "cutout" ? "frame original" : "thumbnail";
+        hint.textContent = `Thumbnail pronta (#${highlightId}) · ${modeLabel}`;
       }
+      closeFacePickModal();
+      return data;
     } catch (err) {
-      if (btn) {
-        btn.textContent = label;
-        btn.disabled = false;
-        btn.classList.remove("is-busy");
+      if (triggerBtn) {
+        triggerBtn.textContent = label;
+        triggerBtn.disabled = false;
+        triggerBtn.classList.remove("is-busy");
       }
-      if (hint) hint.textContent = `Thumbnail IA: ${err.message}`;
+      if (confirmBtn) confirmBtn.disabled = !facePickState.selectedId;
+      setFacePickStatus(err.message, { error: true });
+      if (hint) hint.textContent = `Thumbnail: ${err.message}`;
+      throw err;
     }
   }
 
-  function applyTopicThumbnail(topicId, thumbnailUrl, { ai = false } = {}) {
+  $("#face-pick-modal-close")?.addEventListener("click", () => closeFacePickModal());
+  $("#face-pick-cancel")?.addEventListener("click", () => closeFacePickModal());
+  $$("[data-face-pick-dismiss]").forEach((el) => {
+    el.addEventListener("click", () => closeFacePickModal());
+  });
+  $("#face-pick-overlay-text")?.addEventListener("input", () => {
+    updateFacePickPreview();
+  });
+  $$(".face-pick-color-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      setFacePickColorMode(btn.dataset.colorMode);
+      updateFacePickPreview();
+    });
+  });
+  $("#face-pick-margin-v")?.addEventListener("input", (ev) => {
+    syncFacePickMarginLabel(ev.target.value);
+    updateFacePickPreview();
+  });
+  $("#face-pick-font-size")?.addEventListener("input", (ev) => {
+    syncFacePickFontSizeLabel(ev.target.value);
+    updateFacePickPreview();
+  });
+  $("#face-pick-border")?.addEventListener("input", (ev) => {
+    syncFacePickBorderLabel(ev.target.value);
+    updateFacePickPreview();
+  });
+  $("#face-pick-refresh")?.addEventListener("click", async () => {
+    if (facePickState.highlightId == null) return;
+    try {
+      await loadFaceCandidates(facePickState.highlightId);
+    } catch (err) {
+      setFacePickStatus(err.message, { error: true });
+    }
+  });
+  $("#face-pick-confirm")?.addEventListener("click", async () => {
+    if (facePickState.highlightId == null || !facePickState.selectedId) return;
+    if (facePickState.loading) return;
+    const overlayText = ($("#face-pick-overlay-text")?.value || "").trim();
+    facePickState.loading = true;
+    try {
+      await runGenerateThumbnail(facePickState.highlightId, {
+        faceCandidateId: facePickState.selectedId,
+        triggerBtn: facePickState.triggerBtn,
+        overlayText,
+      });
+    } catch (_) {
+      /* status already set */
+    } finally {
+      facePickState.loading = false;
+    }
+  });
+
+  function applyTopicThumbnail(topicId, thumbnailUrl, { ai = false, meta = null } = {}) {
     if (!thumbnailUrl) return;
     if (state.lastJob?.result?.highlights) {
       const highlights = state.lastJob.result.highlights;
@@ -2359,6 +3536,28 @@
         if (hid === Number(topicId)) {
           highlights[i].thumbnail_url = thumbnailUrl;
           if (ai) highlights[i].thumbnail_ai = true;
+          if (meta && typeof meta === "object") {
+            highlights[i].thumbnail_ai_meta = {
+              ...(highlights[i].thumbnail_ai_meta || {}),
+              ...meta,
+            };
+          }
+          break;
+        }
+      }
+    }
+    if (Array.isArray(state.highlights)) {
+      for (let i = 0; i < state.highlights.length; i++) {
+        const hid = Number(state.highlights[i].id ?? i);
+        if (hid === Number(topicId)) {
+          state.highlights[i].thumbnail_url = thumbnailUrl;
+          if (ai) state.highlights[i].thumbnail_ai = true;
+          if (meta && typeof meta === "object") {
+            state.highlights[i].thumbnail_ai_meta = {
+              ...(state.highlights[i].thumbnail_ai_meta || {}),
+              ...meta,
+            };
+          }
           break;
         }
       }
@@ -2381,9 +3580,11 @@
     state.captionStyle = {
       ...state.captionStyle,
       ...(state.jobParams?.caption_style || {}),
+      ...(state.captionStyles?.[currentAspectRatio()] || {}),
     };
     applyThemeToForm({ ...state.captionStyle, id: state.captionStyle.theme });
-    const style = readCaptionForm();
+    const styles = captionStylesPayload();
+    const style = styles[currentAspectRatio()] || readCaptionForm();
     state.captionStyle = style;
     const force = state.renderedIds.has(id);
     const hint = $("#pick-hint");
@@ -2392,6 +3593,8 @@
         ? `Re-renderizando tópico #${id}…`
         : `Renderizando tópico #${id}…`;
     }
+
+    if (notificationsWanted()) await ensureNotifyPermission();
 
     try {
       const res = await fetch(`/api/jobs/${state.activeJobId}/select`, {
@@ -2402,6 +3605,7 @@
           append: true,
           force,
           caption_style: style,
+          caption_styles: styles,
         }),
       });
       const data = await res.json();
@@ -2420,6 +3624,7 @@
             ...state.lastJob.params,
             selected_ids: data.selected_ids || [...ready, id],
             caption_style: style,
+            caption_styles: styles,
           },
           result: {
             ...(state.lastJob.result || {}),
@@ -2661,7 +3866,8 @@
     if (busy && currentRenderId != null) {
       $("#pick-hint").textContent = `Renderizando tópico #${currentRenderId}…`;
     } else if (state.renderedIds.size > 0) {
-      $("#pick-hint").textContent = `${state.renderedIds.size} short(s) pronto(s) — assista no card ou gere em lote`;
+      const noun = currentClipLength() === "long" ? "vídeo(s)" : "short(s)";
+      $("#pick-hint").textContent = `${state.renderedIds.size} ${noun} pronto(s) — assista no card ou gere em lote`;
     }
     syncPickContinue();
   }
@@ -2673,6 +3879,9 @@
     const list = $("#topic-list");
     const pick = $("#pick-area");
     if (state.viewStep === 4) pick.hidden = false;
+    syncClipLengthToggle(
+      job?.params?.clip_length || job?.result?.clip_length || currentClipLength()
+    );
 
     if (!highlights.length) {
       list.innerHTML = `<p class="empty">Nenhum tópico encontrado.</p>`;
@@ -2683,7 +3892,7 @@
     }
 
     if (state.selectedIds.size === 0) {
-      state.selectedIds = selectedIdsFromJob(job, highlights);
+      state.selectedIds = selectedIdsFromJob(job);
     }
 
     pauseAllTopicVideos();
@@ -2700,6 +3909,13 @@
     const busy = jobStatus === "rendering";
     const currentRenderId =
       progress?.current_id != null ? Number(progress.current_id) : null;
+    const lengthHint =
+      currentClipLength() === "long"
+        ? "Modo longos (3–10 min) — selecione os segmentos para cortar"
+        : "Selecione os momentos, renderize um a um ou gere em lote";
+    if (!busy && state.renderedIds.size === 0) {
+      $("#pick-hint").textContent = lengthHint;
+    }
 
     highlights.forEach((h, i) => {
       const id = Number(h.id ?? i);
@@ -2787,7 +4003,9 @@
               ? `<p class="meta-row"><strong>Locutor:</strong> ${escapeHtml(h.attributed_to)}</p>`
               : ""
           }
-          <p class="meta-row topic-time"><strong>Tempo:</strong> ${fmtTime(h.start_time)} → ${fmtTime(h.end_time)}${
+          <p class="meta-row topic-time"><strong>Tempo:</strong> ${fmtTime(h.start_time)} → ${fmtTime(h.end_time)} · ${fmtClipDuration(
+            Number(h.end_time) - Number(h.start_time)
+          )}${
             h.hook_start_time != null
               ? ` · hook +${Math.max(0, Number(h.hook_start_time) - Number(h.start_time || 0)).toFixed(1)}s`
               : ""
@@ -2804,8 +4022,8 @@
             <button type="button" class="topic-ai-thumb" data-ai-thumb-id="${id}">
               ${
                 short?.thumbnail_ai || h.thumbnail_ai
-                  ? "Regenerar thumbnail IA"
-                  : "Gerar thumbnail IA"
+                  ? "Regenerar thumbnail"
+                  : "Gerar thumbnail"
               }
             </button>
             ${
@@ -2853,10 +4071,14 @@
 
     applyPreviewAspect(aspect);
     syncPickContinue();
+    syncPickContinueLabel();
     if (busy && currentRenderId != null) {
       $("#pick-hint").textContent = `Renderizando tópico #${currentRenderId}…`;
     } else if (state.renderedIds.size > 0 && !busy) {
-      $("#pick-hint").textContent = `${state.renderedIds.size} short(s) pronto(s) — assista no card ou gere em lote`;
+      const noun = currentClipLength() === "long" ? "vídeo(s)" : "short(s)";
+      $("#pick-hint").textContent = `${state.renderedIds.size} ${noun} pronto(s) — assista no card ou gere em lote`;
+    } else if (!busy) {
+      $("#pick-hint").textContent = lengthHint;
     }
   }
 
@@ -3049,9 +4271,16 @@
     const hint = $("#trim-hint");
     if (hint) {
       const len = t.end - t.start;
+      const longMode = currentClipLength() === "long";
       let msg = "Arraste um handle por vez — o outro lado fica fixo";
-      if (len < 15) msg = "Corte curto (<15s) — ok se for intencional";
-      else if (len > 90) msg = "Corte longo (>90s) — shorts costumam performar melhor mais curtos";
+      if (longMode) {
+        if (len < 180) msg = "Corte curto (<3 min) para o modo longo — ok se for intencional";
+        else if (len > 600) msg = "Corte >10 min — pode ficar pesado no YouTube mid-form";
+      } else if (len < 15) {
+        msg = "Corte curto (<15s) — ok se for intencional";
+      } else if (len > 90) {
+        msg = "Corte longo (>90s) — shorts costumam performar melhor mais curtos";
+      }
       if (t.dirty) msg += " · alterações não salvas";
       hint.textContent = msg;
     }
@@ -3604,7 +4833,10 @@
     if (!ids.length) return;
     const btn = $("#resume-render-btn");
     if (btn) btn.disabled = true;
+    if (notificationsWanted()) await ensureNotifyPermission();
+    const styles = captionStylesPayload();
     const style =
+      styles[currentAspectRatio()] ||
       job?.params?.caption_style ||
       state.jobParams?.caption_style ||
       state.captionStyle ||
@@ -3616,6 +4848,7 @@
         body: JSON.stringify({
           ids,
           caption_style: style || undefined,
+          caption_styles: Object.keys(styles).length ? styles : undefined,
           force: false,
           resume: true,
         }),
@@ -3634,6 +4867,7 @@
             ...state.lastJob.params,
             selected_ids: ids,
             ...(style ? { caption_style: style } : {}),
+            ...(Object.keys(styles).length ? { caption_styles: styles } : {}),
           },
         };
         renderResults(state.lastJob);
@@ -3658,18 +4892,25 @@
     closeTrimEditor({ silent: true });
     const btn = $("#pick-continue");
     btn.disabled = true;
+    if (notificationsWanted()) await ensureNotifyPermission();
     state.captionStyle = {
       ...state.captionStyle,
       ...(state.jobParams?.caption_style || {}),
+      ...(state.captionStyles?.[currentAspectRatio()] || {}),
     };
     applyThemeToForm({ ...state.captionStyle, id: state.captionStyle.theme });
-    const style = readCaptionForm();
+    const styles = captionStylesPayload();
+    const style = styles[currentAspectRatio()] || readCaptionForm();
     state.captionStyle = style;
     try {
       const res = await fetch(`/api/jobs/${state.activeJobId}/select`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ ids: [...state.selectedIds], caption_style: style }),
+        body: JSON.stringify({
+          ids: [...state.selectedIds],
+          caption_style: style,
+          caption_styles: styles,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || JSON.stringify(data));
@@ -3687,6 +4928,7 @@
             ...state.lastJob.params,
             selected_ids: [...state.selectedIds],
             caption_style: style,
+            caption_styles: styles,
           },
           result: {
             ...state.lastJob.result,
@@ -3757,24 +4999,26 @@
 
   function readCaptionForm() {
     const themeBtn = $(".theme-chip.is-selected");
+    const aspect = currentAspectRatio();
+    const defaults = defaultCaptionStyle(aspect);
     const marginRaw = $("#caption-margin-v")?.value;
     const margin_v =
       marginRaw != null && marginRaw !== ""
         ? Number(marginRaw)
-        : state.captionStyle.margin_v ?? 160;
+        : state.captionStyle.margin_v ?? defaults.margin_v;
     return {
       theme: themeBtn?.dataset.theme || state.captionStyle.theme || "bold-white",
       enabled: true,
-      font_name: $("#caption-font")?.value || "Arial Black",
-      font_size: Number($("#caption-size")?.value || 72),
-      outline: Number($("#caption-outline")?.value || 4),
+      font_name: $("#caption-font")?.value || defaults.font_name,
+      font_size: Number($("#caption-size")?.value || defaults.font_size),
+      outline: Number($("#caption-outline")?.value || defaults.outline),
       max_words_per_line: Number($("#caption-words")?.value || 4),
       primary_colour: hexToAss($("#caption-primary")?.value || "#ffff00"),
       secondary_colour: hexToAss($("#caption-secondary")?.value || "#ffffff"),
       outline_colour: hexToAss($("#caption-outline-color")?.value || "#000000"),
       bold: $("#caption-bold")?.checked ?? true,
       shadow: state.captionStyle.shadow ?? 0,
-      margin_v: Number.isFinite(margin_v) ? margin_v : 160,
+      margin_v: Number.isFinite(margin_v) ? margin_v : defaults.margin_v,
       back_colour: state.captionStyle.back_colour || "&H80000000",
       uppercase: state.captionStyle.uppercase !== false,
     };
@@ -3808,7 +5052,20 @@
       $("#caption-outline-color").value = assToHex(theme.outline_colour);
     }
     if ($("#caption-bold") && theme.bold != null) $("#caption-bold").checked = !!theme.bold;
-    if (theme.margin_v != null) syncCaptionMarginLabel(theme.margin_v);
+    if (theme.margin_v != null) {
+      const aspect = currentAspectRatio();
+      // Theme bold-white stores the shorts margin (610); keep landscape at 160.
+      const mv =
+        aspect === "16:9" && Number(theme.margin_v) === 610
+          ? defaultCaptionStyle("16:9").margin_v
+          : theme.margin_v;
+      syncCaptionMarginLabel(mv);
+    }
+    if (!state.captionStyles) state.captionStyles = {};
+    state.captionStyles[currentAspectRatio()] = {
+      ...state.captionStyle,
+      ...readCaptionForm(),
+    };
     updateCaptionPreview();
   }
 
@@ -4042,9 +5299,12 @@
   }
 
   function syncCaptionForm() {
+    const aspect = currentAspectRatio();
+    ensureCaptionStyleForAspect(aspect);
+    state.captionStyle = cloneCaptionStyle(state.captionStyles[aspect], aspect);
     renderThemeGrid();
-    const style = state.captionStyle;
-    applyThemeToForm({ ...style, id: style.theme });
+    applyThemeToForm({ ...state.captionStyle, id: state.captionStyle.theme });
+    applyPreviewAspect(aspect);
     const controls = $("#caption-controls");
     if (controls) controls.hidden = false;
     updateCaptionPreview();
@@ -4056,8 +5316,19 @@
       const data = await res.json();
       if (res.ok) {
         state.captionThemes = data.themes || [];
-        if (data.default && !state.jobParams?.caption_style) {
-          state.captionStyle = { ...state.captionStyle, ...data.default };
+        const hasAny =
+          state.jobParams?.caption_style ||
+          state.jobParams?.caption_styles?.["9:16"] ||
+          state.jobParams?.caption_styles?.["16:9"];
+        if (data.default && !hasAny) {
+          const aspect = currentAspectRatio();
+          // Drop API margin so aspect default (610 shorts / 160 landscape) wins.
+          const { margin_v: _mv, ...rest } = data.default;
+          state.captionStyle = cloneCaptionStyle(rest, aspect);
+          if (!state.captionStyles) state.captionStyles = {};
+          if (!state.captionStyles[aspect]) {
+            state.captionStyles[aspect] = cloneCaptionStyle(state.captionStyle, aspect);
+          }
         }
       }
     } catch (_) {
@@ -4065,22 +5336,27 @@
     }
   }
 
+  function onCaptionFormInput(ev) {
+    if (ev?.target?.id === "caption-margin-v") syncCaptionMarginLabel(ev.target.value);
+    if (!state.captionStyles) state.captionStyles = {};
+    const style = readCaptionForm();
+    state.captionStyles[currentAspectRatio()] = style;
+    state.captionStyle = style;
+    updateCaptionPreview();
+  }
+
   ["caption-font", "caption-size", "caption-outline", "caption-words", "caption-primary", "caption-secondary", "caption-outline-color", "caption-bold", "caption-margin-v"].forEach((id) => {
-    $(`#${id}`)?.addEventListener("input", (ev) => {
-      if (id === "caption-margin-v") syncCaptionMarginLabel(ev.target?.value);
-      updateCaptionPreview();
-    });
-    $(`#${id}`)?.addEventListener("change", (ev) => {
-      if (id === "caption-margin-v") syncCaptionMarginLabel(ev.target?.value);
-      updateCaptionPreview();
-    });
+    $(`#${id}`)?.addEventListener("input", onCaptionFormInput);
+    $(`#${id}`)?.addEventListener("change", onCaptionFormInput);
   });
 
-  $("#aspect-toggle")?.addEventListener("click", (ev) => {
-    const btn = ev.target.closest(".aspect-toggle-btn");
-    if (!btn || !btn.dataset.ratio) return;
-    setAspectRatio(btn.dataset.ratio);
+  $("#clip-length-toggle")?.addEventListener("click", (ev) => {
+    const btn = ev.target.closest(".clip-length-btn");
+    if (!btn || !btn.dataset.clipLength) return;
+    syncClipLengthToggle(btn.dataset.clipLength);
+    syncPickContinueLabel();
   });
+  syncClipLengthToggle($("#clip_length")?.value || "short");
 
   $("#caption-back")?.addEventListener("click", () => {
     state.followJobStep = false;
@@ -4092,10 +5368,11 @@
     const btn = $("#caption-continue");
     const hint = $("#caption-hint");
     btn.disabled = true;
-    const style = readCaptionForm();
+    const styles = captionStylesPayload();
+    const aspect = currentAspectRatio();
+    const style = styles[aspect] || readCaptionForm();
     state.captionStyle = style;
     try {
-      const aspect = currentAspectRatio();
       const fmt =
         $("#download_format")?.value ||
         state.jobParams?.download_format ||
@@ -4108,6 +5385,7 @@
           download_format: fmt,
           ui_step: 4,
           caption_style: style,
+          caption_styles: styles,
           regenerate: false,
         }),
       });
@@ -4117,19 +5395,21 @@
         state.lastJob.params.ui_step = 4;
         state.lastJob.params.flow_version = 2;
         state.lastJob.params.caption_style = style;
+        state.lastJob.params.caption_styles = styles;
       }
       state.jobParams = {
         ...(state.jobParams || {}),
         ui_step: 4,
         flow_version: 2,
         caption_style: style,
+        caption_styles: styles,
       };
       state.followJobStep = false;
       setFlowStep(4, { maxStep: 4 });
       if (state.lastJob) renderTopicPicker(state.lastJob);
       if (hint) {
         hint.textContent =
-          "Escolha o tema e ajuste tipografia — as palavras destacam no ritmo da fala";
+          "Ajuste tipografia no formato escolhido — as palavras destacam no ritmo da fala";
       }
     } catch (err) {
       if (hint) hint.textContent = `erro: ${err.message}`;
@@ -4295,6 +5575,9 @@
     const box = $("#results");
     if (!box) return;
 
+    const aspect = resultsAspectRatio(job);
+    box.dataset.ratio = aspect;
+
     const highlights = job.result?.highlights || [];
     const shorts = job.result?.shorts || [];
     const progress = job.result?.render_progress || null;
@@ -4415,6 +5698,7 @@
 
       if (card && card.dataset.state === cardState && cardState === "ready") {
         // Keep the same <video> so playback isn't interrupted — only refresh YT actions
+        card.dataset.ratio = aspect;
         card.style.order = String(i);
         const actions = card.querySelector(".short-actions");
         const prevYt = actions?.dataset.ytState || "";
@@ -4441,6 +5725,7 @@
       }
 
       card.dataset.state = cardState;
+      card.dataset.ratio = aspect;
       card.className = `short-card is-${cardState}`;
       card.style.order = String(i);
       card.style.animationDelay = `${i * 0.06}s`;
@@ -4552,7 +5837,7 @@
       if (video) video.setAttribute("poster", thumbnailUrl);
       const aiBtn = topic.querySelector(".topic-ai-thumb");
       if (aiBtn && !aiBtn.classList.contains("is-busy")) {
-        aiBtn.textContent = "Regenerar thumbnail IA";
+        aiBtn.textContent = "Regenerar thumbnail";
       }
     });
   }
@@ -4561,6 +5846,10 @@
     const body = $("#yt-upload-modal-body");
     const confirmBtn = $("#yt-upload-modal-confirm");
     if (!body) return;
+
+    const aspect = resultsAspectRatio(state.lastJob);
+    const ytModal = $("#yt-upload-modal");
+    if (ytModal) ytModal.dataset.ratio = aspect;
 
     const hashtags = Array.isArray(data.hashtags) ? data.hashtags : [];
     const tags = Array.isArray(data.tags) ? data.tags : [];
@@ -4693,86 +5982,55 @@
     }
 
     $("#yt-upload-generate-thumb")?.addEventListener("click", () => {
-      generateYtThumbnail();
+      const shortId = ytUploadState.shortId;
+      if (!shortId) return;
+      openFacePickModal(shortId, {
+        triggerBtn: $("#yt-upload-generate-thumb"),
+        source: "youtube",
+      });
     });
   }
 
   async function generateYtThumbnail() {
-    const jobId = state.activeJobId || state.lastJob?.id;
     const shortId = ytUploadState.shortId;
+    if (!shortId) return;
+    openFacePickModal(shortId, {
+      triggerBtn: $("#yt-upload-generate-thumb"),
+      source: "youtube",
+    });
+  }
+
+  function syncYtUploadThumbFromGenerate(url, data) {
+    if (!url) return;
+    const img = $("#yt-upload-thumb-img");
+    if (img) {
+      if (img.tagName === "IMG") {
+        img.src = url;
+      } else {
+        const next = document.createElement("img");
+        next.className = "yt-upload-thumb";
+        next.id = "yt-upload-thumb-img";
+        next.alt = "Thumbnail do short";
+        next.src = url;
+        img.replaceWith(next);
+      }
+    }
+    const note = $(".yt-upload-thumb-note");
+    if (note) {
+      note.textContent =
+        data?.mode === "frame" || data?.mode === "cutout"
+          ? "Thumbnail do frame original (+ texto)"
+          : "Thumbnail gerada";
+    }
     const btn = $("#yt-upload-generate-thumb");
-    const confirmBtn = $("#yt-upload-modal-confirm");
-    if (!jobId || !shortId || ytUploadState.generatingThumb || ytUploadState.uploading) {
-      return;
+    if (btn && !btn.classList.contains("is-busy")) {
+      btn.textContent = "Regenerar thumbnail";
     }
-
-    ytUploadState.generatingThumb = true;
-    if (btn) {
-      btn.disabled = true;
-      btn.textContent = "Gerando…";
-    }
-    if (confirmBtn) confirmBtn.disabled = true;
-    setYtUploadStatus("Gerando thumbnail com IA (pode levar ~30–90s)…");
-
-    try {
-      const res = await fetch(
-        `/api/jobs/${jobId}/shorts/${encodeURIComponent(shortId)}/generate-thumbnail`,
-        { method: "POST" }
-      );
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const detail = data.detail;
-        const msg =
-          typeof detail === "string"
-            ? detail
-            : Array.isArray(detail)
-              ? detail.map((d) => d.msg || JSON.stringify(d)).join("; ")
-              : data.message || `HTTP ${res.status}`;
-        throw new Error(msg);
-      }
-      if (ytUploadState.shortId !== String(shortId)) return;
-
-      const url = data.thumbnail_url || data.short?.thumbnail_url || "";
-      applyShortThumbnail(shortId, url);
-
-      const img = $("#yt-upload-thumb-img");
-      if (url && img) {
-        if (img.tagName === "IMG") {
-          img.src = url;
-        } else {
-          const next = document.createElement("img");
-          next.className = "yt-upload-thumb";
-          next.id = "yt-upload-thumb-img";
-          next.alt = "Thumbnail do short";
-          next.src = url;
-          img.replaceWith(next);
-        }
-      }
-      const note = $(".yt-upload-thumb-note");
-      if (note) note.textContent = "Thumbnail gerada por IA";
-      if (btn) btn.textContent = "Regenerar thumbnail IA";
-
-      const faces = Array.isArray(data.faces) ? data.faces : [];
-      const cited = faces.filter((f) => f.kind === "cited").map((f) => f.name);
-      const faceHint = cited.length
-        ? ` · Wiki: ${cited.join(", ")}`
-        : faces.length
-          ? ` · ${faces.length} rosto(s)`
-          : "";
-      setYtUploadStatus(`Thumbnail atualizada${faceHint}`);
-    } catch (err) {
-      setYtUploadStatus(String(err.message || err), { error: true });
-      if (btn) btn.textContent = "Gerar thumbnail IA";
-    } finally {
-      ytUploadState.generatingThumb = false;
-      if (btn) btn.disabled = false;
-      if (confirmBtn) {
-        confirmBtn.disabled = !ytUploadState.configured;
-        confirmBtn.textContent = ytUploadState.alreadyUploaded
-          ? "Atualizar no YouTube"
-          : "Fazer upload";
-      }
-    }
+    setYtUploadStatus(
+      data?.mode === "frame" || data?.mode === "cutout"
+        ? "Thumbnail atualizada (frame original)"
+        : "Thumbnail atualizada"
+    );
   }
 
   async function openYtUploadModal(shortId) {
@@ -4793,6 +6051,7 @@
     ytUploadState.alreadyUploaded = !!(
       knownShort?.youtube_video_id || knownShort?.youtube_url
     );
+    modal.dataset.ratio = resultsAspectRatio(state.lastJob);
     modal.hidden = false;
     document.body.classList.add("yt-upload-modal-open");
     body.innerHTML = `<p class="empty">Carregando preview…</p>`;
@@ -5110,6 +6369,7 @@
   refreshHealth();
   loadSources();
   loadCaptionThemes();
+  syncNotifyUi();
   setFlowStep(1);
   applyRoute(parseRoute(location.pathname));
 })();

@@ -117,12 +117,33 @@
                 <option value="local" selected>Local (yt-dlp + Whisper)</option>
               </select>
             </label>
+            <label class="field field-grow" id="clip-length-field">
+              <span class="label">Formato dos cortes</span>
+              <div class="clip-length-toggle" id="clip-length-toggle" role="group" aria-label="Formato dos cortes">
+                <button type="button" class="clip-length-btn is-active" data-clip-length="short" aria-pressed="true">
+                  Shorts · 45–90s
+                </button>
+                <button type="button" class="clip-length-btn" data-clip-length="long" aria-pressed="false">
+                  Longos · 3–10 min
+                </button>
+              </div>
+              <input type="hidden" name="clip_length" id="clip_length" value="short" />
+              <span class="hint" id="clip-length-hint">Shorts virais para o feed</span>
+            </label>
           </div>
 
           <label class="field upload-field" id="upload-wrap">
             <span class="label">Arquivo local <em id="upload-mode-note">(somente modo local)</em></span>
             <input type="file" name="file" id="file" accept="video/*,.mp4,.mkv,.webm,.mov" />
             <span class="upload-hint" id="file-hint">Arraste um mp4 ou clique para escolher</span>
+          </label>
+
+          <label class="checkbox-field" id="notify-field">
+            <input type="checkbox" id="browser-notify" />
+            <span>
+              Notificar no navegador quando etapas longas terminarem
+              <span class="hint" id="notify-hint" hidden></span>
+            </span>
           </label>
 
           <div class="actions" id="new-job-actions">
@@ -168,7 +189,7 @@
           <div class="section-head">
             <div>
               <h2 style="font-size:1.2rem">Legendas karaoke</h2>
-              <p class="hint" id="caption-hint">Escolha o tema e ajuste tipografia — as palavras destacam no ritmo da fala</p>
+              <p class="hint" id="caption-hint">Ajuste tipografia no formato escolhido — as palavras destacam no ritmo da fala</p>
             </div>
             <div class="pick-actions">
               <button type="button" class="btn ghost" id="caption-back">← Fonte</button>
@@ -186,20 +207,20 @@
               <label class="field">
                 <span class="label">Fonte</span>
                 <select id="caption-font">
+                  <option value="DejaVu Sans">DejaVu Sans</option>
                   <option value="Arial Black">Arial Black</option>
                   <option value="Impact">Impact</option>
                   <option value="Arial">Arial</option>
-                  <option value="DejaVu Sans">DejaVu Sans</option>
                   <option value="Helvetica">Helvetica</option>
                 </select>
               </label>
               <label class="field">
                 <span class="label">Tamanho</span>
-                <input type="number" id="caption-size" min="32" max="120" step="2" value="72" />
+                <input type="number" id="caption-size" min="32" max="120" step="2" value="100" />
               </label>
               <label class="field">
                 <span class="label">Borda</span>
-                <input type="number" id="caption-outline" min="0" max="12" step="1" value="4" />
+                <input type="number" id="caption-outline" min="0" max="40" step="1" value="20" />
               </label>
               <label class="field">
                 <span class="label">Palavras / linha</span>
@@ -233,7 +254,7 @@
               <label class="field caption-position-field">
                 <span class="label">
                   Posição vertical
-                  <span class="caption-position-val" id="caption-margin-v-val">160</span>
+                  <span class="caption-position-val" id="caption-margin-v-val">610</span>
                 </span>
                 <input
                   type="range"
@@ -241,10 +262,10 @@
                   min="40"
                   max="720"
                   step="10"
-                  value="160"
+                  value="610"
                   aria-valuemin="40"
                   aria-valuemax="720"
-                  aria-valuenow="160"
+                  aria-valuenow="610"
                 />
                 <span class="caption-position-ends" aria-hidden="true">
                   <span>Mais baixo</span>
@@ -263,10 +284,6 @@
                 <span class="caption-preview-badge" id="caption-preview-badge">9:16</span>
               </div>
               <div class="caption-preview-bar">
-                <div class="aspect-toggle" id="aspect-toggle" role="group" aria-label="Proporção do short">
-                  <button type="button" class="aspect-toggle-btn is-active" data-ratio="9:16" aria-pressed="true">9:16</button>
-                  <button type="button" class="aspect-toggle-btn" data-ratio="16:9" aria-pressed="false">16:9</button>
-                </div>
                 <button type="button" class="btn ghost" id="caption-preview-toggle">▶ Pré-visualizar</button>
                 <p class="hint caption-preview-meta" id="caption-preview-meta">Preview com o primeiro tópico selecionado</p>
               </div>
@@ -459,7 +476,7 @@
 
       <div class="section-head config-section-gap">
         <h2>Configuração geral</h2>
-        <p class="lede small">Idioma, pasta de saída dos shorts e suavização do crop. Chaves de API, Whisper e modelos ficam apenas no arquivo <code>.env</code>.</p>
+        <p class="lede small">Idioma, pasta de saída, crop e paleta das thumbnails (borda + texto). Chaves de API, Whisper e modelos ficam apenas no arquivo <code>.env</code>.</p>
       </div>
       <form id="config-form" class="config-grid"></form>
       <div class="actions">
@@ -590,7 +607,154 @@
     </div>
   </div>
 
-  <div class="yt-upload-modal" id="yt-upload-modal" hidden>
+  <div class="face-pick-modal" id="face-pick-modal" data-ratio="9:16" hidden>
+    <div class="face-pick-modal-backdrop" data-face-pick-dismiss tabindex="-1" aria-hidden="true"></div>
+    <div
+      class="face-pick-modal-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="face-pick-modal-title"
+    >
+      <div class="face-pick-modal-head">
+        <div>
+          <h3 class="face-pick-modal-title" id="face-pick-modal-title">Escolha o frame do rosto</h3>
+          <p class="hint" id="face-pick-modal-hint">
+            O texto segue o estilo da legenda — ajuste cor, posição, tamanho e borda no preview.
+          </p>
+        </div>
+        <button type="button" class="btn ghost" id="face-pick-modal-close">Fechar</button>
+      </div>
+      <div class="face-pick-modal-body">
+        <div class="face-pick-layout" data-ratio="9:16">
+          <div class="face-pick-preview-wrap">
+            <p class="label">Preview</p>
+            <div class="face-pick-preview" id="face-pick-preview" data-ratio="9:16" aria-label="Preview da thumbnail">
+              <img id="face-pick-preview-img" alt="" hidden />
+              <div class="face-pick-preview-placeholder" id="face-pick-preview-placeholder">
+                Selecione um frame
+              </div>
+              <div class="face-pick-preview-border" aria-hidden="true"></div>
+              <div class="face-pick-preview-text" id="face-pick-preview-text"></div>
+            </div>
+          </div>
+          <div class="face-pick-controls">
+            <div class="field face-pick-text-field">
+              <label class="label" for="face-pick-overlay-text">Texto da thumbnail</label>
+              <input
+                type="text"
+                id="face-pick-overlay-text"
+                maxlength="80"
+                placeholder="Título curto na imagem"
+                autocomplete="off"
+              />
+              <p class="hint">Usa o estilo gráfico da legenda. Ideal: 3–6 palavras.</p>
+            </div>
+            <div class="face-pick-style-controls" id="face-pick-style-controls">
+              <div class="field">
+                <span class="label">Cor do texto</span>
+                <div class="face-pick-color-toggle" role="group" aria-label="Cor do texto">
+                  <button
+                    type="button"
+                    class="btn ghost face-pick-color-btn is-selected"
+                    data-color-mode="caption"
+                    id="face-pick-color-caption"
+                  >
+                    Cor da legenda
+                  </button>
+                  <button
+                    type="button"
+                    class="btn ghost face-pick-color-btn"
+                    data-color-mode="palette"
+                    id="face-pick-color-palette"
+                  >
+                    Paleta da borda
+                  </button>
+                </div>
+              </div>
+              <label class="field caption-position-field face-pick-margin-field">
+                <span class="label">
+                  Posição vertical
+                  <span class="caption-position-val" id="face-pick-margin-v-val">160</span>
+                </span>
+                <input
+                  type="range"
+                  id="face-pick-margin-v"
+                  min="40"
+                  max="720"
+                  step="10"
+                  value="160"
+                  aria-valuemin="40"
+                  aria-valuemax="720"
+                  aria-valuenow="160"
+                />
+                <span class="caption-position-ends" aria-hidden="true">
+                  <span>Mais baixo</span>
+                  <span>Mais alto</span>
+                </span>
+              </label>
+              <label class="field caption-position-field face-pick-font-field">
+                <span class="label">
+                  Tamanho do texto
+                  <span class="caption-position-val" id="face-pick-font-size-val">100</span>
+                </span>
+                <input
+                  type="range"
+                  id="face-pick-font-size"
+                  min="40"
+                  max="140"
+                  step="2"
+                  value="100"
+                  aria-valuemin="40"
+                  aria-valuemax="140"
+                  aria-valuenow="100"
+                />
+                <span class="caption-position-ends" aria-hidden="true">
+                  <span>Menor</span>
+                  <span>Maior</span>
+                </span>
+              </label>
+              <label class="field caption-position-field face-pick-border-field">
+                <span class="label">
+                  Espessura da borda
+                  <span class="caption-position-val" id="face-pick-border-val">3.8</span>%
+                </span>
+                <input
+                  type="range"
+                  id="face-pick-border"
+                  min="1"
+                  max="8"
+                  step="0.2"
+                  value="3.8"
+                  aria-valuemin="1"
+                  aria-valuemax="8"
+                  aria-valuenow="3.8"
+                />
+                <span class="caption-position-ends" aria-hidden="true">
+                  <span>Fina</span>
+                  <span>Grossa</span>
+                </span>
+              </label>
+            </div>
+            <div class="face-pick-grid" id="face-pick-grid" data-ratio="9:16" role="listbox" aria-label="Frames candidatos">
+              <p class="empty">Buscando frames com rosto…</p>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="face-pick-modal-foot">
+        <p class="hint face-pick-status" id="face-pick-status" hidden></p>
+        <div class="face-pick-modal-actions">
+          <button type="button" class="btn ghost" id="face-pick-refresh">Buscar de novo</button>
+          <button type="button" class="btn ghost" id="face-pick-cancel">Cancelar</button>
+          <button type="button" class="btn primary" id="face-pick-confirm" disabled>
+            Gerar thumbnail
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="yt-upload-modal" id="yt-upload-modal" data-ratio="9:16" hidden>
     <div class="yt-upload-modal-backdrop" data-yt-upload-dismiss tabindex="-1" aria-hidden="true"></div>
     <div
       class="yt-upload-modal-panel"
