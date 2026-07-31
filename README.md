@@ -41,7 +41,7 @@ Built for creators, agencies, and developers who don't want to pay $20–$300/mo
 - **🔀 Two Modes — API (fast) or Local (offline)**: Default `--mode api` uses MuAPI for download/transcription/cropping; `--mode local` runs entirely on your machine with `yt-dlp`, `faster-whisper`, and `ffmpeg`/`opencv`, and lets you pick OpenAI or Gemini for highlight ranking
 - **🤖 Virality-Aware Highlight Selection**: Clips ranked on hooks, emotional peaks, opinion bombs, revelation moments, conflict, quotable lines, story peaks, and practical value — not just generic "interesting"
 - **📈 Score + Hook + Reason for Every Clip**: Each highlight comes with a viral score, an opening hook line, and a one-sentence explanation of why it works
-- **🎤 Whisper Transcription, Your Choice**: Cloud (`/openai-whisper` via MuAPI) or local (`faster-whisper`, CPU or CUDA) — same downstream output shape
+- **🎤 Whisper Transcription, Your Choice**: Prefers free YouTube captions when available, then cloud (`/openai-whisper` via MuAPI) or local (`faster-whisper`, CPU or CUDA) — same downstream output shape
 - **🧩 Long-Video Aware**: Videos over 30 minutes are auto-chunked with overlap so nothing gets missed
 - **♻️ Smart Dedupe**: Overlapping highlights are collapsed by score so you never get two near-duplicate clips
 - **🎯 Smart Vertical Crop**: API mode uses MuAPI's auto-crop; local mode runs OpenCV face tracking with motion smoothing
@@ -111,10 +111,12 @@ Além da CLI, o projeto inclui uma interface no navegador. A home lista **projet
 
 ```bash
 pip install -r requirements.txt
-uvicorn web.app:app --reload --host 0.0.0.0 --port 8000
+make dev
 ```
 
 Abra [http://localhost:8000](http://localhost:8000).
+
+Equivalente manual: `uvicorn web.app:app --reload --host 0.0.0.0 --port 8000`
 
 ## Usage
 
@@ -198,7 +200,7 @@ xargs -a urls.txt -I{} python main.py "{}"
 | Step | API mode (`--mode api`) | Local mode (`--mode local`) |
 |---|---|---|
 | Download | MuAPI `/youtube-download` | `yt-dlp` for remote URLs, direct file path for local inputs |
-| Transcription | MuAPI `/openai-whisper` | `faster-whisper` (CPU or CUDA) |
+| Transcription | YouTube captions (if available) → MuAPI `/openai-whisper` | YouTube captions (if available) → `faster-whisper` (CPU or CUDA) |
 | Highlight LLM | MuAPI `gpt-5-mini` | `LLM_PROVIDER=openai` uses OpenAI (`gpt-4o-mini` by default), `LLM_PROVIDER=gemini` uses Gemini (`gemini-2.5-flash` by default) |
 | Vertical crop | MuAPI `/autocrop` | `ffmpeg` + OpenCV face tracking |
 | Output | hosted URLs | local mp4 paths |
@@ -207,7 +209,7 @@ xargs -a urls.txt -I{} python main.py "{}"
 ## How It Works
 
 1. **Download**: Fetches the source video from YouTube
-2. **Transcribe**: MuAPI `/openai-whisper` produces a timestamped transcript (verbose_json segments)
+2. **Transcribe**: Prefers free YouTube captions (manual/auto via yt-dlp); falls back to MuAPI `/openai-whisper` (or local `faster-whisper`) for a timestamped transcript
 3. **Detect content type**: An LLM classifies the video (podcast, interview, tutorial, vlog, etc.) and density, so the prompt can be tuned per content style
 4. **Long-video chunking**: Videos > 30 min are split into 20-min overlapping chunks
 5. **Highlight ranking**: An LLM scans the transcript through a virality framework — hook moments, emotional peaks, opinion bombs, revelations, conflict, quotables, story peaks, practical value — and emits ranked candidates with scores 0–100
@@ -271,7 +273,7 @@ Edit `shorts_generator/config.py` (or set env vars):
 - `MUAPI_POLL_TIMEOUT` (default 1800s) — give up after this long
 
 ### Whisper transcription
-Audio is transcribed by MuAPI's `/openai-whisper` endpoint (server-side `whisper-1`). Pass `--language <code>` to lock the recognition to a specific language; otherwise it auto-detects.
+By default (`PREFER_YOUTUBE_CAPTIONS=true`), the pipeline tries YouTube captions first (manual, then auto). If none are usable, audio is transcribed by MuAPI's `/openai-whisper` endpoint (server-side `whisper-1`), or by `faster-whisper` in local mode. Pass `--language <code>` to lock recognition / caption language preference; otherwise it follows `CONTENT_LANGUAGE` / auto-detect.
 
 ## Project Structure
 
@@ -289,6 +291,7 @@ AI-Youtube-Shorts-Generator/
     ├── muapi.py                  generic submit + poll wrapper
     ├── downloader.py             API mode: YouTube download via MuAPI
     ├── transcriber.py            API mode: MuAPI /openai-whisper client
+    ├── youtube_captions.py       YouTube caption fetch (preferred before Whisper)
     ├── highlights.py             shared LLM virality ranking (pluggable backend)
     ├── clipper.py                API mode: MuAPI /autocrop
     ├── pipeline.py               mode dispatcher (api ↔ local)
