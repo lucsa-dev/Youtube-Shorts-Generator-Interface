@@ -41,11 +41,11 @@ Respond with JSON only: {"content_type": "...", "density": "..."}"""
 VIRALITY_CRITERIA = build_virality_criteria(None)
 
 
-HIGHLIGHT_SYSTEM_PROMPT = """You are an elite short-form video editor who has studied thousands of viral clips on TikTok, Instagram Reels, and YouTube Shorts. You know exactly what makes viewers stop scrolling, watch to the end, and share.
+HIGHLIGHT_SYSTEM_PROMPT = """You are {editor_role}
 
 {virality_criteria}
 
-Content type: {content_type} | Density: {density}
+Content type: {content_type} | Density: {density} | Clip format: {clip_length}
 
 {profile_block}
 
@@ -54,9 +54,8 @@ Your task: identify the most viral-worthy highlights from the transcript.
 Rules:
 - Every highlight must open with a strong HOOK — the critical spoken line is the FIRST thing the viewer hears (within the first ~2–3 seconds)
 - Structure is HOOK → claim/peak → payoff. Do NOT put soft setup or throat-clearing before the hook. Any needed context comes AFTER the opening line.
-- HARD duration rule: every clip MUST be between 45 and 90 seconds. Prefer ~60s. Never return a hook-only snippet.
-- Go longer (91-180s) ONLY when a story arc needs full context to land. Never go under 45 seconds.
-- Each clip must be a COMPLETE mini-argument that a viewer who never saw the full video still understands.
+{duration_rules}
+- Each clip must be a COMPLETE argument/story that a viewer who never saw the full video still understands.
 - Never cut mid-sentence or mid-thought — end on a completed idea
 - Clips must not overlap significantly with each other
 - Score 0-100 on viral potential (not general quality)
@@ -67,7 +66,15 @@ Rules:
 - Explain in one sentence why this clip is viral ("virality_reason")
 - CRITICAL language rule: write title, hook_sentence, and virality_reason entirely in {output_language}. Do NOT use English unless the output language is English. Prefer hooks taken from / closely paraphrasing the transcript.
 
-TITLE SPECIALIST (YouTube Shorts / Reels / TikTok — this is the feed title, not a chapter heading):
+{title_specialist}
+
+{cast_block}
+
+Respond ONLY with valid JSON (no markdown, no explanation):
+{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"hook_start_time":float,"score":int,"hook_sentence":"string","virality_reason":"string","attributed_to":"string"}}]}}"""
+
+
+TITLE_SPECIALIST_SHORT = """TITLE SPECIALIST (YouTube Shorts / Reels / TikTok — this is the feed title, not a chapter heading):
 You write titles the way a growth editor writes Shorts titles: scroll-stopping, specific, emotional, and easy to read in under 1 second.
 - The title must SELL the clip. Lead with the claim, provocation, contradiction, or curiosity gap — never with a neutral topic label.
 - Ideal length: ~40–70 characters. Hard max ~80. Cut filler words.
@@ -84,23 +91,96 @@ Bad → Good examples (Portuguese):
 - BAD: "Cassius Ogrus: a verdade sobre as vacinas" → GOOD: "Proibir falar de vacina é pior que mentir"
 - BAD: "Cassius Ogrus: o papel da comédia na vida das pessoas" → GOOD: "Meu humor fez gente rir de novo na depressão"
 - BAD: "Cassius Ogrus: O que é sucesso?" → GOOD: "Sucesso pra mim é ter família — ponto"
+"""
 
-{cast_block}
+TITLE_SPECIALIST_LONG = """TITLE SPECIALIST (YouTube mid-form 3–10 min — upload title, not a chapter label):
+You write titles that sell a self-contained segment: curiosity + substance, readable in under 2 seconds.
+- Lead with the claim, conflict, or curiosity gap — never a neutral topic label.
+- Ideal length: ~45–85 characters. Hard max ~100.
+- Prefer concrete language from the clip over abstract themes.
+- Patterns that FAIL (never use): "Nome: tema genérico", "Nome fala sobre X", "o papel de X", "a importância de X", essay/chapter titles.
+- Do NOT start every title with the speaker name. Put the person in attributed_to.
+- Each title must be UNIQUE across the batch.
+- Title and hook_sentence are different jobs: title = thumbnail/feed bait; hook_sentence = first spoken line.
+- When KNOWN SPEAKERS are provided, fill attributed_to (prefer guests over hosts). Never invent names outside the list.
 
-Respond ONLY with valid JSON (no markdown, no explanation):
-{{"highlights":[{{"title":"string","start_time":float,"end_time":float,"hook_start_time":float,"score":int,"hook_sentence":"string","virality_reason":"string","attributed_to":"string"}}]}}"""
+Bad → Good examples (Portuguese):
+- BAD: "Kim Kataguiri: emendas parlamentares" → GOOD: "Orçamento secreto: por que o Centrão não larga o osso"
+- BAD: "Debate sobre letalidade policial" → GOOD: "Bandido negro atirando: ele responde sem filtro"
+"""
+
+DURATION_RULES_SHORT = """- HARD duration rule: every clip MUST be between 45 and 90 seconds. Prefer ~60s. Never return a hook-only snippet.
+- Go longer (91-180s) ONLY when a story arc needs full context to land. Never go under 45 seconds."""
+
+DURATION_RULES_LONG = """- HARD duration rule: every clip MUST be between 180 and 600 seconds (3–10 minutes). Prefer ~5–6 minutes (~300–360s).
+- Never return a short hook snippet or a sub-3-minute tease — each clip is a full mid-form segment with setup, development, and payoff.
+- Go toward 8–10 minutes ONLY when the topic genuinely needs that arc. Never go under 180 seconds."""
 
 
-CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long videos
-LONG_VIDEO_THRESHOLD = 1800     # chunk videos longer than 30 min
+CHUNK_SIZE_SECONDS = 1200       # 20-min chunks for long source videos
+LONG_VIDEO_THRESHOLD = 1800     # chunk sources longer than 30 min
 CHUNK_OVERLAP_SECONDS = 60
 GPT_CALL_TIMEOUT_SECONDS = 300  # cap LLM polls at 5 min — a wedged call should fail fast
 MAX_HIGHLIGHT_API_ATTEMPTS = 3
 
-# Enforce complete-context clips even when the LLM returns a hook-only window.
+# Default = short-form (back-compat aliases)
 MIN_CLIP_SECONDS = 45.0
 TARGET_CLIP_SECONDS = 65.0
 MAX_CLIP_SECONDS = 180.0
+
+CLIP_LENGTH_SHORT = "short"
+CLIP_LENGTH_LONG = "long"
+DEFAULT_CLIP_LENGTH = CLIP_LENGTH_SHORT
+
+CLIP_LENGTH_PRESETS: Dict[str, Dict] = {
+    CLIP_LENGTH_SHORT: {
+        "id": CLIP_LENGTH_SHORT,
+        "min_seconds": 45.0,
+        "target_seconds": 65.0,
+        "max_seconds": 180.0,
+        "prefer_hi": 90.0,
+        "seconds_per_clip_hint": 90.0,
+        "max_natural": 8,
+        "max_natural_chunk": 5,
+        "editor_role": (
+            "an elite short-form video editor who has studied thousands of viral "
+            "clips on TikTok, Instagram Reels, and YouTube Shorts. You know exactly "
+            "what makes viewers stop scrolling, watch to the end, and share."
+        ),
+        "duration_rules": DURATION_RULES_SHORT,
+        "title_specialist": TITLE_SPECIALIST_SHORT,
+        "retry_duration_label": "45–90 seconds (up to 180s only if the arc needs it)",
+    },
+    CLIP_LENGTH_LONG: {
+        "id": CLIP_LENGTH_LONG,
+        "min_seconds": 180.0,
+        "target_seconds": 360.0,
+        "max_seconds": 600.0,
+        "prefer_hi": 480.0,
+        "seconds_per_clip_hint": 360.0,
+        "max_natural": 6,
+        "max_natural_chunk": 3,
+        "editor_role": (
+            "an elite YouTube editor who cuts long interviews/podcasts into "
+            "self-contained 3–10 minute mid-form videos that retain viewers "
+            "and stand alone without the full episode."
+        ),
+        "duration_rules": DURATION_RULES_LONG,
+        "title_specialist": TITLE_SPECIALIST_LONG,
+        "retry_duration_label": "180–600 seconds (3–10 minutes; prefer ~5–6 min)",
+    },
+}
+
+
+def normalize_clip_length(value: Optional[str]) -> str:
+    raw = (value or DEFAULT_CLIP_LENGTH).strip().lower()
+    if raw in ("long", "longo", "mid", "midform", "mid-form", "3-10", "3–10"):
+        return CLIP_LENGTH_LONG
+    return CLIP_LENGTH_SHORT
+
+
+def clip_length_preset(clip_length: Optional[str] = None) -> Dict:
+    return CLIP_LENGTH_PRESETS[normalize_clip_length(clip_length)]
 
 
 def call_muapi_llm(prompt: str) -> str:
@@ -646,7 +726,12 @@ def expand_highlights_to_context(
     highlights: List[Dict],
     transcript: Dict,
     hook_in_first_seconds: float = DEFAULT_HOOK_IN_FIRST_SECONDS,
+    clip_length: Optional[str] = None,
 ) -> List[Dict]:
+    preset = clip_length_preset(clip_length)
+    min_seconds = float(preset["min_seconds"])
+    target_seconds = float(preset["target_seconds"])
+    max_seconds = float(preset["max_seconds"])
     segments = transcript.get("segments") or []
     duration = float(transcript.get("duration") or (segments[-1]["end"] if segments else 0))
     words = _flatten_words(segments, transcript.get("words") or [])
@@ -657,15 +742,18 @@ def expand_highlights_to_context(
             h,
             segments,
             duration,
+            min_seconds=min_seconds,
+            target_seconds=target_seconds,
+            max_seconds=max_seconds,
             words=words,
             hook_in_first_seconds=hook_in_first_seconds,
         )
         after = float(e["end_time"]) - float(e["start_time"])
         hook_delay = float(e.get("hook_start_time", e["start_time"])) - float(e["start_time"])
-        if after < MIN_CLIP_SECONDS - 0.5:
+        if after < min_seconds - 0.5:
             print(
                 f"[highlights] drop too-short after expand: {before:.1f}s → {after:.1f}s "
-                f"({e.get('title', '')!r})",
+                f"(need ≥{min_seconds:.0f}s) ({e.get('title', '')!r})",
                 flush=True,
             )
             continue
@@ -711,16 +799,24 @@ def build_transcript_text(transcript: Dict, offset: float = 0.0) -> str:
     )
 
 
-def chunk_transcript(transcript: Dict) -> List[Dict]:
+def chunk_transcript(
+    transcript: Dict,
+    *,
+    chunk_size: float = CHUNK_SIZE_SECONDS,
+    overlap: float = CHUNK_OVERLAP_SECONDS,
+) -> List[Dict]:
     segments = transcript.get("segments", [])
     duration = transcript.get("duration", segments[-1]["end"] if segments else 0)
+    chunk_size = max(60.0, float(chunk_size))
+    overlap = max(0.0, min(float(overlap), chunk_size * 0.5))
+    step = max(30.0, chunk_size - overlap)
     chunks = []
-    start = 0
+    start = 0.0
     while start < duration:
-        end = min(start + CHUNK_SIZE_SECONDS, duration)
+        end = min(start + chunk_size, duration)
         chunk_segs = [
             s for s in segments
-            if s["start"] >= start and s["end"] <= end + CHUNK_OVERLAP_SECONDS
+            if s["start"] >= start and s["end"] <= end + overlap
         ]
         if chunk_segs:
             chunk = dict(transcript)
@@ -728,27 +824,49 @@ def chunk_transcript(transcript: Dict) -> List[Dict]:
             chunk["duration"] = end - start
             chunk["_offset"] = start
             chunks.append(chunk)
-        start += CHUNK_SIZE_SECONDS - CHUNK_OVERLAP_SECONDS
+        if end >= duration:
+            break
+        start += step
     return chunks
 
 
-def _num_clips_instruction(num_clips: Optional[int], duration: float, is_chunk: bool) -> str:
+def _chunk_params_for_clip_length(clip_length: Optional[str]) -> tuple:
+    """Wider windows + more overlap so 3–10 min arcs aren't split across chunks."""
+    if normalize_clip_length(clip_length) == CLIP_LENGTH_LONG:
+        return 1800.0, 360.0  # 30-min windows, 6-min overlap
+    return float(CHUNK_SIZE_SECONDS), float(CHUNK_OVERLAP_SECONDS)
+
+
+def _num_clips_instruction(
+    num_clips: Optional[int],
+    duration: float,
+    is_chunk: bool,
+    clip_length: Optional[str] = None,
+) -> str:
     """How many highlights to ask the model for.
 
     When ``num_clips`` is None the model decides from content density/length
     (used by the interactive web picker). Otherwise ask for ~2× the CLI target.
     """
-    natural = max(2 if is_chunk else 3, int(float(duration or 0) / 90))
+    preset = clip_length_preset(clip_length)
+    hint = float(preset["seconds_per_clip_hint"])
+    max_natural = int(preset["max_natural_chunk"] if is_chunk else preset["max_natural"])
+    natural = max(2 if is_chunk else 3, int(float(duration or 0) / hint))
     if num_clips is None:
-        aim = min(natural, 8 if not is_chunk else 5)
+        aim = min(natural, max_natural)
+        kind = (
+            "self-contained mid-form segments (3–10 min)"
+            if preset["id"] == CLIP_LENGTH_LONG
+            else "viral short-form topics"
+        )
         return (
-            f"Identify EVERY distinct viral-worthy topic in this transcript. "
+            f"Identify EVERY distinct {kind} in this transcript. "
             f"Return as many as the content genuinely supports "
             f"(typically around {aim}; more if dense). "
             "Do not invent weak filler clips — only real standout moments."
         )
     target = max(int(num_clips) * 2, 5)
-    min_clips = min(target, natural, 8)
+    min_clips = min(target, natural, max_natural)
     return f"Generate at least {min_clips} highlights"
 
 
@@ -762,13 +880,21 @@ def call_highlight_api(
     output_language: str = "Brazilian Portuguese (pt-BR)",
     cast_block: str = "",
     virality_profile: Optional[Dict] = None,
+    clip_length: Optional[str] = None,
 ) -> Dict:
     profile = normalize_virality_profile(virality_profile)
+    preset = clip_length_preset(clip_length)
     system = HIGHLIGHT_SYSTEM_PROMPT.format(
+        editor_role=preset["editor_role"],
         virality_criteria=build_virality_criteria(profile),
         content_type=content_info.get("content_type", "other"),
         density=content_info.get("density", "medium"),
-        num_clips_instruction=_num_clips_instruction(num_clips, duration, is_chunk),
+        clip_length=preset["id"],
+        duration_rules=preset["duration_rules"],
+        title_specialist=preset["title_specialist"],
+        num_clips_instruction=_num_clips_instruction(
+            num_clips, duration, is_chunk, clip_length=preset["id"]
+        ),
         output_language=output_language,
         cast_block=cast_block or "",
         profile_block=build_profile_prompt_block(profile),
@@ -777,6 +903,8 @@ def call_highlight_api(
     prompt = base_prompt
     last_error = "unknown"
     hook_s = profile["hook_in_first_seconds"]
+    min_s = int(preset["min_seconds"])
+    prefer_hi = int(preset["prefer_hi"])
 
     for attempt in range(1, MAX_HIGHLIGHT_API_ATTEMPTS + 1):
         raw = llm_fn(prompt)
@@ -813,11 +941,12 @@ def call_highlight_api(
                 + "\n\nIMPORTANT: Return ONLY valid JSON with a top-level 'highlights' array."
                 + " Each item must include: title, start_time, end_time, hook_start_time, score, hook_sentence, virality_reason, attributed_to."
                 + f" Timestamps must be relative to THIS transcript window (0 to {duration:.1f} seconds)."
-                + f" EVERY clip duration (end_time - start_time) MUST be {int(MIN_CLIP_SECONDS)}–90 seconds"
+                + f" EVERY clip duration (end_time - start_time) MUST be {preset['retry_duration_label']}"
+                + f" (hard range {min_s}–{int(preset['max_seconds'])}s; prefer up to ~{prefer_hi}s)"
                 + " and cover hook + claim + payoff — never a single hook sentence."
                 + f" hook_start_time - start_time MUST be ≤ {hook_s:.1f} seconds (hook opens the clip)."
                 + f" title, hook_sentence, and virality_reason MUST be written in {output_language}."
-                + " Titles must be viral Shorts titles (claim/curiosity), NEVER 'Name: generic topic'."
+                + " Titles must sell the clip (claim/curiosity), NEVER 'Name: generic topic'."
                 + " Put the speaker in attributed_to, not as a boring title prefix."
                 + " No markdown fences, no commentary."
             )
@@ -875,6 +1004,7 @@ def get_highlights(
     output_language: Optional[str] = None,
     speakers: Optional[List[Dict]] = None,
     virality_profile: Optional[Dict] = None,
+    clip_length: Optional[str] = None,
 ) -> Dict:
     """Main entry point — returns {highlights: [...]} sorted by score.
 
@@ -884,6 +1014,7 @@ def get_highlights(
     Pass ``num_clips=None`` to let the model decide how many topics to return.
     `speakers` — named cast roster for title attribution (from cast.py).
     `virality_profile` — per-channel editor taste (see virality.py).
+    `clip_length` — ``short`` (45–90s Shorts) or ``long`` (3–10 min mid-form).
     """
     from .cast import cast_context_block
     from .config import language_label, resolve_content_language
@@ -896,10 +1027,19 @@ def get_highlights(
     cast_block = cast_context_block(cast_speakers) if cast_speakers else ""
     profile = normalize_virality_profile(virality_profile)
     hook_s = float(profile["hook_in_first_seconds"])
+    preset = clip_length_preset(clip_length)
+    clip_len = preset["id"]
     content_info = detect_content_type(transcript, llm_fn=llm_fn)
+    if float(duration or 0) < float(preset["min_seconds"]):
+        raise RuntimeError(
+            f"Fonte tem {float(duration or 0):.0f}s — insuficiente para clip_length={clip_len} "
+            f"(mínimo {preset['min_seconds']:.0f}s por corte)."
+        )
     print(
         f"[highlights] content={content_info.get('content_type')} "
         f"density={content_info.get('density')} duration={duration:.0f}s "
+        f"clip_length={clip_len} "
+        f"({preset['min_seconds']:.0f}–{preset['max_seconds']:.0f}s) "
         f"output_lang={lang_code} speakers={len(cast_speakers)} "
         f"hook_first≤{hook_s:.1f}s",
         flush=True,
@@ -912,11 +1052,17 @@ def get_highlights(
         output_language=lang_label,
         cast_block=cast_block,
         virality_profile=profile,
+        clip_length=clip_len,
     )
 
     if duration >= LONG_VIDEO_THRESHOLD:
-        chunks = chunk_transcript(transcript)
-        print(f"[highlights] long video — splitting into {len(chunks)} chunks", flush=True)
+        chunk_size, overlap = _chunk_params_for_clip_length(clip_len)
+        chunks = chunk_transcript(transcript, chunk_size=chunk_size, overlap=overlap)
+        print(
+            f"[highlights] long source — splitting into {len(chunks)} chunks "
+            f"(size={chunk_size:.0f}s overlap={overlap:.0f}s)",
+            flush=True,
+        )
         all_highlights: List[Dict] = []
         for i, chunk in enumerate(chunks):
             offset = float(chunk.get("_offset", 0) or 0)
@@ -936,7 +1082,10 @@ def get_highlights(
                     h["hook_start_time"] = float(h["hook_start_time"]) + offset
                 all_highlights.append(h)
         highlights = expand_highlights_to_context(
-            all_highlights, transcript, hook_in_first_seconds=hook_s
+            all_highlights,
+            transcript,
+            hook_in_first_seconds=hook_s,
+            clip_length=clip_len,
         )
         highlights = dedupe_highlights(highlights)
     else:
@@ -950,17 +1099,19 @@ def get_highlights(
             result.get("highlights", []),
             transcript,
             hook_in_first_seconds=hook_s,
+            clip_length=clip_len,
         )
         highlights = dedupe_highlights(highlights)
 
     if not highlights:
         raise RuntimeError(
-            f"No highlights left after enforcing min duration ({MIN_CLIP_SECONDS:.0f}s) "
-            "and complete-context expansion."
+            f"No highlights left after enforcing min duration "
+            f"({preset['min_seconds']:.0f}s) and complete-context expansion."
         )
 
     return {
         "highlights": highlights,
         "content_type": content_info.get("content_type") or "other",
         "density": content_info.get("density") or "medium",
+        "clip_length": clip_len,
     }

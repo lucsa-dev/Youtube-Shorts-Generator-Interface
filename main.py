@@ -35,6 +35,12 @@ def main() -> int:
         default=None,
         help="Content language for Whisper + titles/hooks (e.g. pt, en). Default: CONTENT_LANGUAGE from .env (pt)",
     )
+    parser.add_argument(
+        "--clip-length",
+        choices=["short", "long"],
+        default="short",
+        help="short = Shorts 45–90s (default); long = mid-form 3–10 min",
+    )
     parser.add_argument("--output-json", default=None, help="Write the full result JSON to this path")
     args = parser.parse_args()
 
@@ -46,6 +52,7 @@ def main() -> int:
             download_format=args.format,
             language=args.language,
             mode=args.mode,
+            clip_length=args.clip_length,
         )
     except Exception as e:
         print(f"\nFAILED: {e}", file=sys.stderr)
