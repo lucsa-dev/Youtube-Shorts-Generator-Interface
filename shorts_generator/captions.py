@@ -16,16 +16,16 @@ from typing import Any, Dict, List, Optional, Sequence
 THEMES: Dict[str, Dict[str, Any]] = {
     "bold-white": {
         "label": "Branco bold",
-        "font_name": "Arial Black",
-        "font_size": 72,
+        "font_name": "DejaVu Sans",
+        "font_size": 100,
         "primary_colour": "&H0000FFFF",  # yellow highlight (karaoke fill)
         "secondary_colour": "&H00FFFFFF",  # white waiting
         "outline_colour": "&H00000000",
         "back_colour": "&H80000000",
         "bold": True,
-        "outline": 4,
+        "outline": 20,
         "shadow": 0,
-        "margin_v": 160,
+        "margin_v": 610,  # default vertical pos for 9:16 shorts
         "max_words_per_line": 4,
     },
     "yellow-pop": {
@@ -124,6 +124,69 @@ def resolve_style(raw: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     style["enabled"] = bool(style.get("enabled", True))
     style["uppercase"] = bool(style.get("uppercase", True))
     return style
+
+
+def normalize_caption_aspect(aspect_ratio: Optional[str] = None) -> str:
+    raw = (aspect_ratio or "9:16").strip()
+    return "16:9" if raw == "16:9" else "9:16"
+
+
+# Vertical position defaults: high on shorts, lower on landscape.
+DEFAULT_MARGIN_V = {"9:16": 610, "16:9": 160}
+
+
+def resolve_style_for_aspect(
+    params: Optional[Dict[str, Any]] = None,
+    aspect_ratio: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Pick karaoke style for an aspect; prefer caption_styles[aspect].
+
+    Falls back to legacy singular ``caption_style``, then theme default.
+    When the chosen raw style omits ``margin_v``, apply the aspect default
+    (610 for 9:16 shorts, 160 for 16:9).
+    """
+    params = params or {}
+    aspect = normalize_caption_aspect(
+        aspect_ratio if aspect_ratio is not None else params.get("aspect_ratio")
+    )
+    raw: Optional[Dict[str, Any]] = None
+    by_aspect = params.get("caption_styles")
+    if isinstance(by_aspect, dict):
+        candidate = by_aspect.get(aspect)
+        if isinstance(candidate, dict):
+            raw = candidate
+    if raw is None:
+        legacy = params.get("caption_style")
+        raw = legacy if isinstance(legacy, dict) else None
+    style = resolve_style(raw)
+    if not isinstance(raw, dict) or raw.get("margin_v") is None:
+        style["margin_v"] = DEFAULT_MARGIN_V.get(aspect, 160)
+    return style
+
+
+def merge_caption_styles(
+    existing: Optional[Dict[str, Any]] = None,
+    updates: Optional[Dict[str, Any]] = None,
+    *,
+    active_aspect: Optional[str] = None,
+    active_style: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """Resolve and merge per-aspect karaoke styles (only 9:16 / 16:9)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    if isinstance(existing, dict):
+        for key in ("9:16", "16:9"):
+            raw = existing.get(key)
+            if isinstance(raw, dict):
+                out[key] = resolve_style(raw)
+    if isinstance(updates, dict):
+        for key in ("9:16", "16:9"):
+            raw = updates.get(key)
+            if isinstance(raw, dict):
+                out[key] = resolve_style(raw)
+    if active_style is not None:
+        aspect = normalize_caption_aspect(active_aspect)
+        out[aspect] = resolve_style(active_style)
+    return out
 
 
 def _ass_ts(seconds: float) -> str:
@@ -235,15 +298,39 @@ def words_from_transcript(
     return _sanitize_words(words)
 
 
+_SPEAKER_MARK_RE = re.compile(r"^>+\s*")
+
+# Push / fade motion (ms + design-canvas px). Keep in sync with web preview CSS.
+CAPTION_FADE_IN_MS = 200
+CAPTION_FADE_OUT_MS = 180
+CAPTION_SLIDE_PX = 52
+
+
+def _clean_word_token(text: str) -> str:
+    """Strip YouTube speaker markers (>>) and empty husks."""
+    token = _SPEAKER_MARK_RE.sub("", str(text or "")).strip()
+    if token in (">>", ">", "->", "-->"):
+        return ""
+    return token
+
+
 def _sanitize_words(words: Sequence[Dict[str, float | str]]) -> List[Dict[str, float | str]]:
     cleaned: List[Dict[str, float | str]] = []
     for w in words:
+        token = _clean_word_token(str(w.get("word") or ""))
+        if not token:
+            continue
         start = float(w["start"])
         end = float(w["end"])
         if end <= start:
             end = start + 0.08
-        cleaned.append({"start": start, "end": end, "word": str(w["word"])})
+        cleaned.append({"start": start, "end": end, "word": token})
     cleaned.sort(key=lambda x: float(x["start"]))
+    # Clamp overlaps so Dialogue events never stack (YouTube rolling cues).
+    for i in range(len(cleaned) - 1):
+        nxt = float(cleaned[i + 1]["start"])
+        if float(cleaned[i]["end"]) > nxt:
+            cleaned[i]["end"] = max(float(cleaned[i]["start"]) + 0.04, nxt)
     return cleaned
 
 
@@ -266,6 +353,22 @@ def _chunk_words(
     return chunks
 
 
+def _line_window(
+    chunks: Sequence[Sequence[Dict[str, float | str]]], index: int
+) -> tuple[float, float]:
+    """Visible window: from first word until the next line pushes this one out."""
+    chunk = chunks[index]
+    line_start = float(chunk[0]["start"])
+    if index + 1 < len(chunks):
+        line_end = float(chunks[index + 1][0]["start"])
+    else:
+        line_end = float(chunk[-1]["end"])
+    min_dur = (CAPTION_FADE_IN_MS + CAPTION_FADE_OUT_MS) / 1000.0 + 0.05
+    if line_end <= line_start:
+        line_end = line_start + min_dur
+    return line_start, line_end
+
+
 def build_ass(
     words: Sequence[Dict[str, float | str]],
     style: Dict[str, Any],
@@ -275,8 +378,8 @@ def build_ass(
 ) -> str:
     """Build karaoke ASS: each line uses \\k tags (centiseconds).
 
-    Style numeric fields are authored for DESIGN_PLAY_RES (1080×1920), matching
-    the web preview. Pass that PlayRes so libass scales to the real clip size.
+    Lines fade/slide up from below and stay until the next line starts
+    (push). Style numeric fields are authored for DESIGN_PLAY_RES (1080×1920).
     """
     style = resolve_style(style)
     bold = -1 if style["bold"] else 0
@@ -305,11 +408,21 @@ Style: Karaoke,{font},{int(style['font_size'])},{style['primary_colour']},{style
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
     lines = [header]
-    for chunk in _chunk_words(words, max_w):
-        line_start = float(chunk[0]["start"])
-        line_end = float(chunk[-1]["end"])
-        if line_end <= line_start:
-            line_end = line_start + 0.2
+    # Alignment 2 (bottom-center): resting point is mid-X, PlayResY - MarginV.
+    cx = int(round(play_res_x / 2))
+    y_rest = max(0, int(play_res_y) - int(margin_v))
+    y_from = y_rest + CAPTION_SLIDE_PX
+
+    chunks = _chunk_words(words, max_w)
+    for i, chunk in enumerate(chunks):
+        line_start, line_end = _line_window(chunks, i)
+        dur_ms = max(1, int(round((line_end - line_start) * 1000)))
+        fade_in = min(CAPTION_FADE_IN_MS, max(40, dur_ms // 3))
+        fade_out = min(CAPTION_FADE_OUT_MS, max(40, dur_ms // 3))
+        if fade_in + fade_out >= dur_ms:
+            fade_in = max(30, dur_ms // 3)
+            fade_out = max(30, dur_ms - fade_in - 10)
+
         parts: List[str] = []
         for w in chunk:
             dur_cs = max(1, int(round((float(w["end"]) - float(w["start"])) * 100)))
@@ -317,7 +430,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             if uppercase:
                 token = token.upper()
             parts.append(f"{{\\k{dur_cs}}}{_escape_ass_text(token)}")
-        text = " ".join(parts)
+        # One \\move (entrance). Exit is fade-out; next line's slide-in creates the push.
+        motion = (
+            f"{{\\fad({fade_in},{fade_out})"
+            f"\\move({cx},{y_from},{cx},{y_rest},0,{fade_in})}}"
+        )
+        text = motion + " ".join(parts)
         lines.append(
             f"Dialogue: 0,{_ass_ts(line_start)},{_ass_ts(line_end)},Karaoke,,0,0,0,,{text}\n"
         )
