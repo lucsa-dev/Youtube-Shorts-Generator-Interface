@@ -6,6 +6,9 @@ Two modes:
   * mode="local"            — yt-dlp + faster-whisper + OpenAI or Gemini + ffmpeg/opencv.
                               Self-hosted, LLM_PROVIDER selects OpenAI or Gemini.
 
+Transcription prefers free YouTube captions (manual/auto) when
+PREFER_YOUTUBE_CAPTIONS is on, then falls back to Whisper (MuAPI or local).
+
 The web UI runs analysis in stages so the user can name speakers, then pick
 which highlights to render. CLI still runs the full pipeline in one shot
 (auto-accepting suggested speaker names).
@@ -22,10 +25,16 @@ from .cast import (
     label_transcript_speakers,
 )
 from .clipper import crop_highlights
-from .config import LOCAL_OUTPUT_DIR, normalize_language, resolve_content_language
+from .config import (
+    LOCAL_OUTPUT_DIR,
+    PREFER_YOUTUBE_CAPTIONS,
+    normalize_language,
+    resolve_content_language,
+)
 from .downloader import download_youtube
 from .highlights import call_muapi_llm, get_highlights, snippet_for_range
 from .transcriber import transcribe
+from .youtube_captions import try_youtube_captions
 
 
 def _source_folder_slug(analysis: Dict) -> str:
@@ -104,19 +113,26 @@ def prepare_video(
     whisper_lang = normalize_language(language)
     llm_fn = _llm_for_mode(mode)
 
+    transcript = None
+    if PREFER_YOUTUBE_CAPTIONS:
+        transcript = try_youtube_captions(youtube_url, language=whisper_lang)
+
     if mode == "local":
         from .local.downloader import download_youtube_local
         from .local.transcriber import transcribe_local
 
         source = download_youtube_local(youtube_url, fmt=download_format)
-        transcript = transcribe_local(source, language=whisper_lang)
+        if transcript is None:
+            transcript = transcribe_local(source, language=whisper_lang)
     else:
         source = download_youtube(youtube_url, fmt=download_format)
-        transcript = transcribe(source, language=whisper_lang)
+        if transcript is None:
+            transcript = transcribe(source, language=whisper_lang)
 
-    if not transcript.get("segments"):
+    if not transcript or not transcript.get("segments"):
         raise RuntimeError(
-            "Whisper produced no segments. The video may have no detectable speech."
+            "No transcript segments (YouTube captions + Whisper both empty). "
+            "The video may have no captions and no detectable speech."
         )
 
     metadata = fetch_source_metadata(youtube_url)
@@ -151,6 +167,7 @@ def finalize_analysis(
     num_clips: Optional[int] = None,
     language: Optional[str] = None,
     virality_profile: Optional[Dict] = None,
+    clip_length: Optional[str] = None,
 ) -> Dict:
     """Label transcript with confirmed names (optional) and rank highlights."""
     mode = (prepared.get("mode") or "api").lower()
@@ -197,13 +214,18 @@ def finalize_analysis(
         output_language=output_lang,
         speakers=named,
         virality_profile=virality_profile,
+        clip_length=clip_length or prepared.get("clip_length"),
     )
     all_highlights: List[Dict] = highlights_result.get("highlights", [])
     if not all_highlights:
         raise RuntimeError("Highlight generator returned zero clips.")
 
     enriched = _enrich_highlights(all_highlights, transcript)
-    print(f"[pipeline] analysis done — {len(enriched)} topics", flush=True)
+    clip_len = highlights_result.get("clip_length") or "short"
+    print(
+        f"[pipeline] analysis done — {len(enriched)} topics (clip_length={clip_len})",
+        flush=True,
+    )
 
     return {
         "mode": mode,
@@ -215,6 +237,7 @@ def finalize_analysis(
         "speakers": named or candidates,
         "content_type": highlights_result.get("content_type") or "other",
         "density": highlights_result.get("density") or "medium",
+        "clip_length": clip_len,
         "highlights": enriched,
         "shorts": [],
     }
@@ -333,6 +356,7 @@ def _run_full(
     download_format: str,
     language: Optional[str],
     mode: str,
+    clip_length: Optional[str] = None,
 ) -> Dict:
     prepared = prepare_video(
         youtube_url,
@@ -346,6 +370,7 @@ def _run_full(
         skip_cast=False,
         num_clips=None,
         language=language,
+        clip_length=clip_length,
     )
     all_highlights = analysis["highlights"]
     top = sorted(all_highlights, key=lambda h: int(h.get("score", 0)), reverse=True)[:num_clips]
@@ -360,6 +385,7 @@ def generate_shorts(
     download_format: str = "720",
     language: Optional[str] = None,
     mode: str = "api",
+    clip_length: Optional[str] = None,
 ) -> Dict:
     """Run the full pipeline and return a structured result.
 
@@ -373,6 +399,7 @@ def generate_shorts(
             Pass "auto" to let Whisper detect; LLM still uses CONTENT_LANGUAGE.
         mode: "api" (default, MuAPI) or "local" (yt-dlp + faster-whisper +
             OpenAI or Gemini + ffmpeg).
+        clip_length: "short" (45–90s Shorts) or "long" (3–10 min mid-form).
 
     Returns:
         {
@@ -392,5 +419,11 @@ def generate_shorts(
     if mode not in ("api", "local"):
         raise ValueError(f"Unknown mode: {mode!r}. Use 'api' or 'local'.")
     return _run_full(
-        youtube_url, num_clips, aspect_ratio, download_format, language, mode
+        youtube_url,
+        num_clips,
+        aspect_ratio,
+        download_format,
+        language,
+        mode,
+        clip_length=clip_length,
     )

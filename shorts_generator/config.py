@@ -44,15 +44,80 @@ OPENAI_IMAGE_FIDELITY = (
     if _OPENAI_IMAGE_FIDELITY in ("low", "high", "none", "off")
     else "low"
 )
-# hybrid = IA gera cena/rostos sem texto; tipografia + moldura em PIL (recomendado)
+# hybrid legado — tipografia + moldura sempre em PIL no fluxo atual
 THUMBNAIL_HYBRID = os.getenv("THUMBNAIL_HYBRID", "true").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
+# frame/cutout = frame original do locutor + overlay local (sem fundo IA)
+# ai = legado; tratado como frame
+_THUMBNAIL_MODE = (
+    os.getenv("THUMBNAIL_MODE", "frame").strip().strip("'\"").lower() or "frame"
+)
+THUMBNAIL_MODE = (
+    _THUMBNAIL_MODE if _THUMBNAIL_MODE in ("cutout", "ai", "frame") else "frame"
+)
+# Shared palette for thumbnail border gradient + per-word hook text fills (comma-separated hex).
+DEFAULT_THUMBNAIL_PALETTE = "#FF28B4,#FF7828,#FFDC28,#28DCFF,#A03CFF"
+THUMBNAIL_PALETTE = (
+    os.getenv("THUMBNAIL_PALETTE", DEFAULT_THUMBNAIL_PALETTE).strip().strip("'\"")
+    or DEFAULT_THUMBNAIL_PALETTE
+)
+
+
+def parse_thumbnail_palette(raw: str | None = None) -> list[tuple[int, int, int]]:
+    """Parse ``#RRGGBB,#RRGGBB,…`` into RGB tuples; falls back to the default palette."""
+    import re
+
+    _FALLBACK = [
+        (255, 40, 180),
+        (255, 120, 40),
+        (255, 220, 40),
+        (40, 220, 255),
+        (160, 60, 255),
+    ]
+    text = (raw if raw is not None else THUMBNAIL_PALETTE) or ""
+    text = str(text).strip().strip("'\"")
+    colors: list[tuple[int, int, int]] = []
+    for part in re.split(r"[,;\s]+", text):
+        token = part.strip().lstrip("#")
+        if len(token) == 3 and all(c in "0123456789abcdefABCDEF" for c in token):
+            token = "".join(c * 2 for c in token)
+        if len(token) != 6:
+            continue
+        try:
+            colors.append(
+                (int(token[0:2], 16), int(token[2:4], 16), int(token[4:6], 16))
+            )
+        except ValueError:
+            continue
+    if colors:
+        return colors
+    if raw is not None and str(raw).strip() and str(raw).strip() != DEFAULT_THUMBNAIL_PALETTE:
+        return parse_thumbnail_palette(DEFAULT_THUMBNAIL_PALETTE)
+    return list(_FALLBACK)
+
+
+def format_thumbnail_palette(colors: list[tuple[int, int, int]] | None = None) -> str:
+    """Serialize RGB tuples (or current config) as ``#RRGGBB,#RRGGBB,…``."""
+    if colors is None:
+        colors = parse_thumbnail_palette()
+    return ",".join(f"#{r:02X}{g:02X}{b:02X}" for r, g, b in colors)
+# openai | gemini | auto (tenta OpenAI; se billing/quota → Gemini)
+_IMAGE_PROVIDER = (
+    os.getenv("IMAGE_PROVIDER", "auto").strip().strip("'\"").lower() or "auto"
+)
+IMAGE_PROVIDER = (
+    _IMAGE_PROVIDER if _IMAGE_PROVIDER in ("openai", "gemini", "auto") else "auto"
+)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_IMAGE_MODEL = (
+    os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip().strip("'\"")
+    or "gemini-2.5-flash-image"
+)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai").strip().lower()
 LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "base")
 LOCAL_WHISPER_DEVICE = os.getenv("LOCAL_WHISPER_DEVICE", "auto")  # auto / cpu / cuda
@@ -72,6 +137,15 @@ CLIP_START_LEAD_IN_MAX = max(
 # Content language: Whisper recognition + titles/hooks/descriptions from the LLM.
 # ISO-639-1 code. Default Brazilian Portuguese.
 CONTENT_LANGUAGE = os.getenv("CONTENT_LANGUAGE", "pt").strip().lower() or "pt"
+
+# Prefer free YouTube captions (manual/auto) before Whisper when the source is a
+# YouTube URL. Falls back to MuAPI Whisper / faster-whisper if missing or thin.
+PREFER_YOUTUBE_CAPTIONS = os.getenv("PREFER_YOUTUBE_CAPTIONS", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 LANGUAGE_OPTIONS = [
     ("pt", "Português (Brasil)"),

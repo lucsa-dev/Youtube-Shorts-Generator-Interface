@@ -9,3 +9,8 @@ google-api-python-client>=2.100
 google-auth>=2.25
 google-auth-oauthlib>=1.2
 openai>=1.40.0
+yt-dlp>=2024.1.1
+opencv-python-headless>=4.8
+# Optional: better person matting for cutout thumbnails (falls back to Haar mask)
+# rembg>=2.0
+# onnxruntime>=1.16
