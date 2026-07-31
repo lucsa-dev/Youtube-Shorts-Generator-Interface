@@ -342,9 +342,14 @@ def fetch_cited_portraits(
             hint=str(item.get("hint") or "").strip(),
         )
         if not meta:
+            print(f"[wiki] sem página/imagem para {name!r}", flush=True)
             continue
         dest = dest_dir / f"{_slug(name)}.jpg"
         if dest.exists() and dest.stat().st_size > 0:
+            print(
+                f"[wiki] cache hit: {name!r} → {dest.name} ({meta.get('page_url')})",
+                flush=True,
+            )
             out.append(
                 {
                     "name": name,
@@ -354,6 +359,10 @@ def fetch_cited_portraits(
                 }
             )
             continue
+        print(
+            f"[wiki] download: {name!r} ← {meta.get('image_url')}",
+            flush=True,
+        )
         if download_image(meta["image_url"], dest):
             out.append(
                 {
@@ -363,4 +372,10 @@ def fetch_cited_portraits(
                     "title": meta["title"],
                 }
             )
+            print(
+                f"[wiki] salvo: {name!r} → {dest.name} ({meta.get('page_url')})",
+                flush=True,
+            )
+        else:
+            print(f"[wiki] download falhou: {name!r}", flush=True)
     return out

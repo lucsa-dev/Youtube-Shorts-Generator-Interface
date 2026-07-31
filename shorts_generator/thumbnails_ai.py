@@ -1,4 +1,4 @@
-"""AI thumbnail generation — cost-optimized (mini model + hybrid PIL overlay)."""
+"""Thumbnail generation — speaker frame + local PIL overlay (no image-model BG)."""
 from __future__ import annotations
 
 import base64
@@ -9,12 +9,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .config import (
-    OPENAI_IMAGE_FIDELITY,
-    OPENAI_IMAGE_MODEL,
-    OPENAI_IMAGE_QUALITY,
-    THUMBNAIL_HYBRID,
+    require_gemini_key,
     require_openai_key,
 )
+from . import config as _cfg
 
 CITED_PEOPLE_PROMPT = """From this short-clip transcript snippet, list public figures who are CITED or talked ABOUT (not the people speaking on camera).
 
@@ -31,22 +29,32 @@ Rules:
 - If nobody notable is cited, return an empty list
 - Respond JSON only: {{"people":[{{"name":"string","hint":"string"}}]}}"""
 
-# Viral palette for PIL overlay (fill cycles per line)
-_HOOK_COLORS = [
-    (255, 230, 0),  # yellow
-    (0, 229, 255),  # electric cyan
-    (255, 64, 160),  # hot pink
-    (180, 255, 40),  # lime
-    (255, 140, 0),  # orange
-]
-_BORDER_STOPS = [
-    (255, 40, 180),
-    (255, 120, 40),
-    (255, 220, 40),
-    (40, 220, 255),
-    (160, 60, 255),
-    (255, 40, 180),
-]
+THUMBNAIL_TEXT_PROMPT = """You write the SHORT on-image text for a viral YouTube Shorts / TikTok / Reels thumbnail (the big letters burned onto the image — not the feed title).
+
+Goal: maximize scroll-stop and click probability. Curiosity gap, bold claim, contradiction, or emotional punch — still faithful to the clip. Think growth editor, not chapter heading.
+
+Inputs:
+- Feed title: {title}
+- Spoken hook: {hook}
+- Why this clip is viral: {reason}
+- Transcript snippet: {snippet}
+
+Rules:
+- Write entirely in {language}. Do NOT use English unless the language is English.
+- Ideal length: 3–6 words. Hard max ~40 characters (spaces count).
+- Compress — never paste a long title. Extract the click trigger.
+- No speaker-name prefix ("Fulano:"), no hashtags, no emoji, no quotation marks, no trailing ellipsis spam.
+- Prefer concrete punch from the clip over vague labels ("a verdade", "o papel de", "a importância").
+- Patterns that WORK: bold claim · open question · "X vs Y" · unexpected confession · specific number/detail.
+- ALL CAPS is applied later — write with normal casing and correct accents.
+
+Respond JSON only: {{"text":"string"}}"""
+
+def _thumbnail_palette() -> List[Tuple[int, int, int]]:
+    """Shared viral palette (border gradient + per-word text fills) from config."""
+    from .config import parse_thumbnail_palette
+
+    return parse_thumbnail_palette()
 
 
 def _parse_json_loose(raw: str) -> Dict:
@@ -118,8 +126,121 @@ def extract_cited_people(
     return out
 
 
+def _language_label(language: str) -> str:
+    lang = (language or "pt").strip().lower()
+    if lang.startswith("pt"):
+        return "Brazilian Portuguese"
+    if lang.startswith("en"):
+        return "English"
+    if lang.startswith("es"):
+        return "Spanish"
+    return f"language code '{lang}'"
+
+
+def generate_thumbnail_overlay_text(
+    *,
+    title: str = "",
+    hook: str = "",
+    reason: str = "",
+    snippet: str = "",
+    language: str = "pt",
+    llm_fn=None,
+) -> str:
+    """LLM: short click-bait on-image text from title/hook/reason/snippet.
+
+    Returns plain text (not forced UPPERCASE). Empty string only when every
+    input is empty — callers should fall back to ``_hook_for_thumb``.
+    """
+    title = (title or "").strip()
+    hook = (hook or "").strip()
+    reason = (reason or "").strip()
+    snippet = (snippet or "").strip()
+    if not any((title, hook, reason, snippet)):
+        return ""
+
+    if llm_fn is None:
+        from .local.llm import call_local_llm
+
+        llm_fn = call_local_llm
+
+    prompt = THUMBNAIL_TEXT_PROMPT.format(
+        title=title or "(none)",
+        hook=hook or "(none)",
+        reason=reason or "(none)",
+        snippet=(snippet[:1200] if snippet else "(none)"),
+        language=_language_label(language),
+    )
+    try:
+        raw = llm_fn(prompt)
+        parsed = _parse_json_loose(raw)
+    except Exception as e:
+        print(f"[thumb-ai] overlay text LLM failed: {e}", flush=True)
+        return ""
+
+    text = ""
+    if isinstance(parsed, dict):
+        text = str(parsed.get("text") or parsed.get("overlay") or "").strip()
+    text = re.sub(r"\s+", " ", text)
+    text = text.strip(" \"'`“”‘’")
+    # Drop accidental ALL-CAPS so _hook_for_thumb can normalize once
+    if len(text) > 40:
+        words = text.split()
+        trimmed: List[str] = []
+        for w in words:
+            candidate = (" ".join(trimmed + [w])).strip()
+            if len(candidate) > 40:
+                break
+            trimmed.append(w)
+        text = " ".join(trimmed) if trimmed else text[:39].rstrip()
+    return text
+
+
 def _normalize_name(value: str) -> str:
     return re.sub(r"\s+", " ", (value or "").strip()).casefold()
+
+
+_NAME_STOPWORDS = frozenset(
+    {
+        "de",
+        "da",
+        "do",
+        "das",
+        "dos",
+        "e",
+        "the",
+        "of",
+        "a",
+        "an",
+        "van",
+        "von",
+    }
+)
+
+
+def _name_tokens(value: str) -> set:
+    return {t for t in _normalize_name(value).split() if t and t not in _NAME_STOPWORDS}
+
+
+def _name_match_score(target: str, candidate: str) -> float:
+    """Score how well ``candidate`` matches ``target`` (0–1)."""
+    if not target or not candidate:
+        return 0.0
+    if target == candidate:
+        return 1.0
+    if target in candidate or candidate in target:
+        return 0.85
+    ta = _name_tokens(target)
+    tb = _name_tokens(candidate)
+    if not ta or not tb:
+        return 0.0
+    inter = ta & tb
+    if not inter:
+        return 0.0
+    # Require at least one meaningful token overlap (len>=3) to avoid
+    # weak matches like single letters / initials.
+    if not any(len(t) >= 3 for t in inter):
+        return 0.0
+    return len(inter) / max(len(ta | tb), 1)
 
 
 def match_cast_portrait(
@@ -127,7 +248,12 @@ def match_cast_portrait(
     speakers: Sequence[Dict[str, Any]],
     cast_dir: Path,
 ) -> Optional[Tuple[Path, str]]:
-    """Return (portrait_path, display_name) for the attributed speaker."""
+    """Return (portrait_path, display_name) for the attributed speaker.
+
+    Never falls back to an unrelated cast member (e.g. the podcast host)
+    when ``attributed_to`` does not match — that used to put the wrong face
+    on AI thumbnails.
+    """
     target = _normalize_name(attributed_to)
     if not target or not cast_dir.is_dir():
         return None
@@ -141,32 +267,10 @@ def match_cast_portrait(
         path = cast_dir / f"{sid}.jpg"
         if not path.is_file():
             continue
-        if not name and not target:
-            continue
         nkey = _normalize_name(name)
-        score = 0.0
-        if target and nkey:
-            if target == nkey:
-                score = 1.0
-            elif target in nkey or nkey in target:
-                score = 0.85
-            else:
-                ta = set(target.split())
-                tb = set(nkey.split())
-                if ta and tb and ta & tb:
-                    score = len(ta & tb) / max(len(ta | tb), 1)
+        score = _name_match_score(target, nkey)
         if score >= 0.5:
             candidates.append((path, name or sid, score))
-
-    if not candidates and speakers:
-        for sp in speakers:
-            if not isinstance(sp, dict):
-                continue
-            sid = str(sp.get("id") or "").strip().upper()
-            path = cast_dir / f"{sid}.jpg"
-            if path.is_file():
-                name = str(sp.get("name") or sp.get("suggested_name") or sid).strip()
-                return path, name
 
     if not candidates:
         return None
@@ -176,35 +280,39 @@ def match_cast_portrait(
 
 
 def _hook_for_thumb(hook: str, title: str, *, max_chars: int = 110) -> str:
-    """Keep the full hook when it fits; never chop mid-phrase at a fixed word count."""
-    text = (hook or title or "").strip()
+    """Text painted on the thumbnail — prefer title, fall back to hook (always UPPERCASE)."""
+    text = (title or hook or "").strip()
     text = re.sub(r"\s+", " ", text)
     if not text:
         return ""
     if len(text) >= 2 and text[0] in "\"'“”" and text[-1] in "\"'“”":
         text = text[1:-1].strip()
-    if len(text) <= max_chars:
-        return text
 
-    parts = re.split(r"(?<=[,:;.—–\-])\s+|\s+[—–\-]\s+", text)
-    parts = [p.strip(" ,;:—–-") for p in parts if p and p.strip(" ,;:—–-")]
-    if len(parts) >= 2:
-        tail = parts[-1]
-        if 12 <= len(tail) <= max_chars:
-            head = parts[0]
-            combo = f"{head} {tail}".strip()
-            if len(combo) <= max_chars:
-                return combo
-            return tail
+    result = text
+    if len(text) > max_chars:
+        parts = re.split(r"(?<=[,:;.—–\-])\s+|\s+[—–\-]\s+", text)
+        parts = [p.strip(" ,;:—–-") for p in parts if p and p.strip(" ,;:—–-")]
+        if len(parts) >= 2:
+            tail = parts[-1]
+            if 12 <= len(tail) <= max_chars:
+                head = parts[0]
+                combo = f"{head} {tail}".strip()
+                result = combo if len(combo) <= max_chars else tail
+            else:
+                result = None
+        else:
+            result = None
+        if result is None:
+            words = text.split()
+            out: List[str] = []
+            for w in words:
+                candidate = (" ".join(out + [w])).strip()
+                if len(candidate) > max_chars:
+                    break
+                out.append(w)
+            result = " ".join(out) if out else text[: max_chars - 1].rstrip() + "…"
 
-    words = text.split()
-    out: List[str] = []
-    for w in words:
-        candidate = (" ".join(out + [w])).strip()
-        if len(candidate) > max_chars:
-            break
-        out.append(w)
-    return " ".join(out) if out else text[: max_chars - 1].rstrip() + "…"
+    return result.upper() if result else ""
 
 
 def _size_for_aspect(aspect_ratio: str) -> str:
@@ -228,6 +336,43 @@ def _clip_context(title: str, hook_line: str, snippet: str, *, limit: int = 420)
     return context
 
 
+def _build_background_prompt(
+    *,
+    hook: str,
+    title: str,
+    attributed_to: str,
+    language: str,
+    aspect_ratio: str,
+    snippet: str = "",
+) -> str:
+    """Scene-only prompt: AI must NOT invent people (cutout is composited later)."""
+    hook_line = _hook_for_thumb(hook, title)
+    context = _clip_context(title, hook_line, snippet)
+    who = f" about {attributed_to}" if attributed_to else ""
+    if context:
+        bg = (
+            f"Invent a rich thematic environment{who} that matches: \"{context}\". "
+            "Environment, props, colors and mood that clearly echo the topic. "
+        )
+    else:
+        bg = (
+            f"Invent a bold cinematic environment{who} with depth and vivid color. "
+        )
+    return (
+        "Create a viral YouTube thumbnail BACKGROUND plate only. "
+        "High contrast, bold colors, cinematic lighting, click-worthy. "
+        f"Composition for aspect ratio {aspect_ratio}. "
+        f"{bg}"
+        "CRITICAL: do NOT draw any people, faces, hands, silhouettes, mannequins, "
+        "or human figures of any kind. Empty stage for a real photo cutout. "
+        "Leave the LOWER third relatively clear and uncluttered (soft bokeh) "
+        "so text can be overlaid later. "
+        "Keep the UPPER / center area with depth but not busy edges. "
+        "Do NOT draw any text, letters, words, captions, logos, watermarks, "
+        "UI chrome, frames, borders, stickers, or speech bubbles."
+    )
+
+
 def _build_prompt(
     *,
     hook: str,
@@ -238,8 +383,10 @@ def _build_prompt(
     aspect_ratio: str,
     snippet: str = "",
     hybrid: bool = True,
+    paint_text: str = "",
 ) -> str:
     hook_line = _hook_for_thumb(hook, title)
+    paint_line = _hook_for_thumb(paint_text, paint_text) if paint_text else hook_line
     people_bits = []
     if attributed_to:
         people_bits.append(f"main on-camera person: {attributed_to}")
@@ -267,6 +414,8 @@ def _build_prompt(
         "(same face, skin tone, hair). "
         f"Composition for aspect ratio {aspect_ratio}. "
         f"Subjects: {people}. "
+        "The FIRST reference photo is the primary on-camera person — that face MUST dominate "
+        "the thumbnail. Do not invent a different person or swap in someone else from memory. "
         "Large expressive face(s) in the UPPER half / safe area, shallow depth of field. "
         f"{bg_note} "
     )
@@ -287,20 +436,21 @@ def _build_prompt(
         if lang.startswith("pt")
         else f"All on-image text MUST be in language code '{lang}'."
     )
-    exact = hook_line or title or "VIRAL"
+    exact = paint_line or title or "VIRAL"
     return (
         base
         + "FRAME / BORDER (critical): wrap the entire thumbnail content inside a thick rounded "
         "rectangle frame with generous corner radius. The border itself must be a vibrant "
         "multi-stop gradient. Soft outer glow + subtle inner highlight. Leave a small outer "
         "margin so the rounded border is fully visible. "
-        "TYPOGRAPHY (critical): paint the hook as stylized viral thumbnail lettering — "
-        "chunky display font, vivid multi-color fills, thick dark outline + soft glow. "
+        "TYPOGRAPHY (critical): paint the TITLE as stylized viral thumbnail lettering — "
+        "chunky display font, vivid multi-color fills from a neon palette, thick dark outline "
+        "+ soft glow. ALL CAPS / CAIXA ALTA only — never mixed or lowercase. "
         "2–4 lines max, huge readable letters, centered in the mid/lower safe zone. "
-        f"Render this COMPLETE hook text EXACTLY, word-for-word, do not truncate, do not paraphrase, "
+        f"Render this COMPLETE title text EXACTLY, word-for-word, do not truncate, do not paraphrase, "
         f"do not drop the ending: \"{exact}\". "
         f"{lang_note} "
-        "No watermarks, no logos, no UI chrome, no extra slogans besides that hook."
+        "No watermarks, no logos, no UI chrome, no extra slogans besides that title."
     )
 
 
@@ -375,6 +525,88 @@ def _resolve_display_font(size: int):
     return ImageFont.load_default()
 
 
+def _ass_to_rgb(ass: str, *, fallback: Tuple[int, int, int] = (255, 255, 0)) -> Tuple[int, int, int]:
+    """ASS ``&HAABBGGRR`` → RGB tuple."""
+    m = re.match(r"&H([0-9A-Fa-f]{8})\b", str(ass or "").strip())
+    if not m:
+        return fallback
+    hexv = m.group(1)
+    try:
+        bb = int(hexv[2:4], 16)
+        gg = int(hexv[4:6], 16)
+        rr = int(hexv[6:8], 16)
+    except ValueError:
+        return fallback
+    return (rr, gg, bb)
+
+
+def _resolve_caption_font(font_name: str, size: int, *, bold: bool = True):
+    """Map caption ``font_name`` to a truetype face (size in px)."""
+    from PIL import ImageFont
+
+    name = (font_name or "Arial Black").strip().casefold()
+    size = max(12, int(size))
+    by_name: Dict[str, List[str]] = {
+        "arial black": [
+            "/usr/share/fonts/truetype/msttcorefonts/Arial_Black.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ],
+        "impact": [
+            "/usr/share/fonts/truetype/msttcorefonts/Impact.ttf",
+            "/usr/share/fonts/truetype/lato/Lato-Black.ttf",
+        ],
+        "arial": [
+            "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+            "/usr/share/fonts/truetype/msttcorefonts/Arial_Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/msttcorefonts/Arial.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ],
+        "dejavu sans": [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ],
+        "helvetica": [
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            if bold
+            else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ],
+    }
+    candidates = list(by_name.get(name) or [])
+    candidates.extend(
+        [
+            "/usr/share/fonts/truetype/lato/Lato-Black.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ]
+    )
+    seen = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if Path(path).exists():
+            try:
+                return ImageFont.truetype(path, size=size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def _is_shorts_aspect(aspect_ratio: str) -> bool:
+    raw = (aspect_ratio or "9:16").strip()
+    return raw not in ("16:9", "1.777", "1.78", "1:1", "1.0")
+
 def _lerp_rgb(a: Tuple[int, int, int], b: Tuple[int, int, int], t: float) -> Tuple[int, int, int]:
     t = max(0.0, min(1.0, t))
     return (
@@ -385,7 +617,9 @@ def _lerp_rgb(a: Tuple[int, int, int], b: Tuple[int, int, int], t: float) -> Tup
 
 
 def _gradient_color(t: float) -> Tuple[int, int, int]:
-    stops = _BORDER_STOPS
+    palette = _thumbnail_palette()
+    # Loop seamlessly for the border ring.
+    stops = list(palette) + ([palette[0]] if palette else [(255, 40, 180)])
     if t <= 0:
         return stops[0]
     if t >= 1:
@@ -399,15 +633,17 @@ def _gradient_color(t: float) -> Tuple[int, int, int]:
 def _draw_gradient_rounded_border(
     img,
     *,
-    margin: int,
     thickness: int,
     radius: int,
 ) -> None:
-    """Paint a thick multi-stop gradient ring as a rounded rectangle border."""
+    """Paint a full-bleed gradient frame with a rounded inner cutout.
+
+    Outer edge is flush to the canvas (no scene peeking outside the border);
+    only the inner window is rounded.
+    """
     from PIL import Image, ImageDraw, ImageFilter
 
     w, h = img.size
-    margin = max(4, int(margin))
     thickness = max(12, int(thickness))
     radius = max(16, int(radius))
 
@@ -427,15 +663,11 @@ def _draw_gradient_rounded_border(
     grad2 = hstrip.resize((w, h), Image.Resampling.BILINEAR)
     grad = Image.blend(grad, grad2, 0.55)
 
-    mask = Image.new("L", (w, h), 0)
+    # Full canvas outer fill; punch a rounded hole for the scene.
+    mask = Image.new("L", (w, h), 255)
     md = ImageDraw.Draw(mask)
-    md.rounded_rectangle(
-        [margin, margin, w - 1 - margin, h - 1 - margin],
-        radius=radius,
-        fill=255,
-    )
-    inner_m = margin + thickness
-    inner_r = max(6, radius - thickness // 2)
+    inner_m = thickness
+    inner_r = max(6, radius)
     md.rounded_rectangle(
         [inner_m, inner_m, w - 1 - inner_m, h - 1 - inner_m],
         radius=inner_r,
@@ -447,17 +679,6 @@ def _draw_gradient_rounded_border(
 
     glow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     gld = ImageDraw.Draw(glow)
-    gld.rounded_rectangle(
-        [
-            max(0, margin - 3),
-            max(0, margin - 3),
-            w - 1 - max(0, margin - 3),
-            h - 1 - max(0, margin - 3),
-        ],
-        radius=radius + 3,
-        outline=(255, 90, 200, 80),
-        width=max(4, thickness // 2),
-    )
     gld.rounded_rectangle(
         [inner_m + 1, inner_m + 1, w - 2 - inner_m, h - 2 - inner_m],
         radius=max(4, inner_r - 1),
@@ -474,6 +695,65 @@ def _draw_gradient_rounded_border(
 def _measure_line(draw, text: str, font, outline: int) -> Tuple[int, int]:
     bbox = draw.textbbox((0, 0), text, font=font, stroke_width=outline)
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def _space_width(draw, font, outline: int) -> int:
+    """Width of one space between stroked words (stroke inflates bare ``' '``)."""
+    w_gap, _ = _measure_line(draw, "A A", font, outline)
+    w_tight, _ = _measure_line(draw, "AA", font, outline)
+    return max(1, int(w_gap - w_tight))
+
+
+def _draw_line_words(
+    draw,
+    *,
+    x: float,
+    y: float,
+    line: str,
+    font,
+    outline: int,
+    stroke_rgb: Tuple[int, int, int],
+    fill_rgb: Optional[Tuple[int, int, int]],
+    palette: List[Tuple[int, int, int]],
+    word_index: int,
+) -> int:
+    """Draw a line; in palette mode each word cycles a different fill.
+
+    Returns the next global word index after this line.
+    """
+    words = [t for t in re.split(r"\s+", str(line or "").strip()) if t]
+    if not words:
+        return word_index
+    if fill_rgb is not None:
+        draw.text(
+            (x, y),
+            line,
+            font=font,
+            fill=fill_rgb,
+            stroke_width=outline,
+            stroke_fill=stroke_rgb,
+        )
+        return word_index + len(words)
+
+    gap = _space_width(draw, font, outline)
+    cursor = float(x)
+    wi = word_index
+    for j, word in enumerate(words):
+        fill = palette[wi % len(palette)]
+        draw.text(
+            (cursor, y),
+            word,
+            font=font,
+            fill=fill,
+            stroke_width=outline,
+            stroke_fill=stroke_rgb,
+        )
+        tw, _ = _measure_line(draw, word, font, outline)
+        cursor += tw
+        if j < len(words) - 1:
+            cursor += gap
+        wi += 1
+    return wi
 
 
 def _wrap_hook_to_width(
@@ -516,50 +796,147 @@ def apply_viral_thumbnail_overlay(
     hook: str,
     *,
     title: str = "",
+    caption_style: Optional[Dict[str, Any]] = None,
+    aspect_ratio: str = "9:16",
+    text_color_mode: str = "caption",
+    margin_v: Optional[int] = None,
+    font_size: Optional[int] = None,
+    border_pct: Optional[float] = None,
 ) -> Path:
-    """Burn gradient frame + stylized hook onto an AI scene (hybrid path)."""
+    """Burn gradient frame + title onto the speaker frame.
+
+    When ``caption_style`` is set, the title uses the same graphic rules as
+    karaoke captions (font, size, outline, words/line) for any aspect ratio.
+    ``text_color_mode`` chooses caption primary colour vs border palette
+    (palette mode: each word cycles a different colour).
+    ``margin_v`` / ``font_size`` / ``border_pct`` override style defaults.
+    """
     from PIL import Image, ImageDraw, ImageFilter
 
-    hook_line = _hook_for_thumb(hook, title)
+    use_caption = bool(caption_style)
+    color_mode = (text_color_mode or "caption").strip().lower()
+    use_palette_fill = color_mode == "palette"
+    if use_caption:
+        from .captions import resolve_style
+
+        style = resolve_style(caption_style)
+        raw = re.sub(r"\s+", " ", (hook or title or "").strip())
+        if len(raw) >= 2 and raw[0] in "\"'“”" and raw[-1] in "\"'“”":
+            raw = raw[1:-1].strip()
+        hook_line = raw.upper() if style.get("uppercase", True) else raw
+    else:
+        style = None
+        hook_line = _hook_for_thumb(hook, title)
+
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     img = Image.open(src).convert("RGB")
     w, h = img.size
 
-    margin = max(10, int(round(min(w, h) * 0.028)))
-    thickness = max(10, int(round(min(w, h) * 0.038)))
-    radius = max(28, int(round(min(w, h) * 0.08)))
-    _draw_gradient_rounded_border(
-        img, margin=margin, thickness=thickness, radius=radius
-    )
+    pct = 3.8
+    if border_pct is not None:
+        try:
+            pct = max(1.0, min(8.0, float(border_pct)))
+        except (TypeError, ValueError):
+            pct = 3.8
+    thickness = max(4, int(round(min(w, h) * (pct / 100.0))))
+    radius = max(16, int(round(min(w, h) * max(0.04, pct / 100.0 * 2.1))))
+    _draw_gradient_rounded_border(img, thickness=thickness, radius=radius)
 
     if not hook_line:
         img.save(dest, format="JPEG", quality=92, optimize=True)
         return dest
 
-    # Text lives inside the frame, mid/lower zone
-    pad = margin + thickness + max(8, int(w * 0.04))
+    pad = thickness + max(8, int(w * 0.04))
     max_text_w = max(40, w - pad * 2)
-    # Keep faces clear: text starts around 52% height
-    text_top = int(h * 0.52)
-    text_bottom = h - (margin + thickness + max(12, int(h * 0.04)))
-    max_text_h = max(40, text_bottom - text_top)
+
+    # Match ASS DESIGN_PLAY_RES (1080×1920) used by caption preview for both aspects.
+    play_w = 1080.0
+    play_h = 1920.0
+
+    if use_caption and style is not None:
+        scale = w / play_w
+        scale_y = h / play_h
+        style_font = float(style["font_size"])
+        if font_size is not None:
+            try:
+                style_font = float(max(40, min(140, int(font_size))))
+            except (TypeError, ValueError):
+                pass
+        base_font = max(16, int(round(style_font * scale)))
+        outline = max(0, int(round(float(style["outline"]) * scale)))
+        style_margin = float(style["margin_v"])
+        if margin_v is not None:
+            try:
+                style_margin = float(max(40, min(720, int(margin_v))))
+            except (TypeError, ValueError):
+                pass
+        margin_scaled = max(0, int(round(style_margin * scale_y)))
+        # Keep text above the decorative border ring.
+        text_bottom = max(thickness + 8, h - margin_scaled)
+        text_top = thickness + max(8, int(h * 0.08))
+        max_text_h = max(40, text_bottom - text_top)
+        max_words = max(1, int(style.get("max_words_per_line") or 4))
+        fill_rgb = (
+            None
+            if use_palette_fill
+            else _ass_to_rgb(str(style.get("primary_colour") or ""), fallback=(255, 255, 0))
+        )
+        stroke_rgb = _ass_to_rgb(
+            str(style.get("outline_colour") or ""), fallback=(10, 10, 18)
+        )
+        bold = bool(style.get("bold", True))
+        font_name = str(style.get("font_name") or "Arial Black")
+
+        def _font_at(sz: int):
+            return _resolve_caption_font(font_name, sz, bold=bold)
+
+    else:
+        text_top = int(h * 0.52)
+        text_bottom = h - (thickness + max(12, int(h * 0.04)))
+        max_text_h = max(40, text_bottom - text_top)
+        style_font = 100.0
+        if font_size is not None:
+            try:
+                style_font = float(max(40, min(140, int(font_size))))
+            except (TypeError, ValueError):
+                pass
+        base_font = max(28, int(round(style_font * (w / play_w))))
+        if margin_v is not None:
+            try:
+                margin_scaled = max(
+                    0,
+                    int(round(float(max(40, min(720, int(margin_v)))) * (h / play_h))),
+                )
+                text_bottom = max(thickness + 8, h - margin_scaled)
+                max_text_h = max(40, text_bottom - text_top)
+            except (TypeError, ValueError):
+                pass
+        outline = max(4, int(base_font * 0.14))
+        max_words = 4
+        fill_rgb = None if use_palette_fill else (255, 230, 0)
+        stroke_rgb = (10, 10, 18)
+        _font_at = _resolve_display_font  # type: ignore[assignment]
 
     draw = ImageDraw.Draw(img)
-    base_font = max(28, int(w * 0.095))
-    outline_base = max(4, int(base_font * 0.14))
     font_size = base_font
-    outline = outline_base
+    outline_base = outline
     lines: List[str] = []
     heights: List[int] = []
     widths: List[int] = []
     line_gap = 6
-    font = _resolve_display_font(font_size)
+    font = _font_at(font_size)
 
     for _ in range(20):
-        font = _resolve_display_font(font_size)
-        outline = max(3, int(round(outline_base * (font_size / max(1, base_font)))))
-        lines = _wrap_hook_to_width(draw, hook_line, font, outline, max_text_w, max_words=4)
+        font = _font_at(font_size)
+        if use_caption:
+            # Keep outline proportional to caption style (don't grow with retries).
+            outline = outline_base
+        else:
+            outline = max(3, int(round(outline_base * (font_size / max(1, base_font)))))
+        lines = _wrap_hook_to_width(
+            draw, hook_line, font, outline, max_text_w, max_words=max_words
+        )
         if not lines:
             break
         heights = []
@@ -577,12 +954,10 @@ def apply_viral_thumbnail_overlay(
 
     if lines:
         total_h = sum(heights) + line_gap * max(0, len(lines) - 1)
-        # Prefer lower block but stay inside text_top..text_bottom
         y = text_bottom - total_h
         if y < text_top:
             y = text_top
 
-        # Soft shadow layer
         shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         sd = ImageDraw.Draw(shadow)
         sy = y + max(2, int(font_size * 0.06))
@@ -595,7 +970,7 @@ def apply_viral_thumbnail_overlay(
                 line,
                 font=font,
                 fill=(0, 0, 0, 140),
-                stroke_width=outline + 2,
+                stroke_width=outline + 2 if outline else 2,
                 stroke_fill=(0, 0, 0, 160),
             )
             sy += th + line_gap
@@ -604,23 +979,151 @@ def apply_viral_thumbnail_overlay(
         img = Image.alpha_composite(base, shadow).convert("RGB")
         draw = ImageDraw.Draw(img)
 
+        palette = _thumbnail_palette() or [(255, 230, 0)]
+        word_i = 0
         for i, line in enumerate(lines):
             tw = widths[i]
             th = heights[i]
             x = max(pad, min((w - tw) / 2, w - pad - tw))
-            fill = _HOOK_COLORS[i % len(_HOOK_COLORS)]
-            draw.text(
-                (x, y),
-                line,
+            word_i = _draw_line_words(
+                draw,
+                x=x,
+                y=y,
+                line=line,
                 font=font,
-                fill=fill,
-                stroke_width=outline,
-                stroke_fill=(10, 10, 18),
+                outline=outline,
+                stroke_rgb=stroke_rgb,
+                fill_rgb=fill_rgb,
+                palette=palette,
+                word_index=word_i,
             )
             y += th + line_gap
 
     img.save(dest, format="JPEG", quality=92, optimize=True)
     return dest
+
+
+def _is_billing_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "billing_hard_limit",
+        "billing_limit",
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "you have no credits",
+        "exceeded your current quota",
+        "quota exceeded",
+    )
+    if any(n in msg for n in needles):
+        return True
+    if "429" in msg and ("credit" in msg or "quota" in msg or "billing" in msg):
+        return True
+    return False
+
+
+class ImageBillingError(RuntimeError):
+    """Provider account has no credits or hit a hard billing limit."""
+
+
+def _friendly_billing_message(provider: str = "openai") -> str:
+    if provider.lower().startswith("gemini") or provider.lower() == "google":
+        return (
+            "Créditos Gemini esgotados ou billing bloqueado. "
+            "Confira https://aistudio.google.com/apikey e o billing do projeto Google Cloud."
+        )
+    return (
+        "Créditos OpenAI esgotados (billing hard limit). "
+        "Adicione créditos em https://platform.openai.com/settings/organization/billing/ "
+        "ou use IMAGE_PROVIDER=gemini com GEMINI_API_KEY."
+    )
+
+
+def _gemini_aspect(aspect_ratio: str) -> str:
+    raw = (aspect_ratio or "9:16").strip()
+    allowed = {"1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"}
+    if raw in allowed:
+        return raw
+    if raw in ("1.0",):
+        return "1:1"
+    if raw in ("1.777", "1.78"):
+        return "16:9"
+    return "9:16"
+
+
+def _call_gemini_image(
+    *,
+    prompt: str,
+    aspect_ratio: str,
+    refs: Sequence[Path],
+    model: Optional[str] = None,
+) -> bytes:
+    """Generate/edit via Gemini Flash Image; returns raw image bytes."""
+    try:
+        from google import genai  # type: ignore
+        from google.genai import types  # type: ignore
+        from PIL import Image
+    except ImportError as e:
+        raise RuntimeError(
+            "google-genai/Pillow necessários para IMAGE_PROVIDER=gemini. "
+            "Rode: pip install -r requirements-local.txt"
+        ) from e
+
+    image_model = (model or _cfg.GEMINI_IMAGE_MODEL or "gemini-2.5-flash-image").strip()
+    client = genai.Client(api_key=require_gemini_key())
+
+    parts: List[Any] = [prompt]
+    for p in list(refs)[:3]:
+        try:
+            parts.append(Image.open(p).convert("RGB"))
+        except OSError as e:
+            print(f"[thumb-ai] skip gemini ref {p}: {e}", flush=True)
+
+    aspect = _gemini_aspect(aspect_ratio)
+    print(
+        f"[thumb-ai] gemini model={image_model} aspect={aspect} refs={len(parts) - 1}",
+        flush=True,
+    )
+
+    try:
+        config = types.GenerateContentConfig(
+            response_modalities=["TEXT", "IMAGE"],
+            image_config=types.ImageConfig(aspect_ratio=aspect),
+        )
+        response = client.models.generate_content(
+            model=image_model,
+            contents=parts,
+            config=config,
+        )
+    except Exception as exc:
+        if _is_billing_error(exc):
+            raise ImageBillingError(_friendly_billing_message("gemini")) from exc
+        try:
+            response = client.models.generate_content(
+                model=image_model,
+                contents=parts,
+                config=types.GenerateContentConfig(
+                    response_modalities=["TEXT", "IMAGE"],
+                ),
+            )
+        except Exception as exc2:
+            if _is_billing_error(exc2):
+                raise ImageBillingError(_friendly_billing_message("gemini")) from exc2
+            raise
+
+    candidates = getattr(response, "candidates", None) or []
+    for cand in candidates:
+        content = getattr(cand, "content", None)
+        parts_out = getattr(content, "parts", None) or []
+        for part in parts_out:
+            inline = getattr(part, "inline_data", None)
+            if inline is None:
+                continue
+            data = getattr(inline, "data", None)
+            if data:
+                if isinstance(data, str):
+                    return base64.b64decode(data)
+                return bytes(data)
+    raise RuntimeError("Gemini não retornou imagem")
 
 
 def _call_openai_image(
@@ -672,9 +1175,10 @@ def _call_openai_image(
                         n=1,
                     )
             except Exception as first:
+                if _is_billing_error(first):
+                    raise ImageBillingError(_friendly_billing_message("openai")) from first
                 msg = str(first).lower()
                 if "input_fidelity" in msg or "quality" in msg:
-                    # Retry without the rejected param
                     retry = {
                         "model": model,
                         "image": kwargs["image"],
@@ -687,6 +1191,10 @@ def _call_openai_image(
                     try:
                         return client.images.edit(**retry)
                     except Exception as second:
+                        if _is_billing_error(second):
+                            raise ImageBillingError(
+                                _friendly_billing_message("openai")
+                            ) from second
                         print(
                             f"[thumb-ai] edit failed ({second}); falling back to generate",
                             flush=True,
@@ -696,13 +1204,20 @@ def _call_openai_image(
                         f"[thumb-ai] edit failed ({first}); falling back to generate",
                         flush=True,
                     )
-                return client.images.generate(
-                    model=model,
-                    prompt=prompt,
-                    size=size,
-                    n=1,
-                    quality=q,
-                )
+                try:
+                    return client.images.generate(
+                        model=model,
+                        prompt=prompt,
+                        size=size,
+                        n=1,
+                        quality=q,
+                    )
+                except Exception as gen_exc:
+                    if _is_billing_error(gen_exc):
+                        raise ImageBillingError(
+                            _friendly_billing_message("openai")
+                        ) from gen_exc
+                    raise
 
         try:
             return client.images.generate(
@@ -719,6 +1234,10 @@ def _call_openai_image(
                 size=size,
                 n=1,
             )
+        except Exception as gen_exc:
+            if _is_billing_error(gen_exc):
+                raise ImageBillingError(_friendly_billing_message("openai")) from gen_exc
+            raise
     finally:
         for fh in handles:
             try:
@@ -727,144 +1246,286 @@ def _call_openai_image(
                 pass
 
 
+def _has_gemini_key() -> bool:
+    key = (_cfg.GEMINI_API_KEY or "").strip().strip("'\"")
+    if not key:
+        return False
+    placeholders = {
+        "your_gemini_key_here",
+        "changeme",
+        "xxx",
+        "your_api_key_here",
+    }
+    return key.casefold() not in placeholders
+
+
+def _resolve_image_providers() -> List[str]:
+    pref = (_cfg.IMAGE_PROVIDER or "auto").strip().lower()
+    if pref == "openai":
+        return ["openai"]
+    if pref == "gemini":
+        return ["gemini"]
+    order = ["openai"]
+    if _has_gemini_key():
+        order.append("gemini")
+    return order
+
+
+def _cited_people_llm():
+    """Prefer Gemini for cited-people extract when image provider is gemini/auto+gemini."""
+    from .local.llm import call_gemini_llm, call_openai_llm, call_local_llm
+
+    pref = (_cfg.IMAGE_PROVIDER or "auto").strip().lower()
+    if pref == "gemini" and _has_gemini_key():
+        return call_gemini_llm
+    if pref == "auto" and _has_gemini_key():
+        def _try(prompt: str) -> str:
+            try:
+                return call_gemini_llm(prompt)
+            except Exception:
+                return call_openai_llm(prompt)
+
+        return _try
+    return call_local_llm
+
+
+def _fit_frame_to_aspect(
+    src: Path,
+    dest: Path,
+    *,
+    aspect_ratio: str = "9:16",
+) -> Path:
+    """Cover-crop ``src`` into the thumbnail canvas size; keep original pixels (no BG remove)."""
+    from PIL import Image
+
+    size = _size_for_aspect(aspect_ratio)
+    tw, th = (int(x) for x in size.split("x", 1))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    img = Image.open(src).convert("RGB")
+    sw, sh = img.size
+    if sw < 1 or sh < 1:
+        raise RuntimeError(f"Frame inválido: {src}")
+
+    target_ar = tw / float(th)
+    src_ar = sw / float(sh)
+    if src_ar > target_ar:
+        new_w = max(1, int(round(sh * target_ar)))
+        left = max(0, (sw - new_w) // 2)
+        img = img.crop((left, 0, left + new_w, sh))
+    elif src_ar < target_ar:
+        new_h = max(1, int(round(sw / target_ar)))
+        # Bias toward the top so faces stay in frame
+        top = max(0, int((sh - new_h) * 0.12))
+        if top + new_h > sh:
+            top = max(0, sh - new_h)
+        img = img.crop((0, top, sw, top + new_h))
+
+    img = img.resize((tw, th), Image.Resampling.LANCZOS)
+    img.save(dest, format="JPEG", quality=92, optimize=True)
+    return dest
+
+
 def generate_ai_thumbnail(
     *,
     dest: Path,
     hook: str = "",
     title: str = "",
+    virality_reason: str = "",
     attributed_to: str = "",
     snippet: str = "",
     speakers: Optional[Sequence[Dict[str, Any]]] = None,
     cast_dir: Optional[Path] = None,
     wiki_dir: Optional[Path] = None,
     reference_frame: Optional[Path] = None,
+    person_frame: Optional[Path] = None,
     aspect_ratio: str = "9:16",
     language: str = "pt",
     model: Optional[str] = None,
     quality: Optional[str] = None,
     fidelity: Optional[str] = None,
     hybrid: Optional[bool] = None,
+    mode: Optional[str] = None,
+    overlay_text: Optional[str] = None,
+    caption_style: Optional[Dict[str, Any]] = None,
+    text_color_mode: Optional[str] = None,
+    margin_v: Optional[int] = None,
+    font_size: Optional[int] = None,
+    border_pct: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Generate a viral thumbnail and write JPEG to ``dest``.
 
-    Default path is cost-optimized: ``gpt-image-1-mini`` + medium quality +
-    hybrid mode (scene from the model, typography/frame via PIL).
+    Uses the speaker frame as-is (original background kept) + local PIL
+    overlay (gradient border + short text). No image-model background and
+    no background removal.
+
+    If ``overlay_text`` is provided (user edit), it is burned as-is and the
+    overlay LLM is skipped. When ``caption_style`` is set, it drives the
+    title look (font/size/outline) to match karaoke captions. Colour mode,
+    vertical margin, font size and border thickness can be overridden.
     """
+    del model, quality, fidelity, hybrid, wiki_dir  # unused — local frame path only
+
     speakers = list(speakers or [])
-    speaker_names = [
-        str(s.get("name") or s.get("suggested_name") or "").strip()
-        for s in speakers
-        if isinstance(s, dict)
-    ]
-    speaker_names = [n for n in speaker_names if n]
+    use_caption_look = bool(caption_style)
+    color_mode = (
+        "palette"
+        if (text_color_mode or "").strip().lower() == "palette"
+        else "caption"
+    )
+    margin_override = None
+    if margin_v is not None:
+        try:
+            margin_override = max(40, min(720, int(margin_v)))
+        except (TypeError, ValueError):
+            margin_override = None
+    font_override = None
+    if font_size is not None:
+        try:
+            font_override = max(40, min(140, int(font_size)))
+        except (TypeError, ValueError):
+            font_override = None
+    border_override = None
+    if border_pct is not None:
+        try:
+            border_override = max(1.0, min(8.0, float(border_pct)))
+        except (TypeError, ValueError):
+            border_override = None
 
-    face_paths: List[Path] = []
-    face_meta: List[Dict[str, str]] = []
+    user_overlay = re.sub(r"\s+", " ", (overlay_text or "").strip())
+    overlay_from_user = bool(user_overlay)
+    if overlay_from_user:
+        # Keep casing; apply_viral_thumbnail_overlay applies uppercase from caption style.
+        hook_line = user_overlay if use_caption_look else _hook_for_thumb(user_overlay, user_overlay)
+        overlay_raw = ""
+        print(f"[thumb-ai] texto overlay (usuário): {hook_line!r}", flush=True)
+    else:
+        print("[thumb-ai] gerando texto curto da thumbnail (LLM)…", flush=True)
+        overlay_raw = generate_thumbnail_overlay_text(
+            title=title,
+            hook=hook,
+            reason=virality_reason,
+            snippet=snippet,
+            language=language,
+            llm_fn=_cited_people_llm(),
+        )
+        if overlay_raw:
+            hook_line = (
+                re.sub(r"\s+", " ", overlay_raw.strip())
+                if use_caption_look
+                else _hook_for_thumb(overlay_raw, overlay_raw)
+            )
+            print(f"[thumb-ai] texto overlay (IA): {hook_line!r}", flush=True)
+        else:
+            hook_line = (
+                re.sub(r"\s+", " ", (title or hook or "").strip())
+                if use_caption_look
+                else _hook_for_thumb(hook, title)
+            )
+            print(
+                f"[thumb-ai] texto overlay (fallback título/hook): {hook_line!r}",
+                flush=True,
+            )
 
-    if cast_dir:
+    thumb_mode = (mode or getattr(_cfg, "THUMBNAIL_MODE", "cutout") or "cutout").strip().lower()
+    if thumb_mode not in ("cutout", "ai", "frame"):
+        thumb_mode = "cutout"
+
+    person_src: Optional[Path] = None
+    person_src_origin = ""
+    if person_frame and Path(person_frame).is_file():
+        person_src = Path(person_frame)
+        person_src_origin = "person_frame"
+    elif cast_dir:
         matched = match_cast_portrait(attributed_to, speakers, cast_dir)
         if matched:
-            path, name = matched
-            face_paths.append(path)
-            face_meta.append({"kind": "on_camera", "name": name, "path": str(path)})
+            person_src = matched[0]
+            person_src_origin = "cast_portrait"
+    if person_src is None and reference_frame and Path(reference_frame).is_file():
+        person_src = Path(reference_frame)
+        person_src_origin = "reference_frame"
 
-    cited = extract_cited_people(snippet, speaker_names)
-    cited_names = [c["name"] for c in cited]
-    wiki_hits: List[Dict[str, str]] = []
-    if cited and wiki_dir is not None:
-        from .wikipedia_faces import fetch_cited_portraits
+    if person_src is None:
+        raise RuntimeError(
+            "Sem frame do locutor para montar a thumbnail "
+            "(selecione um frame ou garanta referência do vídeo)."
+        )
 
-        wiki_hits = fetch_cited_portraits(cited, wiki_dir, language=language)
-        for hit in wiki_hits:
-            p = Path(hit["path"])
-            if p.is_file():
-                face_paths.append(p)
-                face_meta.append(
-                    {
-                        "kind": "cited",
-                        "name": hit["name"],
-                        "path": str(p),
-                        "page_url": hit.get("page_url") or "",
-                    }
-                )
-
-    refs: List[Path] = list(face_paths)
-    if reference_frame and Path(reference_frame).is_file():
-        refs.append(Path(reference_frame))
-
-    uniq: List[Path] = []
-    seen_paths = set()
-    for p in refs:
-        key = str(p.resolve()) if p.exists() else str(p)
-        if key in seen_paths:
-            continue
-        seen_paths.add(key)
-        uniq.append(p)
-    refs = uniq[:4]
-
-    use_hybrid = THUMBNAIL_HYBRID if hybrid is None else bool(hybrid)
-    prompt = _build_prompt(
-        hook=hook,
-        title=title,
-        attributed_to=attributed_to,
-        cited_names=cited_names or [h["name"] for h in wiki_hits],
-        language=language,
-        aspect_ratio=aspect_ratio,
-        snippet=snippet,
-        hybrid=use_hybrid,
-    )
+    face_meta: List[Dict[str, str]] = [
+        {
+            "kind": "frame",
+            "name": attributed_to or "person",
+            "path": str(person_src),
+        }
+    ]
     size = _size_for_aspect(aspect_ratio)
-    image_model = (model or OPENAI_IMAGE_MODEL or "gpt-image-1-mini").strip().strip("'\"")
-    image_quality = (quality or OPENAI_IMAGE_QUALITY or "medium").strip().lower()
-    image_fidelity = (fidelity or OPENAI_IMAGE_FIDELITY or "low").strip().lower()
-
-    client = _openai_client()
     print(
-        f"[thumb-ai] generating model={image_model} quality={image_quality} "
-        f"fidelity={image_fidelity} hybrid={use_hybrid} size={size} refs={len(refs)} "
-        f"cited={cited_names}",
+        f"[thumb-ai] mode=frame (pedido={thumb_mode}) "
+        f"person_src={person_src.name} ({person_src_origin}) "
+        f"size={size} — fundo original, sem IA de imagem"
+        + (" · texto=estilo legenda" if use_caption_look else ""),
         flush=True,
     )
 
-    result = _call_openai_image(
-        client=client,
-        model=image_model,
-        prompt=prompt,
-        size=size,
-        quality=image_quality,
-        fidelity=image_fidelity,
-        refs=refs,
-    )
-
-    raw = _decode_image_result(result)
-    hook_line = _hook_for_thumb(hook, title)
-    hook_burned = False
-
-    if use_hybrid:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dest.with_suffix(".scene.jpg")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    canvas = dest.with_suffix(".frame.jpg")
+    try:
+        _fit_frame_to_aspect(person_src, canvas, aspect_ratio=aspect_ratio)
+        print(
+            f"[thumb-ai] overlay local (borda + texto) sobre frame {person_src.name}",
+            flush=True,
+        )
+        apply_viral_thumbnail_overlay(
+            canvas,
+            dest,
+            hook_line,
+            title=hook_line,
+            caption_style=caption_style if use_caption_look else None,
+            aspect_ratio=aspect_ratio,
+            text_color_mode=color_mode,
+            margin_v=margin_override,
+            font_size=font_override,
+            border_pct=border_override,
+        )
+    finally:
         try:
-            _to_jpeg(raw, tmp)
-            apply_viral_thumbnail_overlay(tmp, dest, hook_line, title=title)
-            hook_burned = bool(hook_line)
-        finally:
-            try:
-                if tmp.exists() and tmp != dest:
-                    tmp.unlink(missing_ok=True)
-            except OSError:
-                pass
-    else:
-        _to_jpeg(raw, dest)
+            if canvas.exists() and canvas != dest:
+                canvas.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    print(
+        f"[thumb-ai] pronto mode=frame person={person_src.name} "
+        f"overlay={hook_line!r}",
+        flush=True,
+    )
 
     return {
         "path": str(dest),
-        "model": image_model,
+        "provider": "local",
+        "model": "frame+overlay",
         "size": size,
-        "quality": image_quality,
-        "fidelity": image_fidelity,
-        "hybrid": use_hybrid,
+        "quality": None,
+        "fidelity": None,
+        "hybrid": True,
+        "mode": "frame",
+        "mode_requested": thumb_mode,
         "hook": hook_line,
-        "hook_burned": hook_burned,
+        "hook_burned": bool(hook_line),
+        "overlay_text": hook_line,
+        "overlay_from_llm": bool(overlay_raw) and not overlay_from_user,
+        "overlay_from_user": overlay_from_user,
+        "caption_style_applied": use_caption_look,
+        "text_color_mode": color_mode,
+        "margin_v": margin_override,
+        "font_size": font_override,
+        "border_pct": border_override,
         "faces": face_meta,
-        "cited_people": cited,
+        "cited_people": [],
+        "wiki_hits": [],
+        "wiki_skip_reason": "frame mode — sem Wikipedia / sem modelo de imagem",
+        "refs_sent_to_ai": [],
+        "refs_sent_count": 0,
+        "person_src": str(person_src),
+        "person_src_origin": person_src_origin or None,
     }
